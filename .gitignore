@@ -5,3 +5,6 @@
 benchmarks/**
 logs/**
 slurm/**
+.Rhistory
+.stignore
+*.html
