@@ -1,0 +1,7 @@
+.Rproj.user/**
+.snakemake/**
+.stfolder/**
+.tmp.driveupload/**
+benchmarks/**
+logs/**
+slurm/**
