@@ -1,0 +1,32 @@
+---
+title: "Link bins"
+output: html_notebook
+---
+
+Quickly link bins processed by Jacob Evans in the denef lab to a folder in my directory.
+Bins were split into folders by sample, but I wanted them all in one directory with sample names in filenames for drep.
+
+
+```{r}
+library(tidyverse)
+```
+
+
+Collect bins
+```{r}
+bins <- list.files("/omics/HABs/Microcystis/Microcystis_StrainDB_ROS_Enzyme_Search/WLE_strain_isolates/anvi_summaries_refined",pattern = ".*-contigs.fa",recursive = T,include.dirs = T) %>% 
+  data.frame(path = .)
+
+bin_renamed <- bins %>% 
+  filter(str_detect(path,"fastas")) %>% 
+  mutate(sample = str_extract(path,"[A-z, 0-9, -]*/") %>% str_remove("/"),
+         bin = str_extract(path,"bin_.*") %>% str_remove("-contigs.fa"),
+         link_name = glue::glue("/geomicro/data2/kiledal/metagenome_pipeline/data/combined_bins/{sample}_{bin}.fasta"),
+         full_path = glue::glue("/omics/HABs/Microcystis/Microcystis_StrainDB_ROS_Enzyme_Search/WLE_strain_isolates/anvi_summaries_refined/{path}"))
+
+for (i in 1:nrow(bin_renamed)) {
+  file.symlink(bin_renamed$full_path[i],bin_renamed$link_name[i])
+}
+
+```
+

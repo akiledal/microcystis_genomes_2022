@@ -8,3 +8,5 @@ slurm/**
 .Rhistory
 .stignore
 *.html
+results/**
+data/**
