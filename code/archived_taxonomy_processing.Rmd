@@ -1,0 +1,254 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+------------------------------------------------------------------------
+
+\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#
+
+**The code in this document for combining relative abundance tables and creating metacodeR figures for each sample has been moved to the snakefile, and so this is mostly a historic archive.**
+
+\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#\#
+
+------------------------------------------------------------------------
+
+## Summarize braken reports
+
+### Create relative abundance table of all samples
+
+This is now handled in the snakemake file and should probably be removed from this markdown document
+
+```{r}
+library(tidyverse)
+
+files <-  data.frame(file = list.files("data/kraken2/",full.names = TRUE)) %>% 
+  filter(str_detect(file,"_brackenReport.txt")) %>% 
+  mutate(sample = str_remove(file, "_brackenReport.txt"),
+         sample = str_remove(sample, "data/kraken2/"))
+
+
+
+combined <- data.frame()
+cols <- c("ra_and_subs","reads_and_subs","reads","rank","NCBI_id","tax")
+
+
+for (sample_id in files$sample){
+
+########
+##Read in GTDB classified report
+#######
+
+kraken <- read_tsv(paste0("data/kraken2/",sample_id,"_brackenReport.txt"), 
+                   col_names = cols,trim_ws = F)
+
+ranks_and_num <- unique(kraken$rank) %>% 
+  data.frame(rank = .) %>% 
+  mutate(num_rank = row_number())
+
+tax_split <- ranks_and_num %>% filter(rank != "U") %>% pull(rank)
+
+#Fill in higher level taxonomy and calculate relative abundances without sub-taxa
+kraken_gtdb <- kraken %>% separate(tax,into = tax_split,sep = "  ") %>%
+  mutate(across(everything(), ~na_if(.x,""))) %>%
+  left_join(ranks_and_num) %>% 
+  fill(any_of(tax_split)) %>% 
+  mutate(taxa = row_number()) %>% 
+  pivot_longer(tax_split,names_to = "row_rank",values_to = "row_tax") %>% 
+  left_join(ranks_and_num %>% rename(row_rank = "rank",row_num_rank = "num_rank")) %>% 
+  filter(row_num_rank <= num_rank) %>% 
+  pivot_wider(id_cols = c("taxa","ra_and_subs","reads_and_subs","reads","rank","NCBI_id"), names_from = "row_rank",values_from = "row_tax") %>% 
+  mutate(rel.abund = reads/sum(reads)) %>% 
+  mutate(R = paste0("r__",R),
+         taxonomy = paste(R,D,P,C,O,F,G,S,sep = "|"),
+         taxonomy = str_remove(taxonomy,"[NA|]+$"),
+         sample = sample_id) %>% 
+  select(sample,reads,taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id)
+
+combined <- combined %>% bind_rows(kraken_gtdb)
+
+}
+
+gtdb_wide <- combined %>% pivot_wider(id_cols = c(taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id),names_from = sample, values_from = reads,values_fill = 0)
+
+
+########
+##Read in refseq classified report
+#######
+
+combined <- data.frame()
+
+for (sample_id in files$sample){
+  
+kraken <- read_tsv(paste0("data/kraken2_euk/",sample_id,"_brackenReport.txt"), col_names = cols,trim_ws = F)
+
+ranks_and_num <- unique(kraken$rank) %>% 
+  data.frame(rank = .) %>% 
+  mutate(num_rank = row_number())
+
+tax_split <- ranks_and_num %>% filter(rank != "U") %>% pull(rank) %>% as.character()
+
+#Fill in higher level taxonomy and calculate relative abundances without sub-taxa
+kraken_refseq <- kraken %>% separate(tax,into = tax_split, sep = "  ") %>%
+  mutate(across(everything(), ~na_if(.x,""))) %>%
+  left_join(ranks_and_num) %>% 
+  fill(any_of(tax_split)) %>% 
+  mutate(taxa = row_number()) %>% 
+  pivot_longer(tax_split,names_to = "row_rank",values_to = "row_tax") %>% 
+  left_join(ranks_and_num %>% rename(row_rank = "rank",row_num_rank = "num_rank")) %>% 
+  filter(row_num_rank <= num_rank) %>% 
+  pivot_wider(id_cols = c("taxa","ra_and_subs","reads_and_subs","reads","rank","NCBI_id"), names_from = "row_rank",values_from = "row_tax") %>% 
+  mutate(rel.abund = reads/sum(reads),
+         across(c(R,D,P,C,O,F,G,S),~paste(tolower(cur_column()),.x,sep = "__")),
+         taxonomy = paste(R,D,P,C,O,F,G,S,sep = "|"),
+         taxonomy = str_remove(taxonomy,"[NA|]+$"),
+         sample = sample_id) %>% 
+  filter(D != "d__Bacteria") %>% 
+  select(sample,reads,taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id)
+
+combined <- combined %>% bind_rows(kraken_refseq)
+
+}
+
+refseq_wide <- combined %>% pivot_wider(id_cols = c(taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id),names_from = sample, values_from = reads,values_fill = 0)
+
+abudance <- bind_rows(gtdb_wide, refseq_wide)
+
+#Combine bacteria and archaea from GTDB with other life from refseq
+
+
+rel.abund <- abudance %>% 
+  mutate(across(-c(taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id), ~(.x/sum(.x)))) %>% write_tsv("c:/Users/eande/Desktop/kraken_rel_abund.tsv")
+
+```
+
+## MetacodeR tree for each sample
+
+This is now handled in the snakemake file and should probably be removed from this markdown document
+
+```{r}
+library(metacoder)
+library(tidyverse)
+
+simple_meta <- read_tsv("data/metadata.tsv")
+samples <- simple_meta$sample
+
+neg_controls <- simple_meta %>% filter(neg_control == TRUE) %>% pull(sample)
+
+rel.abund <- read_tsv("data/tax_profile/kraken_rel_abund.tsv") %>% 
+  select(one_of(samples), taxonomy) 
+
+for (sample in samples) {
+  
+
+sample_abund <- rel.abund %>% 
+  select(sample,taxonomy) %>% 
+  filter(get(sample) > 0)
+
+
+obj <- parse_tax_data(sample_abund, class_cols = "taxonomy", class_sep = "|",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#converting to relative abundance
+obj$data$tax_data <- calc_obs_props(obj, "tax_data")
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data")
+
+obj$data$tax_abund <- obj$data$tax_abund %>% rename(rel_abund = paste(sample))
+
+obj2 <- obj %>% filter_taxa(taxon_ranks == "g", supertaxa = TRUE, reassign_obs = TRUE, drop_obs = TRUE)
+
+#obj3 <- obj %>% filter_taxa(S3 > 0.001)
+
+(tree <- obj %>%
+    #filter_taxa(taxon_names %in% c("Viruses", "Bacteria", "Archaea", "Eukaryota"), subtaxa = TRUE) %>% 
+    #filter_taxa(taxon_ranks == "g", supertaxa = TRUE) %>%
+    filter_taxa(rel_abund > 0.001) %>%
+    heat_tree(node_label = taxon_names,
+          node_size = rel_abund,
+          node_size_range = c(0.00175,0.045),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 75,
+          node_color = rel_abund,
+          node_color_range = c("gray","gray","gray"),
+          node_color_axis_label = "Relative abundance")
+)
+ggsave(plot = tree,filename = paste0("c:/Users/eande/Desktop/",sample,"_kraken.pdf"), device = cairo_pdf(), width = 12, height = 12, dpi = 600)
+
+}
+```
+
+## MetacodeR tree for each sample, negs removed
+
+This is now handled in the snakemake file and should probably be removed from this markdown document
+
+```{r}
+library(metacoder)
+library(tidyverse)
+
+simple_meta <- read_tsv("data/metadata.tsv")
+samples <- simple_meta$sample
+
+neg_controls <- simple_meta %>% filter(neg_control == TRUE) %>% pull(sample)
+
+rel.abund <- read_tsv("data/tax_profile/kraken_rel_abund.tsv") %>% 
+  select(one_of(samples), taxonomy)
+
+tax_in_negs <- rel.abund %>% select(one_of(neg_controls), taxonomy) %>% 
+  filter(across(-taxonomy, ~ .x > 0))
+
+
+rel.abund <- rel.abund %>% 
+  select(!one_of(neg_controls)) %>% 
+  filter(!taxonomy %in% tax_in_negs$taxonomy)
+
+
+for (sample in samples) {
+  
+
+sample_abund <- rel.abund %>% 
+  select(sample,taxonomy) %>% 
+  filter(get(sample) > 0)
+
+
+obj <- parse_tax_data(sample_abund, class_cols = "taxonomy", class_sep = "|",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#converting to relative abundance
+obj$data$tax_data <- calc_obs_props(obj, "tax_data")
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data")
+
+obj$data$tax_abund <- obj$data$tax_abund %>% rename(rel_abund = paste(sample))
+
+obj2 <- obj %>% filter_taxa(taxon_ranks == "g", supertaxa = TRUE, reassign_obs = TRUE, drop_obs = TRUE)
+
+#obj3 <- obj %>% filter_taxa(S3 > 0.001)
+
+(tree <- obj %>%
+    #filter_taxa(taxon_names %in% c("Viruses", "Bacteria", "Archaea", "Eukaryota"), subtaxa = TRUE) %>% 
+    #filter_taxa(taxon_ranks == "g", supertaxa = TRUE) %>%
+    filter_taxa(rel_abund > 0.001) %>%
+    heat_tree(node_label = taxon_names,
+          node_size = rel_abund,
+          node_size_range = c(0.00175,0.045),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 75,
+          node_color = rel_abund,
+          node_color_range = c("gray","gray","gray"),
+          node_color_axis_label = "Relative abundance")
+)
+ggsave(plot = tree,filename = paste0("results/metacodeR_neg_removed",sample,"_kraken.pdf"), device = cairo_pdf(), width = 12, height = 12, dpi = 600)
+
+}
+```

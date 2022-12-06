@@ -1,0 +1,24 @@
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+  - knights-lab
+  - biobakery
+dependencies:
+  - spades=3.15.3
+  - fastqc=0.11.9
+  - trim-galore=0.6.6
+  - shogun=1.0.8
+  - bioawk=1.0
+  - megahit=1.2.9
+  - cutadapt=2.10
+  - prodigal=2.6.3
+  - emboss=6.6.0
+  - hmmer=3.3.1
+  - kraken2=2.1.2
+  - bracken=2.6.1
+  - humann=3.0.1
+  - bowtie2=2.4.4
+  - samtools=1.14
+  - taxonkit=0.10.1
+  - csvtk=0.23.0

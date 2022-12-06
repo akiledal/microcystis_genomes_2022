@@ -1,0 +1,139 @@
+---
+title: "Western Lake Erie Microcystis Strains"
+author: "Anders Kiledal"
+output: pdf_document
+#output: 
+#  pdf_document:
+#    extra_dependencies: ["float"]
+header-includes:
+  - \usepackage{placeins}    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+#knitr::opts_chunk$set(fig.pos = "!H", out.extra = "")
+
+# knitr::knit_hooks$set(plot = function(x, options)  {
+#   paste0(knitr::hook_plot_tex(x, options), "\n\\FloatBarrier\n")
+# })
+```
+
+# Heterotrophs Associated with WLE *Microcystis* Strains
+
+Heterotrophs associated with our WLE *Microcystis* strains were determined in two ways: 1) mapping reads to the bins produced by Jacob and 2) using k-mer based profiling of reads with Kraken and Bracken.
+
+## Bin-based abundance
+
+### Bin summary
+
+Here are a few figures summarizing bin completness and contamination:
+
+![Bin % completion (checkM).](../results/completion.png)
+
+\FloatBarrier
+
+![Bin % contamination (checkM).](../results/bin_contamination.png)
+
+\FloatBarrier
+
+The following tools were used to characterize bins:
+
+-   [GTDB-tk](https://github.com/Ecogenomics/GTDBTk) (release 202)
+
+-   [CheckM](https://github.com/Ecogenomics/CheckM)
+
+-   [dRep](https://github.com/MrOlm/drep)
+
+-   [CoverM](https://github.com/wwood/CoverM)
+
+### Within sample read recruitment to bins
+
+From per-sample assemblies, bins were determined with the following percent of reads mapping to bins (y-axis) in each sample (x-axis):
+
+![Percent of reads in each sample mapping to its bins.](../results/per_sample_bin_abund.png)
+
+\FloatBarrier
+
+### Read mapping across samples to dRep'd bins
+
+Bins were dereplicated to identify representative bins for each associated bacteria, and the following representative bins (y-axis) were present with *Microcystis* strains (x-axis):
+
+![Percent of reads in each sample mapping to representative bins. Only bins with at least 50% of bases covered by reads are shown per strain.](../results/drep_bin_presence.png)
+
+\FloatBarrier
+
+### Read mapping to bins, summarized by taxonomy
+
+Bins were then summarized by taxonomy:
+
+![Percent of reads in each sample mapping to bins, summarized by taxonomy. Taxa are separated into Cyanobacteria (middle) and Non-Cyanobacteria (bottom), and the percent of unmapped reads is also shown (top). Only included per strain are bins with at least 50% of bases covered and 1% of its reads mapping.](../results/unmapped_cyano_het_tax_presence.png)
+
+\FloatBarrier
+
+Bin abundance was also summarized at the genus level:
+
+![Percent of reads in each sample mapping to bins, summarized by genus. Genera are separated into Cyanobacteria (middle) and Non-Cyanobacteria (bottom), and the percent of unmapped reads is also shown (top). Only included per strain are bins with at least 50% of bases covered and 1% of its reads mapping.](../results/unmapped_genus_cyano_het_tax_presence.png)
+
+\FloatBarrier
+
+## Kmer-based abundance
+
+The k-mer tools Kraken and Bracken were used to generate taxonomic profiles for each sample (*Microcystis* strain) from un-assembled quality controlled reads. These results provide additional support for the bin-based abundance results, and account for unbinned organisms.
+
+![Percent abundance of genera in each Microcystis strain sample, determined by Bracken using a GTDB r202 database. Genera are separated by Cyanobacteria (top) and non-Cyanobacteria (bottom).](../results/bracken_cyano_and_het_abund.png)
+
+\FloatBarrier
+
+Abundance determined by read-mapping to bins is shown in comparison to Bracken results:
+
+![Abundance of genera in each Microcystis strain sample, determined by mapping reads to representative bins (left) and taxonomic profiling of quality controlled reads (right).](../results/bin_coverage_and_bracken_abund_faceted.png)
+
+\FloatBarrier
+
+Differences in the communities associated with each *Microcystis* strain are shown in the following NMDS plot, calculated from Bracken data summarized at the genus level:
+
+![Differences in microbial communities associated with each Microcystis strain are summarized in this non-metric multidimensional-scaling plot. Environmental parameters were also fit to the ordination; only those with a p.value \< 0.5 are shown.](../results/nmds_from_heterotroph_abundance.png)
+
+\FloatBarrier
+
+# Environmental associations with *Microcystis* strains
+
+Environmental conditions were measured for samples from Western Lake Eries, from which *Microcystis* strains were collected. Differences in these environmental conditions are summarized in the following PCA plot:
+
+![PCA plot of environmental conditions for the samples Microcystis strains were obtained from.](../results/pca_environmental_data.png)
+
+\FloatBarrier
+
+# Functional differences between WLE *Microcystis* strains and their associated communities
+
+## Community level functional differences
+
+Functional profiles (KEGG KO abundance) were produced for each assembly prior to binning by annotating prodigal gene calls with GhostKOALA.
+
+![Functional difference of Microcystis strain communities are summarized in this non-metric multidimensional-scaling plot. Environmental parameters were also fit to the ordination; only those with a p.value \< 0.5 are shown.](../results/nmds_sample_ko_abund.png)
+
+\FloatBarrier
+
+## Bin-based functional differences
+
+Functional profiles (KEGG KO abundance) were also produced for each bin by annotating genes determined by prodigal using GhostKOALA.
+
+### *Microcystis* functional differences
+
+![Functional differences of Microcystis bins are summarized in this non-metric multidimensional-scaling plot. Environmental parameters were also fit to the ordination; only those with a p.value \< 0.5 are shown.](../results/nmds_microcystis_env.png)
+
+\FloatBarrier
+
+![Functional differences of Microcystis bins are summarized in this non-metric multidimensional-scaling plot. Heterotroph abundance data was fit to the ordination; only those with a p.value \< 0.5 are shown.](../results/nmds_microcystis_het.png)
+
+\FloatBarrier
+
+### Heterotroph functional differences
+
+![Functional differences in the heterotrophs associated with each Microcystis strain are summarized in this non-metric multidimensional-scaling plot. Environmental parameters were also fit to the ordination; only those with a p.value \< 0.5 are shown.](../results/nmds_heterotroph_ko_with_env.png)
+
+\FloatBarrier
+
+### Correlation of functional differences in *Microcystis and* heterotrophs
+
+Bray-Curtis distance matrices were calculated separately for ko abundance in each sample's Microcystis bins and ko abundance in each sample's associated bacteria bins. The correlation of the *Microcystis* distance matrix and associated bacteria distance matrix was determined by Mantel test using Spearman rank correlations and 10,000 permutations. Functional differences between the Microcystis strains and the associated bacteria in each sample were correlated (Mantel test statistic r = 0.32, *p*-value = 0.0003).

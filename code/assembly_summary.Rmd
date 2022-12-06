@@ -1,0 +1,263 @@
+---
+title: "Assembly summary"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+Define assembly summary functions
+
+```{r}
+library(Biostrings)
+library(tidyverse)
+
+metaspades_process <- function(file_path){
+  
+  metaspades_contigs <- readDNAStringSet(file_path)
+  
+  sample <- file_path %>% str_remove("/contigs.fasta") %>% str_remove("data/combined_assembly_metaspades/")
+  
+  metaspades_df <- as.data.frame(metaspades_contigs) %>% 
+  dplyr::rename(sequence = "x") %>%
+  rownames_to_column("contig") %>% 
+  separate("contig",into = as.character(1:6),sep = "_") %>% 
+  select(name = "2",
+         length = "4",
+         coverage = "6",
+         sequence) %>% 
+  mutate(across(c(length,coverage),~as.numeric(.)),
+         assembler = "metaspades",
+         sample = sample)
+}
+
+
+megahit_process <- function(file_path){
+  
+  megahit_contigs <- readDNAStringSet(file_path)
+  
+  sample <- file_path %>% str_remove("/final.contigs.fa") %>% str_remove("data/combined_assembly_megahit/")
+
+  megahit_df <- as.data.frame(megahit_contigs) %>% 
+    rownames_to_column("header") %>% 
+    dplyr::rename(sequence = "x") %>%
+    separate("header",into=c("name","flag","coverage","length"),sep = " ") %>% 
+    mutate(across(c("flag","coverage","length"),~as.numeric(str_remove(.,"^[a-z]*="))),
+           assembler = "megahit",
+           sample = sample)
+}
+
+```
+
+Make combined dataset from both assemblers--this takes a little while.
+
+```{r}
+library(future.apply)
+plan(multisession, workers = 2) #can use multiple threads for apply functions
+
+#Find all metaspades contig files
+metaspades_files <- list.files("data/combined_assembly_metaspades", "^contigs.fasta$", recursive = TRUE, full.names = TRUE)  
+
+#Make combined table of metaspades contigs
+metaspades_summary <- future_lapply(metaspades_files, metaspades_process) %>% 
+  bind_rows()
+
+#Find all megahit contig files
+megahit_files <- list.files("data/combined_assembly_megahit","^final.contigs.fa$", recursive = TRUE, full.names = TRUE)
+
+#Make combined table of megahit contigs
+megahit_summary <- future_lapply(megahit_files, megahit_process) %>% bind_rows()
+
+#Combined table for both assemblers
+combined_summary <- bind_rows(megahit_summary,metaspades_summary) %>% 
+  mutate(gc_content = (str_count(sequence, "G") + str_count(sequence, "C")) / str_length(sequence) * 100)
+```
+
+Plot coverage vs contig length by assembler
+
+```{r}
+#plot
+combined_summary %>% ggplot(aes(length,coverage)) + 
+  geom_hex() + 
+  scale_y_log10() + 
+  scale_x_log10() + 
+  scale_fill_viridis_c(trans = "log10") + 
+  facet_grid(assembler ~ sample) + 
+  theme_bw() + 
+  ggsave("results/assembly_summary.png", type = "cairo", width = 30, height = 6)
+
+```
+
+Plot coverage vs gc content
+
+```{r}
+#plot
+combined_summary %>% 
+  filter(length > 10000) %>% 
+  ggplot(aes(gc_content,coverage, size = length, alpha = length)) + 
+    geom_point(alpha = 0.4) + 
+    scale_y_log10() + 
+    #scale_x_log10() + 
+    #scale_fill_viridis_c(trans = "log10") + 
+    facet_grid(assembler ~ sample) + 
+    theme_bw() + 
+  ggsave("results/gc_coverage.png", type = "cairo", width = 30, height = 6)
+
+```
+
+Plot top 100 contig lengths
+
+```{r}
+top_x_contigs <- combined_summary %>% 
+  group_by(sample) %>% 
+  #filter(assembler == "megahit") %>% 
+  slice_max(order_by = length, n = 100) %>% 
+  arrange(-length, .by_group = TRUE) %>% 
+  group_by(sample) %>% 
+  mutate(order = row_number())
+
+sample_order <- top_x_contigs %>% 
+  filter(order <= 20) %>% 
+  group_by(sample) %>% 
+  mutate(top20_mean = mean(length)) %>%
+  select(sample,top20_mean) %>% distinct() %>% 
+  arrange(-top20_mean) %>% pull(sample)
+
+
+top_x_contigs %>% 
+  ggplot(aes(order,length)) + 
+    #geom_bar(stat = "identity") +
+    geom_area(alpha = 0.5) +  
+    geom_point(aes(color = assembler)) +
+    scale_color_viridis_d() +
+    facet_wrap(~factor(sample,levels = sample_order)) +
+    theme_bw() +
+    labs(x = NULL, title = "Length of longest 100 contigs", y = "Length (bp)")+
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank()) +
+    ggsave("results/longest_contigs.png", height = 4, width = 5, scale = 2)
+
+```
+
+Number of contigs greater than 2500bp (common binner cutoff length)
+
+```{r}
+library(ggrepel)
+
+longer_than_cutoff_summary <- combined_summary %>% 
+  filter(length > 2500) %>% 
+  group_by(sample,assembler) %>% 
+  mutate(longest_contig = max(length)) %>% 
+  group_by(sample,assembler, longest_contig) %>% 
+  summarise(n_1k_or_longer = n())
+
+
+longer_than_cutoff_summary %>% 
+  ggplot(aes(reorder(sample,n_1k_or_longer), n_1k_or_longer, fill = assembler)) +
+  geom_bar(stat = "identity", position ="dodge") +
+  scale_fill_viridis_d(begin = 0.25, end = 0.75) +
+  coord_flip() +
+  theme_bw() +
+  labs(x = NULL, y = "Number of contigs longer than 1000bp") +
+  ggsave("results/number_of_contigs_1kbp_or_longer.png", type = "cairo", width = 4, height = 4, scale = 1.5)
+
+
+
+longer_than_cutoff_summary %>% 
+  ggplot(aes(n_1k_or_longer, longest_contig, label = sample, color = assembler)) +
+  geom_text_repel() +
+  scale_color_viridis_d(begin = 0.25, end = 0.75) +
+  #coord_flip() +
+  theme_bw() +
+  labs(y = "Longest contig length (bp)" , x = "Number of contigs longer than 2500bp") +
+  ggsave("results/max_contig_legnth_vs_number_of_1kPLUS_contigs.png", type = "cairo", width = 5, height = 4, scale = 1.5)
+
+```
+
+
+## Compare to CO-assembly approach
+```{r}
+
+co_assembly <- readDNAStringSet("data/COassembly_megahit/final.contigs.fa") %>% 
+  as.data.frame()
+
+co_assembly_summary <- co_assembly %>% 
+  rownames_to_column("header") %>% 
+  dplyr::rename(sequence = "x") %>%
+  separate("header",into=c("name","flag","coverage","length"),sep = " ") %>% 
+  mutate(across(c("flag","coverage","length"),~as.numeric(str_remove(.,"^[a-z]*="))),
+         assembler = "CO_megahit")
+
+replicate_and_co_assembly_summary <- bind_rows(co_assembly_summary, combined_summary) %>% 
+  arrange(-length)
+
+
+replicate_and_co_assembly_summary %>% 
+  filter(length > 500) %>% 
+  ggplot(aes(length, fill = assembler)) +
+  #geom_density(alpha = 0.2) +
+  geom_histogram() +
+  scale_x_log10() + 
+  scale_y_log10() +
+  facet_wrap(assembler ~.)+
+  theme_classic()
+
+
+```
+
+
+
+
+
+
+## Contig taxonomy
+
+```{r}
+
+megahit_tax_process <- function(file_path){
+  
+  sample <- file_path %>% 
+    str_remove("/kraken_.*.txt") %>% 
+    str_remove("data/combined_assembly_megahit/")
+  
+  database <- file_path %>% 
+    str_remove(".txt") %>% 
+    str_remove("data/combined_assembly_megahit/.*/kraken_")
+  
+  column_names <- c("classified","name","tax","length", "lca_map")
+  
+  megahit_contigs <- read_tsv(file_path,col_names = column_names) %>% 
+    mutate(sample = sample, 
+           database = database) %>% 
+    filter(classified == "C") %>% 
+    select(sample,database,name,tax)
+  
+  return(megahit_contigs)
+}
+
+
+megahit_tax_files <- list.files("data/combined_assembly_megahit","kraken_.*.txt", recursive = TRUE, full.names = TRUE)
+
+megahit_tax_summary <- future_lapply(megahit_tax_files, megahit_tax_process) %>% bind_rows()
+
+
+tax_map <- read_tsv("data/reference/bac120_metadata.tar.gz")
+
+
+gtdb_tax <- read_tsv("data/reference/taxID_info.tsv")
+
+
+megahit_tax_w_names <- megahit_tax_summary %>% 
+  mutate(taxID = str_extract(tax, "\\(taxid [0-9]*\\)") %>% 
+           str_remove("\\(taxid") %>% 
+           str_remove("\\)") %>% 
+           as.numeric(),
+         tax = str_remove(tax, " \\(taxid [0-9]*\\)")) %>% 
+  left_join(megahit_summary) %>% 
+  arrange(desc(length))
+  
+  
+  #left_join(gtdb_tax,by = c("tax" = "taxID"))
+
+```

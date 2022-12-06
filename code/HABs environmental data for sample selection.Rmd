@@ -1,0 +1,30 @@
+---
+title: "HABs environmental data for sample selection"
+output: html_notebook
+---
+```{r echo=FALSE, fig.height=20, fig.width=20}
+(over_time <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,
+         `Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, 
+         `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,
+                 `CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, 
+                 `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  filter(Site %in% c("WE2","WE4","WE12"),
+         Year >= 2014) %>% 
+  mutate(measurement = str_remove(measurement,"^CTD ")) %>% 
+  ggplot(aes(day_and_month,value, color = Site, measurement = measurement)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values = colors) +
+  scale_x_date(date_breaks = "2 weeks",date_labels = "%m-%d") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(x = NULL) +
+  facet_grid(measurement ~ Year,scales = "free_y")
+)  %>% plotly::ggplotly()
+```

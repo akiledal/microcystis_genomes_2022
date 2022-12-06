@@ -1,0 +1,68 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+library(tidyverse)
+```
+
+
+```{r}
+sam_files <- list.files(path = "data/phyloFlash", pattern = ".bbmap.sam",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(path = .)
+
+import_sam <- function(sam_file){
+
+  sample_name <- sam_files$path[1] %>% str_remove_all(".*/") %>% str_remove(".bbmap.sam")
+  
+  sam_cols <- c("QNAME", "FLAG", "RNAME", "POS", "MAPQ", "CIGAR", "RNEXT", "PNEXT", "TLEN", "SEQ", "QUAL")
+  
+  read_tsv(sam_file,col_names = sam_cols) %>% 
+    filter(str_detect(RNAME,"Microcystis")) %>% 
+    mutate(sample = sample_name)
+  
+}
+
+
+all_microcystis_hits <- map_df(sam_files$path,import_sam)
+
+sam <- sam_files %>% filter(str_detect(path,"ND-100")) %>% 
+
+microcystis_reads <- sam %>% filter(str_detect(RNAME, "Microcystis"))
+
+
+
+```
+
+
+
+```{r}
+spades_classifications <- list.files(path = "data/phyloFlash", pattern = "phyloFlash.extractedSSUclassifications.csv", full.names = T, recursive = T) %>% 
+  map_df(read_csv)
+
+fasta_df <- function(path){
+  Biostrings::readDNAStringSet(path) %>% 
+    data.frame(seq = .) %>% 
+    rownames_to_column("header")
+}
+
+spades_16S_seqs <- list.files(path = "data/phyloFlash", pattern = ".all.final.fasta", full.names = T, recursive = T) %>% 
+  map_df(fasta_df) %>% 
+  mutate(OTU = str_remove(header,"_[0-9,\\.]*$")) %>% 
+  left_join(spades_classifications)
+
+microcystis_seqs <- spades_16S_seqs %>% 
+  filter(str_detect(taxonomy,"Microcystis")) %>% 
+  select(header,seq)
+
+microcystis_biostrings <- Biostrings::DNAStringSet(microcystis_seqs$seq)
+names(microcystis_biostrings) <- microcystis_seqs$header
+
+Biostrings::writeXStringSet(microcystis_biostrings,"data/phyloFlash/microcystis_seqs.fasta")
+
+```

@@ -1,0 +1,2250 @@
+---
+title: "taxonomy_profiling"
+author: "Anders Kiledal"
+date: "3/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(vegan) #needed for distance calculations and NMDS
+library(ape) #needed for pcoa
+library(umap) #needed for umap
+library(glue)
+library(metacoder)
+library(indicspecies)
+
+source(here::here("code/util_funcs.R"))
+
+set.seed(1234321) #for reproducibility
+```
+
+# Taxonomic analysis of concrete metagenomes
+
+## Ordinations from raw relative abundances
+
+Plot ordinations with several different dimensionality reduction tools (NMDS, PCoA, UMAP) with several different distance metrics (Bray-Curtis, Aitchison).
+
+### Bray-Curtis distances
+
+Calculate Bray-Curtis distances on Hellinger transformed data.
+
+```{r}
+#Read in metadata
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  mutate(asr = factor(asr, levels = c("#N/A", "?","no","low","moderate","yes","high")),
+         extraction_date = lubridate::mdy(extraction_date)) %>% 
+  left_join(dist_negs)
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/braken_count_table.tsv")
+
+#Select only needed columns and perform Hellinger transformation
+simple_rel.abund <- rel.abund %>% 
+  column_to_rownames("taxonomy_id") %>%
+  dplyr::select(any_of(simple_meta$sample)) %>% 
+  as.matrix() %>% 
+  microbiome::transform("hellinger")
+
+#Transpose matrix for Vegan
+t_abund <- t(simple_rel.abund)
+
+#Calculate Bray-Curtis distances
+bc_dist <- vegdist(t_abund,method = "bray") 
+```
+
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(bc_dist)) %>% column_to_rownames("sample") #%>% filter(type == "concrete")
+
+(permanova_bc <- adonis2(bc_dist ~ type + location + asr_num, ordered_metadata))
+```
+
+#### NMDS:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(bc_dist,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Bray-Curtis Distances")
+  ) %>% 
+  plotly::ggplotly()
+```
+
+#### PCoA:
+
+```{r}
+#Calculate PCoA
+pcoa_res <- pcoa(bc_dist)
+
+#Plot eigenvalue barplot
+barplot(pcoa_res$values$Relative_eig[1:10])
+
+pcoa_df <- pcoa_res$vectors
+
+points <- pcoa_df %>% as.data.frame %>% 
+  rownames_to_column("sample") %>% 
+  dplyr::select(sample,Axis.1, Axis.2)
+
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(Axis.1,Axis.2,
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      labs(x = glue('Axis 1 ({signif(pcoa_res$values$Relative_eig[1],3) * 100} % variance)'),
+           y = glue('Axis 2 ({signif(pcoa_res$values$Relative_eig[2],3) * 100} % variance)'),
+           title = "PCoA from Bray-Curtis Distances") +
+    theme_bw()
+  
+  ) %>% plotly::ggplotly()
+```
+
+#### UMAP :
+
+```{r}
+
+#Calculate UMAP embedding
+umap <- umap(as.matrix(bc_dist),input = "dist")
+
+#Extract data for plot
+umap_layout <- umap$layout
+
+(umap_layout %>% as.data.frame() %>% 
+  rownames_to_column("sample") %>%  
+  left_join(simple_meta) %>% 
+  ggplot(aes(V1,V2,
+             color = contamination, 
+             sample = sample, 
+             notes = notes, 
+             ident_info = ident_info, 
+             other_notes=other_notes)) + 
+    geom_point() +
+    scale_color_viridis_c() +
+    theme_bw() +
+    labs(title = "UMAP of Bray-Curtis Distances")
+  ) %>% plotly::ggplotly()
+
+```
+
+### Aitchison distances
+
+```{r}
+#Select only needed columns and perform center log ratio (CLR) transformation
+simple_rel.abund <- rel.abund %>% 
+  dplyr::select(any_of(simple_meta$sample)) %>% 
+  as.matrix() %>% 
+  microbiome::transform("clr")
+
+#Transpose matrix for Vegan
+t_abund <- t(simple_rel.abund)
+
+#Calculate Aitchison distances (euclidian of CLR transformed abundances)
+ait_dist <- vegdist(t_abund,method = "euclidian")
+```
+
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(ait_dist)) %>% column_to_rownames("sample") #%>% filter(type == "concrete")
+
+(permanova_ait <- adonis2(ait_dist ~ type + location + asr_num, ordered_metadata))
+```
+
+#### NMDS:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(ait_dist,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Aitchison Distances")
+  ) %>% 
+  plotly::ggplotly()
+```
+
+#### PCoA:
+
+```{r}
+#Calculate PCoA
+pcoa_res <- pcoa(ait_dist)
+
+#Plot eigenvalue barplot
+barplot(pcoa_res$values$Relative_eig[1:10])
+
+pcoa_df <- pcoa_res$vectors
+
+points <- pcoa_df %>% as.data.frame %>% 
+  rownames_to_column("sample") %>% 
+  dplyr::select(sample,Axis.1, Axis.2)
+
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(Axis.1,Axis.2,
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      labs(x = glue('Axis 1 ({signif(pcoa_res$values$Relative_eig[1],3) * 100} % variance)'),
+           y = glue('Axis 2 ({signif(pcoa_res$values$Relative_eig[2],3) * 100} % variance)'),
+           title = "PCoA from Aitchison Distances") +
+    theme_bw()
+  
+  ) %>% plotly::ggplotly()
+```
+
+#### UMAP :
+
+```{r}
+
+#Calculate UMAP embedding
+umap <- umap(as.matrix(ait_dist),input = "dist")
+
+#Extract data for plot
+umap_layout <- umap$layout
+
+(umap_layout %>% as.data.frame() %>% 
+  rownames_to_column("sample") %>%  
+  left_join(simple_meta) %>% 
+  ggplot(aes(V1,V2,
+             color = location, 
+             sample = sample, 
+             notes = notes, 
+             ident_info = ident_info, 
+             other_notes=other_notes)) + 
+    geom_point() +
+    theme_bw() +
+    labs(title = "UMAP of Aitchison Distances")
+  ) %>% plotly::ggplotly()
+
+```
+
+## Ordinations from decontaminated data
+
+### Calculate decontaminated Bray-Curtis distances
+
+```{r}
+
+samples <- simple_meta %>% pull(sample)
+
+#Get list of negative control samples
+neg_controls <- simple_meta %>% 
+  filter(neg_control == TRUE) %>% 
+  pull(sample)
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/braken_count_table.tsv")
+
+contams <- read_tsv("results/contaminants.txt")
+
+contam_filt_rel.abund <- rel.abund %>%
+  dplyr::select(!one_of(neg_controls)) %>%
+  filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  dplyr::select(-taxonomy,-taxonomy_id) %>% 
+  filter(rowSums(.) > 0)
+
+bc_dist_no_contam <- contam_filt_rel.abund %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  filter(rowSums(.) > 0) %>% 
+  as.matrix() %>% 
+  vegdist(method = "bray")
+
+```
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(bc_dist_no_contam)) %>% column_to_rownames("sample") %>% filter(type == "concrete")
+
+concrete_bc_no_contam <- usedist::dist_subset(bc_dist_no_contam,rownames(ordered_metadata))
+
+(permanova_decontam_bc <- adonis2(concrete_bc_no_contam ~ location + asr_logical, ordered_metadata))
+```
+
+
+
+
+#### NMDS from decontaminated Bray-Curtis:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(bc_dist_no_contam,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Decontaminated Bray-Curtis Distances")
+  ) %>% 
+  plotly::ggplotly()
+```
+
+#### PCoA from decontaminated Bray-Curtis:
+
+```{r}
+
+#Calculate PCoA
+pcoa_res <- pcoa(bc_dist_no_contam)
+
+#Plot eigenvalue barplot
+barplot(pcoa_res$values$Relative_eig[1:10])
+
+pcoa_df <- pcoa_res$vectors
+
+points <- pcoa_df %>% as.data.frame %>% 
+  rownames_to_column("sample") %>% 
+  dplyr::select(sample,Axis.1, Axis.2)
+
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(Axis.1,Axis.2,
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      labs(x = glue('Axis 1 ({signif(pcoa_res$values$Relative_eig[1],3) * 100} % variance)'),
+           y = glue('Axis 2 ({signif(pcoa_res$values$Relative_eig[2],3) * 100} % variance)'),
+           title = "PCoA from Decontaminated Bray-Curtis Distances") +
+    theme_bw()
+  
+  ) %>% plotly::ggplotly()
+```
+
+#### UMAP:
+
+```{r}
+
+#Calculate UMAP embedding
+umap <- umap(as.matrix(bc_dist_no_contam),input = "dist")
+
+#Extract data for plot
+umap_layout <- umap$layout
+
+(umap_layout %>% as.data.frame() %>% 
+  rownames_to_column("sample") %>%  
+  left_join(simple_meta) %>% 
+  ggplot(aes(V1,V2,
+             color = location, 
+             sample = sample, 
+             notes = notes, 
+             ident_info = ident_info, 
+             other_notes=other_notes)) + 
+    geom_point() +
+    theme_bw() +
+    labs(title = "UMAP from Decontaminated Bray-Curtis Distances")
+  ) %>% plotly::ggplotly()
+
+```
+
+### Calculate decontaminated Aitchison distances:
+
+```{r}
+ait_dist_no_contam <- contam_filt_rel.abund %>% 
+  as.matrix() %>% 
+  microbiome::transform("clr") %>% 
+  t() %>% 
+  vegdist(method = "euclidian")
+
+```
+
+#### PERMANOVA testing
+```{r}
+ordered_metadata <- simple_meta %>% column_to_rownames("sample") %>% filter(type == "concrete")
+
+concrete_ait_no_contam <- usedist::dist_subset(ait_dist_no_contam,rownames(ordered_metadata))
+
+(permanova_decontam_ait <- adonis2(concrete_ait_no_contam ~ location + asr_logical, ordered_metadata))
+```
+
+
+
+#### NMDS from decontaminated Aitchison distances:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(ait_dist_no_contam,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Decontaminated Aitchison Distances")
+  ) %>% 
+  plotly::ggplotly()
+
+```
+
+#### PCoA from decontaminated Aitchison distances:
+
+```{r}
+
+#Calculate PCoA
+pcoa_res <- pcoa(ait_dist_no_contam)
+
+#Plot eigenvalue barplot
+barplot(pcoa_res$values$Relative_eig[1:10])
+
+pcoa_df <- pcoa_res$vectors
+
+points <- pcoa_df %>% as.data.frame %>% 
+  rownames_to_column("sample") %>% 
+  dplyr::select(sample,Axis.1, Axis.2)
+
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(Axis.1,Axis.2,
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      labs(x = glue('Axis 1 ({signif(pcoa_res$values$Relative_eig[1],3) * 100} % variance)'),
+           y = glue('Axis 2 ({signif(pcoa_res$values$Relative_eig[2],3) * 100} % variance)'),
+           title = "PCoA from Decontaminated Aitchison Distances") +
+    theme_bw()
+  
+  ) %>% plotly::ggplotly()
+```
+
+#### UMAP from decontaminated Aitchison distances:
+
+```{r}
+
+#Calculate UMAP embedding
+umap <- umap(as.matrix(ait_dist_no_contam),input = "dist")
+
+#Extract data for plot
+umap_layout <- umap$layout
+
+(umap_layout %>% as.data.frame() %>% 
+  rownames_to_column("sample") %>%  
+  left_join(simple_meta) %>% 
+  ggplot(aes(V1,V2,
+             color = location, 
+             sample = sample, 
+             notes = notes, 
+             ident_info = ident_info, 
+             other_notes=other_notes)) + 
+    geom_point() +
+    theme_bw() +
+    labs(title = "UMAP from Decontaminated Aitchison Distances")
+  ) %>% plotly::ggplotly()
+
+```
+
+
+
+
+## Decontaminated concrete only
+
+### Calculate decontaminated Bray-Curtis distances
+
+```{r}
+
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+samples <- simple_meta %>% pull(sample)
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/braken_count_table.tsv")
+
+contams <- read_tsv("results/contaminants.txt")
+
+contam_filt_rel.abund <- rel.abund %>%
+  dplyr::select(!one_of(neg_controls)) %>%
+  filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  dplyr::select(all_of(samples)) %>% 
+  filter(rowSums(.) > 0)
+
+bc_dist_no_contam <- contam_filt_rel.abund %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  filter(rowSums(.) > 0) %>% 
+  as.matrix() %>% 
+  vegdist(method = "bray")
+
+```
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(bc_dist_no_contam)) %>% column_to_rownames("sample") %>% filter(type == "concrete")
+
+concrete_bc_no_contam <- usedist::dist_subset(bc_dist_no_contam,rownames(ordered_metadata))
+
+(permanova_decontam_bc <- adonis2(concrete_bc_no_contam ~ location + asr_logical, ordered_metadata))
+```
+
+
+
+
+#### NMDS from decontaminated Bray-Curtis:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(bc_dist_no_contam,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot interactive plotly NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Decontaminated Bray-Curtis Distances")
+  ) %>% 
+  plotly::ggplotly()
+
+
+#Plot NMDS png
+(tax_bc_nmds <- points %>% left_join(simple_meta) %>% 
+    mutate(asr_logical = if_else(asr_logical == TRUE,"Reactive","Unreactive"),
+           location =case_when(
+             location == "delaware" ~ "DelDOT",
+             location == "new_jersey" ~ "NJDOT",
+             location == "star" ~ "STAR",
+             location == "series" ~ "Cylinder\nseries")) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = asr_logical,
+               shape = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+    labs(color = "ASR",
+         shape = "Sample source") +
+    annotate("text", label = glue::glue("Stress: {round(nmds$stress,3)}"), -.5, -.45) +  
+    scale_color_manual(values = c("#ef8a62", "#67a9cf")) +
+    geom_point(size = 2) +
+      theme_bw()
+  )
+
+ggsave("results/tax_bc_nmds.png",plot = tax_bc_nmds,width = 5, height = 4, dpi = 600, scale = 1.2)
+
+```
+
+
+
+### Aitchison distances:
+
+```{r}
+ait_dist_no_contam <- contam_filt_rel.abund %>% 
+  as.matrix() %>% 
+  microbiome::transform("clr") %>% 
+  t() %>% 
+  vegdist(method = "euclidian")
+
+```
+
+#### PERMANOVA testing
+```{r}
+ordered_metadata <- simple_meta %>% column_to_rownames("sample") %>% filter(type == "concrete")
+
+concrete_ait_no_contam <- usedist::dist_subset(ait_dist_no_contam,rownames(ordered_metadata))
+
+(permanova_decontam_ait <- adonis2(concrete_ait_no_contam ~ location + asr_logical, ordered_metadata))
+```
+
+
+
+#### NMDS from decontaminated Aitchison distances:
+
+```{r}
+#Calculate NMDS
+nmds <- metaMDS(ait_dist_no_contam,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(points %>% left_join(simple_meta) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+      geom_point() +
+      theme_bw() +
+      labs(title = "NMDS of Decontaminated Aitchison Distances")
+  ) %>% 
+  plotly::ggplotly()
+
+
+
+#Plot NMDS png
+(tax_ait_nmds <- points %>% left_join(simple_meta) %>% 
+    mutate(asr_logical = if_else(asr_logical == TRUE,"Reactive","Unreactive"),
+           location =case_when(
+             location == "delaware" ~ "DelDOT",
+             location == "new_jersey" ~ "NJDOT",
+             location == "star" ~ "STAR",
+             location == "series" ~ "Cylinder\nseries")) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = asr_logical,
+               shape = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+    labs(color = "ASR",
+         shape = "Sample source") +
+    annotate("text", label = glue::glue("Stress: {round(nmds$stress,3)}"), -150, -120) +  
+    scale_color_viridis_c() +
+    scale_color_manual(values = c("#ef8a62", "#67a9cf")) +
+    geom_point(size = 2) +
+      theme_bw()
+  )
+
+ggsave(plot = tax_ait_nmds, "results/concrete_ait_nmds.png", width = 5, height = 4, dpi = 600, scale = 1.2)
+
+```
+
+
+
+
+
+
+## Differential abundance testing of decontaminated data
+
+```{r}
+library(ALDEx2)
+library(tidyverse)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+#Read abundance
+
+contams <- read_tsv("results/contaminants.txt")
+
+otu_table <- read_tsv("results/braken_count_table.tsv") %>% 
+  filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  dplyr::select(-taxonomy) %>% 
+  column_to_rownames("taxonomy_id") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id)
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out <- aldex(otu_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out,"results/aldex/aldex_out.rds")
+
+aldex_out <- read_rds("results/aldex/aldex_out.rds")
+
+aldex.plot(aldex_out, type="MW")
+
+aldex.plot(aldex_out, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_w_taxa <- aldex_out %>% rownames_to_column("taxonomy_id") %>% left_join(taxonomy)
+
+
+#Plottting
+plot_metag_abund("g__Tomitella",transform = "hell")
+
+```
+
+
+#### Genus DA ALDEx2
+```{r}
+library(ALDEx2)
+library(tidyverse)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete" & str_detect(sample, "NEG",negate = TRUE)) %>% 
+  column_to_rownames("sample")
+
+samples <- rownames(metadata)
+
+#Read abundance
+
+table <- read_tsv("results/decontaminated_bracken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, any_of(samples)) %>% 
+  mutate(taxonomy = str_remove(taxonomy,"; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(samples), ~ sum(.x))) %>% 
+  column_to_rownames("taxonomy") %>%
+  .[,samples]
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_genus <- ALDEx2::aldex(table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_genus,"results/aldex/aldex_out_genus.rds")
+
+aldex_out <- read_rds("results/aldex/aldex_out.rds")
+
+aldex.plot(aldex_out, type="MW")
+
+aldex.plot(aldex_out, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_w_taxa <- aldex_out %>% rownames_to_column("taxonomy_id") %>% left_join(taxonomy)
+
+
+
+```
+
+
+
+
+
+
+
+### Differential abundance testing of the un-decontaminated data
+```{r}
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+#Read abundance
+
+contams <- read_tsv("results/contaminants.txt")
+
+otu_table <- read_tsv("results/braken_count_table.tsv") %>% 
+  #filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  dplyr::select(-taxonomy) %>% 
+  column_to_rownames("taxonomy_id") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id)
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_raw <- aldex(otu_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_raw,"results/aldex/aldex_out_raw.rds")
+
+aldex.plot(aldex_out_raw, type="MW")
+
+aldex.plot(aldex_out_raw, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out_raw, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_raw_w_taxa <- aldex_out_raw %>% rownames_to_column("taxonomy_id") %>% left_join(taxonomy)
+
+
+```
+
+
+
+Aldex differential abund at the genus level
+```{r}
+library(ALDEx2)
+library(tidyverse)
+library(gdata)
+library(BiocParallel)
+
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+#Read abundance
+
+contams <- read_tsv("results/contaminants.txt")
+
+otu_table <- read_tsv("results/braken_count_table.tsv") %>% 
+  filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(rownames(metadata)), ~sum(.x))) %>% 
+  column_to_rownames("taxonomy") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id) %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*"))
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_genus <- aldex(otu_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_genus,"results/aldex/aldex_out_genus.rds")
+
+aldex.plot(aldex_out, type="MW")
+
+aldex.plot(aldex_out, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_genus_w_taxa <- aldex_out %>% rownames_to_column("taxonomy_id") %>% left_join(taxonomy)
+
+
+```
+
+Aldex differential abund at the genus level of un-decontaminated data
+```{r}
+library(ALDEx2)
+library(qiime2R)
+library(tidyverse)
+library(gdata)
+library(BiocParallel)
+
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>%
+  filter(type == "concrete")
+
+#Read abundance
+
+contams <- read_tsv("results/contaminants.txt")
+
+otu_table <- read_tsv("results/braken_count_table.tsv") %>% 
+  #filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(rownames(metadata)), ~sum(.x))) %>% 
+  column_to_rownames("taxonomy") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id) %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*"))
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_genus_raw <- aldex(otu_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_genus_raw,"results/aldex/aldex_out_genus_raw.rds")
+
+aldex.plot(aldex_out_genus_raw, type="MW")
+
+aldex.plot(aldex_out_genus_raw, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+
+
+#aldex_out_genus_w_taxa <- aldex_out_genus_raw %>% rownames_to_column("taxonomy_id") %>% left_join(taxonomy)
+
+
+```
+
+
+
+
+
+Should implement something like this to account for negative controls and location confounding effects
+```{}
+covariates <- data.frame("A" = sample(0:1, 14, replace = TRUE),
+                         "B" = c(rep(0, 7), rep(1, 7)),
+                         "Z" = sample(c(1,2,3), 14, replace=TRUE))
+
+
+mm <- model.matrix(~ A + Z + B, covariates)
+x <- aldex.clr(selex, mm, mc.samples=8, denom="all")
+glm.effect <- aldex.glm.effect(x)
+```
+
+
+
+### GLM ALDEx genus
+
+ALDEX genus GLM testing for ASR DA
+```{r}
+library(ALDEx2)
+library(tidyverse)
+library(gdata)
+library(BiocParallel)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>%
+  filter(type == "concrete") %>% 
+  mutate(asr_factor = reorder.factor(asr_factor, new.order = c("yes","no")))
+
+
+otu_table <- read_tsv("results/decontaminated_bracken_count_table.tsv") %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(rownames(metadata)), ~sum(.x))) %>% 
+  column_to_rownames("taxonomy") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id) %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*"))
+
+
+mm <- model.matrix(~ location + asr_factor, metadata)
+
+aldex_clr_genus <- aldex.clr(otu_table,mm,mc.samples = 128)
+
+glm_genus <- aldex.glm(aldex_clr_genus)
+
+glm_effect_genus <- aldex.glm.effect(aldex_clr_genus)
+
+
+
+effect_and_signif <- glm_genus %>% 
+  rownames_to_column("taxonomy") %>% 
+  left_join(glm_effect_genus$asr_factorno %>% rownames_to_column("taxonomy"))
+
+
+
+signif_asr <- effect_and_signif %>% 
+  filter(`model.asr_factorno Pr(>|t|)` <= 0.05)
+
+
+signif_asr_reactive <- signif_asr %>% 
+  filter(effect <0) %>% 
+  mutate(color = "blue",
+         asr = "ASR-reactive")
+
+signif_asr_nonreactive <- signif_asr %>% 
+  filter(effect > 0) %>% 
+  mutate(color = "orange",
+         asr = "ASR-unreactive")
+
+plot_table <- bind_rows(signif_asr_reactive,signif_asr_nonreactive)
+
+
+
+(asr_diff_abund <- plot_table %>% 
+  mutate(taxonomy = str_remove(taxonomy,".*p__")) %>%   
+  ggplot(aes(reorder(taxonomy,effect), effect, fill = asr)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("orange","blue")) +
+  labs(x = NULL, fill = "ASR", y = "ALDEx2 Effect Size") +
+  theme_bw()
+)
+ggsave(plot = asr_diff_abund, "results/asr_diff_abund_aldex.png", height = 2, width = 5, dpi = 600, scale = 2)
+
+
+
+
+
+
+```
+
+
+
+
+PreDecontam ALDEX genus GLM testing for ASR DA
+```{r}
+library(ALDEx2)
+library(tidyverse)
+library(gdata)
+library(BiocParallel)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>%
+  filter(type == "concrete" | neg_control == TRUE, 
+         !str_detect(rownames(.), "NEG")) %>% 
+  mutate(asr_factor = reorder.factor(asr_factor, new.order = c("other", "no", "yes")))
+
+
+otu_table <- read_tsv("results/combined_bracken.tsv") %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(rownames(metadata)), ~sum(.x))) %>% 
+  column_to_rownames("taxonomy") %>% 
+  .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, taxonomy_id) %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*"))
+
+
+mm <- model.matrix(~ asr_factor + location, metadata)
+
+aldex_clr_genus_raw <- aldex.clr(otu_table,mm,mc.samples = 128)
+
+glm_genus_raw <- aldex.glm(aldex_clr_genus_raw)
+
+glm_effect_genus_raw <- aldex.glm.effect(aldex_clr_genus_raw)
+
+
+(plot <- otu_table %>% 
+  microbiome::transform("hell") %>% as.data.frame() %>% 
+  rownames_to_column("taxonomy") %>% 
+  pivot_longer(-taxonomy, names_to = "sample", values_to = "abund") %>% 
+  #left_join(taxonomy) %>% 
+  filter(str_detect(taxonomy,"g__Psychrobacter")) %>%
+  left_join(metadata %>% rownames_to_column("sample")) %>% 
+  ggplot(aes(sample,abund, color = location, label = sample)) + geom_point() + facet_grid(~ asr_factor,scales = "free_x") + theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 0, vjust = 0))
+) %>% plotly::ggplotly()
+
+
+```
+
+
+
+## Indicator species analysis
+
+
+### Indicators of ASR (preDecontam)
+```{r}
+
+library(tidyverse)
+library(indicspecies)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+table <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, any_of(metadata$sample))
+
+matrix <- table %>% 
+  column_to_rownames("taxonomy") %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t()
+
+groupings <- metadata[match(rownames(matrix),metadata$sample),] %>% pull("asr_logical")
+
+ind_val <- indicspecies::multipatt(matrix,groupings, max.order = 3, control = how(nperm = 999))
+
+saveRDS(ind_val,"results/asr_inds_predecontam.rds")
+```
+
+
+### Indicators of ASR
+```{r}
+
+library(tidyverse)
+library(indicspecies)
+
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+table <- read_tsv("results/decontaminated_bracken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, any_of(metadata$sample))
+
+matrix <- table %>% 
+  column_to_rownames("taxonomy") %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t()
+
+groupings <- metadata[match(rownames(matrix),metadata$sample),] %>% pull("asr_logical")
+
+ind_val <- indicspecies::multipatt(matrix,groupings, max.order = 3, control = how(nperm = 999))
+
+saveRDS(ind_val,"results/asr_inds.rds")
+```
+
+analyze indic species results
+```{r}
+ind_val <- read_rds("results/asr_inds.rds")
+
+inds_df <- ind_val$sign %>% 
+  filter(p.value <= 0.05 & index != 3 & stat > 0.5)
+
+```
+
+
+
+
+### Genus indicators of ASR (preDecontam)
+```{r}
+
+library(tidyverse)
+library(indicspecies)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+table <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, any_of(metadata$sample)) %>% 
+  mutate(taxonomy = str_remove(taxonomy,"; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x)))
+
+matrix <- table %>% 
+  column_to_rownames("taxonomy") %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t()
+
+groupings <- metadata[match(rownames(matrix),metadata$sample),] %>% pull("asr_logical")
+
+genus_ind_val <- indicspecies::multipatt(matrix,groupings, max.order = 3, control = how(nperm = 999))
+
+saveRDS(genus_ind_val,"results/asr_genus_inds_predecontam.rds")
+```
+
+
+
+### Genus indicators of ASR (decontam)
+```{r}
+library(indicspecies)
+library(permute)
+library(vegan)
+library(phyloseq)
+library(tidyverse)
+library(qiime2R)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+table <- read_tsv("results/decontaminated_bracken_count_table.tsv") %>% 
+  dplyr::select(taxonomy, any_of(metadata$sample)) %>% 
+  mutate(taxonomy = str_remove(taxonomy,"; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x)))
+
+matrix <- table %>% 
+  column_to_rownames("taxonomy") %>% 
+  as.matrix() %>% 
+  microbiome::transform("hell") %>% 
+  t()
+
+groupings <- metadata[match(rownames(matrix),metadata$sample),] %>% pull("asr_logical")
+
+genus_ind_val <- indicspecies::multipatt(matrix,groupings, max.order = 3, control = how(nperm = 999))
+
+saveRDS(genus_ind_val,"results/asr_genus_inds.rds")
+```
+
+```{r}
+
+
+genus_ind_val <- read_rds("results/asr_genus_inds.rds")
+
+genus_inds_df <- genus_ind_val$sign %>% 
+  filter(p.value <= 0.05 & index != 3 & stat > 0.5) %>% 
+  rownames_to_column("taxonomy") %>% 
+  filter(!str_detect(taxonomy,"Eukaryota")) %>% 
+  mutate(asr = if_else(index == 1, "ASR-unreactive","ASR-reactive"))
+
+(asr_inds <- genus_inds_df %>% 
+  mutate(taxonomy = str_remove(taxonomy,".*d__")) %>%   
+  ggplot(aes(reorder(taxonomy,stat), stat, fill = asr)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("orange","blue")) +
+  labs(x = NULL, fill = "ASR", y = "Indicator statistic") +
+  theme_bw()
+)
+ggsave(plot = asr_inds, "results/asr_inds_genus.png", height = 2, width = 5, dpi = 600, scale = 2.2)
+
+
+
+
+```
+
+
+Make a combined aldex GLM diff abund plot and indicator species plot
+```{r}
+library(patchwork)
+
+asr_diff_abund / asr_inds + plot_layout(guides = "collect",heights = c(1,1.5)) + plot_annotation(tag_levels = "A") & theme(legend.position = "top")
+ggsave("results/indicator_and_diff_abund.png", width = 6, height = 4, scale = 2, dpi = 600)
+
+```
+
+
+
+
+
+
+
+
+## Compare cylinder series indicators
+```{r}
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+    mutate(sample_wo_replicate = str_remove(sample, "[a-z]"),
+           replicate = str_remove(sample, "[A-Z,0-9]*")) %>% 
+    column_to_rownames("sample") %>% 
+    filter(type == "concrete",
+           !str_detect(rownames(.), "NEG")) %>% 
+  mutate(location =case_when(
+             location == "delaware" ~ "DelDOT",
+             location == "new_jersey" ~ "NJDOT",
+             location == "star" ~ "STAR",
+             location == "series" ~ "Cylinder\nseries"))
+    
+
+otu_table <- read_tsv("results/decontaminated_bracken_count_table.tsv") %>% 
+    #filter(!taxonomy_id %in% contams$taxonomy_id) %>%
+    dplyr::select(-taxonomy) %>% 
+    column_to_rownames("taxonomy_id") %>% 
+    .[,rownames(metadata)]
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+    dplyr::select(taxonomy, taxonomy_id)
+
+
+
+ind_mapping <- data.frame(series_ind = c(
+                          "Arcobacter", 
+                          "Bryobacter",
+                          "Carnobacterium",
+                          "Flavobacterium",
+                          "Laswonella",
+                          "Modestobacter",
+                          "Rheinheimera soli",
+                          "Rhodocyclaceae",
+                          "Salinicoccus"),
+           regex = c("Malaciobacter|Aliarcobacter", 
+                     "Bryobacter|UBA[0-9]*|Palsa-[0-9]*",
+                     "Pisciglobus|Carnobacterium_A|Carnobacterium",
+                     "Flavobacterium",
+                     "Laswonella",
+                     "Modestobacter|Klenkia",
+                     "Pararheinheimera soli",
+                     "Rhodocyclaceae",
+                     "Salinicoccus"
+                     ))
+
+
+series_ind <- ind_mapping$series_ind[1]
+tax_str <- ind_mapping$regex[1]
+  
+plot_table <- otu_table %>% 
+    microbiome::transform("compositional") %>% as.data.frame() %>% 
+    rownames_to_column("taxonomy_id") %>% 
+    pivot_longer(-taxonomy_id, names_to = "sample", values_to = "abund") %>% 
+    left_join(taxonomy) %>% 
+    filter(str_detect(taxonomy,tax_str)) %>%
+    group_by(sample) %>% summarise(abund = sum(abund)) %>% 
+    left_join(metadata %>% rownames_to_column("sample")) %>% 
+  mutate(ASR = if_else(asr_logical,"ASR-reactive","ASR-unreactive"),
+         series_indicator = series_ind)
+
+
+
+for (i in 2:nrow(ind_mapping)) {
+  
+  series_ind <- ind_mapping$series_ind[i]
+  tax_str <- ind_mapping$regex[i]
+  
+  new_table <- otu_table %>% 
+    microbiome::transform("compositional") %>% as.data.frame() %>% 
+    rownames_to_column("taxonomy_id") %>% 
+    pivot_longer(-taxonomy_id, names_to = "sample", values_to = "abund") %>% 
+    left_join(taxonomy) %>% 
+    filter(str_detect(taxonomy,tax_str)) %>%
+    group_by(sample) %>% summarise(abund = sum(abund)) %>% 
+    left_join(metadata %>% rownames_to_column("sample")) %>% 
+    mutate(ASR = if_else(asr_logical,"ASR-reactive","ASR-unreactive"),
+         series_indicator = series_ind)
+  
+  plot_table <- bind_rows(plot_table,new_table)
+  
+}
+
+
+
+plot_table %>% 
+    ggplot(aes(sample_wo_replicate,abund*100, shape = location, notes =ident_info)) + 
+      geom_point() + 
+      facet_grid( series_indicator ~ ASR,scales = "free",space = "free_x",switch = "y") + 
+      labs(x = NULL,
+           y = "Relative abundance (%)",
+           shape = "Sample source") +
+      scale_y_log10() +
+      theme_bw() +
+      scale_y_continuous(position = "right") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+            legend.position = "left")
+ggsave("results/series_inds_revisited.png",height = 6, width = 5, scale = 1.5, dpi = 600)
+
+
+```
+
+
+
+
+
+
+
+## MetacodeR figures: community compostion summaries
+
+### All concrete samples
+```{r}
+abund_mat <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+met_samples <- read_tsv("data/metadata.tsv") %>% 
+              filter(sample %in% colnames(abund_mat),
+                     type =="concrete")
+
+met_otus <- abund_mat %>%
+              dplyr::select(taxonomy_id,taxonomy,any_of(met_samples$sample)) %>% 
+  mutate(across(any_of(met_samples$sample), ~.x/sum(.x))) %>% 
+  pivot_longer(-c(taxonomy_id,taxonomy),names_to = "sample", values_to = "abund") %>% 
+  filter(!is.na(abund)) %>% 
+  group_by(taxonomy_id,taxonomy) %>% 
+  summarise(abund = sum(abund)) %>% ungroup() %>% mutate(abund = abund / sum(abund))
+
+#Make the MetaCodeR obj
+obj <- parse_tax_data(met_otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#summing per-taxon counts
+obj$data$rel_abd <- calc_obs_props(obj, "tax_data", other_cols = T)
+obj$data$tax_abund <- calc_taxon_abund(obj, "rel_abd")
+
+
+obj$data$tax_data <- NULL #otherwise this is ambiguous and confuses metacodeR
+obj$data$rel_abd <- NULL 
+
+#Make the heat tree
+(tree <- obj %>%
+metacoder::filter_taxa(taxon_ranks == "g", supertaxa = TRUE,reassign_obs = TRUE, subtaxa = FALSE) %>% # subset to the genus rank
+metacoder::filter_obs(data = "tax_abund", .$data$tax_abund$abund > 0.005, drop_taxa = TRUE,supertaxa = TRUE,reassign_obs = TRUE) %>% #filter to only plot taxa that represent at least 0.5% of the community
+heat_tree(node_label = taxon_names,
+          node_size = abund,
+          node_size_range = c(0.002,0.05),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 60 ,
+          node_color = abund,
+          node_color_range = c("gray80","gray80","gray80"),
+          node_color_axis_label = "Relative abundance")
+)
+
+ggsave(plot = tree, "results/concrete_community.pdf", device = cairo_pdf, width = 6, height = 6, dpi = 600)
+ggsave(plot = tree, "results/concrete_community.png", type = "cairo", dpi = 600, width = 6, height = 6)
+
+```
+
+### Each location (decontam)
+```{r}
+abund_mat <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+locations <- read_tsv("data/metadata.tsv") %>% 
+              filter(sample %in% colnames(abund_mat),
+                     type =="concrete") %>% pull("location") %>% unique()
+
+
+for (loc in locations){
+
+met_samples <- read_tsv("data/metadata.tsv") %>% 
+              filter(sample %in% colnames(abund_mat),
+                     type =="concrete",
+                     location == loc)
+
+met_otus <- abund_mat %>%
+              dplyr::select(taxonomy_id,taxonomy,any_of(met_samples$sample)) %>% 
+  mutate(across(any_of(met_samples$sample), ~.x/sum(.x))) %>% 
+  pivot_longer(-c(taxonomy_id,taxonomy),names_to = "sample", values_to = "abund") %>% 
+  filter(!is.na(abund)) %>% 
+  group_by(taxonomy_id,taxonomy) %>% 
+  summarise(abund = sum(abund)) %>% ungroup() %>% mutate(abund = abund / sum(abund))
+
+#Make the MetaCodeR obj
+obj <- parse_tax_data(met_otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#summing per-taxon counts
+obj$data$rel_abd <- calc_obs_props(obj, "tax_data", other_cols = T)
+obj$data$tax_abund <- calc_taxon_abund(obj, "rel_abd")
+
+
+obj$data$tax_data <- NULL #otherwise this is ambiguous and confuses metacodeR
+obj$data$rel_abd <- NULL 
+
+#Make the heat tree
+(tree <- obj %>%
+metacoder::filter_taxa(taxon_ranks == "g", supertaxa = TRUE,reassign_obs = TRUE, subtaxa = FALSE) %>% # subset to the genus rank
+metacoder::filter_obs(data = "tax_abund", .$data$tax_abund$abund > 0.005, drop_taxa = TRUE,supertaxa = TRUE,reassign_obs = TRUE) %>% #filter to only plot taxa that represent at least 0.5% of the community
+heat_tree(node_label = taxon_names,
+          node_size = abund,
+          node_size_range = c(0.002,0.05),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 60 ,
+          node_color = abund,
+          node_color_range = c("gray80","gray80","gray80"),
+          node_color_axis_label = "Relative abundance")
+)
+
+ggsave(plot = tree, paste0("results/",loc,"_community.pdf"), device = cairo_pdf, width = 6, height = 6, dpi = 600)
+ggsave(plot = tree, paste0("results/",loc,"_community.png"), type = "cairo", dpi = 600, width = 6, height = 6)
+
+}
+
+```
+
+
+
+### Each location (raw)
+```{r}
+abund_mat <- read_tsv("results/braken_count_table.tsv")
+
+locations <- read_tsv("data/metadata.tsv") %>% 
+              filter(sample %in% colnames(abund_mat),
+                     type =="concrete") %>% pull("location") %>% unique()
+
+
+for (loc in locations){
+
+met_samples <- read_tsv("data/metadata.tsv") %>% 
+              filter(sample %in% colnames(abund_mat),
+                     type =="concrete",
+                     location == loc)
+
+met_otus <- abund_mat %>%
+              dplyr::select(taxonomy_id,taxonomy,any_of(met_samples$sample)) %>% 
+  mutate(across(any_of(met_samples$sample), ~.x/sum(.x))) %>% 
+  pivot_longer(-c(taxonomy_id,taxonomy),names_to = "sample", values_to = "abund") %>% 
+  filter(!is.na(abund)) %>% 
+  group_by(taxonomy_id,taxonomy) %>% 
+  summarise(abund = sum(abund)) %>% ungroup() %>% mutate(abund = abund / sum(abund))
+
+#Make the MetaCodeR obj
+obj <- parse_tax_data(met_otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#summing per-taxon counts
+obj$data$rel_abd <- calc_obs_props(obj, "tax_data", other_cols = T)
+obj$data$tax_abund <- calc_taxon_abund(obj, "rel_abd")
+
+
+obj$data$tax_data <- NULL #otherwise this is ambiguous and confuses metacodeR
+obj$data$rel_abd <- NULL 
+
+#Make the heat tree
+(tree <- obj %>%
+metacoder::filter_taxa(taxon_ranks == "g", supertaxa = TRUE,reassign_obs = TRUE, subtaxa = FALSE) %>% # subset to the genus rank
+metacoder::filter_obs(data = "tax_abund", .$data$tax_abund$abund > 0.005, drop_taxa = TRUE,supertaxa = TRUE,reassign_obs = TRUE) %>% #filter to only plot taxa that represent at least 0.5% of the community
+heat_tree(node_label = taxon_names,
+          node_size = abund,
+          node_size_range = c(0.002,0.05),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 60 ,
+          node_color = abund,
+          node_color_range = c("gray80","gray80","gray80"),
+          node_color_axis_label = "Relative abundance")
+)
+
+ggsave(plot = tree, paste0("results/",loc,"_preDecontam_community.pdf"), device = cairo_pdf, width = 6, height = 6, dpi = 600)
+ggsave(plot = tree, paste0("results/",loc,"_preDecontam_community.png"), type = "cairo", dpi = 600, width = 6, height = 6)
+
+}
+
+```
+
+
+
+## Heat tree matrix for locations (decontam)
+```{r}
+met_samples <- read_tsv("data/metadata.tsv")
+
+delaware_samples <- met_samples %>%
+  filter(location == "delaware") %>%
+  pull("sample")
+  
+NJ_samples <- met_samples %>%
+  filter(location == "new_jersey") %>%
+  pull("sample")
+  
+star_samples <- met_samples %>%
+  filter(location == "star") %>%
+  pull("sample")
+
+series_samples <- met_samples %>%
+  filter(location == "series") %>%
+  pull("sample")
+
+samples_to_compare <- c(delaware_samples,NJ_samples,star_samples,series_samples)
+
+otus <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("DelDOT", "NJDOT", "STAR", "Series")
+
+delaware <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(delaware_samples)) %>% 
+  rowSums(.) %>% data.frame(DelDOT = ./sum(.)) %>% dplyr::select(-`.`)
+
+nj <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(NJ_samples)) %>% 
+  rowSums(.) %>% data.frame(NJDOT = ./sum(.)) %>% dplyr::select(-`.`)
+  
+star <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(star_samples)) %>% 
+  rowSums(.) %>% data.frame(STAR = ./sum(.)) %>% dplyr::select(-`.`)
+  
+series <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(series_samples)) %>% 
+  rowSums(.) %>% data.frame(Series = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(delaware,nj,star,series) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (DelDOT + NJDOT + STAR + Series)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+colors <- c("#ef8a62","grey70", "#67a9cf")
+
+(heat_tree <- obj %>%
+heat_tree_matrix(data = "diff_table",
+                 node_size = Combined,
+                 key_size = 0.7,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 # node_color_range = viridis::viridis(3),
+                 # row_label_color = viridis::viridis(3)[3],
+                 # col_label_color = viridis::viridis(3)[1],
+                 node_color_range = colors,
+                 row_label_color = colors[3],
+                 col_label_color = colors[1],
+                 node_color_trans = "linear",
+                 node_color_interval = c(-3, 3),
+                 edge_color_interval = c(-3, 3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 100,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+  ggsave(plot = heat_tree, "results/location_tree.pdf", width = 6, height = 6)
+  ggsave(plot = heat_tree, "results/location_tree.png", width = 6, height = 6)
+```
+
+
+
+
+
+
+
+## Heat tree matrix for locations (preDecontam)
+```{r}
+met_samples <- read_tsv("data/metadata.tsv")
+
+delaware_samples <- met_samples %>%
+  filter(location == "delaware") %>%
+  pull("sample")
+  
+NJ_samples <- met_samples %>%
+  filter(location == "new_jersey") %>%
+  pull("sample")
+  
+star_samples <- met_samples %>%
+  filter(location == "star") %>%
+  pull("sample")
+
+series_samples <- met_samples %>%
+  filter(location == "series") %>%
+  pull("sample")
+
+samples_to_compare <- c(delaware_samples,NJ_samples,star_samples,series_samples)
+
+otus <- read_tsv("results/braken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("Delaware", "New_Jersey", "STAR", "Series")
+
+delaware <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(delaware_samples)) %>% 
+  rowSums(.) %>% data.frame(Delaware = ./sum(.)) %>% dplyr::select(-`.`)
+
+nj <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(NJ_samples)) %>% 
+  rowSums(.) %>% data.frame(New_Jersey = ./sum(.)) %>% dplyr::select(-`.`)
+  
+star <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(star_samples)) %>% 
+  rowSums(.) %>% data.frame(STAR = ./sum(.)) %>% dplyr::select(-`.`)
+  
+series <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(series_samples)) %>% 
+  rowSums(.) %>% data.frame(Series = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(delaware,nj,star,series) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (Delaware + New_Jersey + STAR + Series)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+colors <- c("#ef8a62","grey70", "#67a9cf")
+
+(heat_tree <- obj %>%
+heat_tree_matrix(data = "diff_table",
+                 node_size = Combined,
+                 key_size = 0.7,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 # node_color_range = viridis::viridis(3),
+                 # row_label_color = viridis::viridis(3)[3],
+                 # col_label_color = viridis::viridis(3)[1],
+                 node_color_range = colors,
+                 row_label_color = colors[3],
+                 col_label_color = colors[1],
+                 node_color_trans = "linear",
+                 node_color_interval = c(-3, 3),
+                 edge_color_interval = c(-3, 3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 100,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+  ggsave(plot = heat_tree, "results/location_preDecontam_tree.pdf", width = 6, height = 6)
+  ggsave(plot = heat_tree, "results/location_preDecontam_tree.png", width = 6, height = 6)
+```
+
+
+
+
+
+## Heat tree of ASR vs. non-ASR 
+```{r}
+
+met_samples <- read_tsv("data/metadata.tsv")
+
+ASR_samples <- met_samples %>%
+  filter(type == "concrete",
+         asr_logical == TRUE) %>%
+  pull("sample")
+  
+noASR_samples <- met_samples %>%
+  filter(type == "concrete",
+         asr_logical == FALSE) %>%
+  pull("sample")
+
+samples_to_compare <- c(ASR_samples,noASR_samples)
+
+otus <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("ASR_positive", "ASR_negative")
+
+asr <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(ASR_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_positive = ./sum(.)) %>% dplyr::select(-`.`)
+  
+asr_neg <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(noASR_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_negative = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(asr, asr_neg) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (ASR_positive + ASR_negative)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(ASR_heat_tree <- obj %>%
+      heat_tree(
+                 node_size = Combined,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 #node_color_range = viridis::viridis(3),
+                 node_color_range = c("#3279a8","grey80", "#ffc559"),
+                 node_color_trans = "linear",
+                 node_color_interval = c(3, -3),
+                 edge_color_interval = c(3, -3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+
+
+ggsave(plot = ASR_heat_tree, "results/ASR_heat_tree.pdf",  width = 6, height = 6, dpi = 600)
+ggsave(plot = ASR_heat_tree, "results/ASR_heat_tree.png", width = 6, height = 6, dpi = 600)
+```
+
+
+
+
+## Heat tree of ASR vs. non-ASR (preDecontam)
+```{r}
+
+met_samples <- read_tsv("data/metadata.tsv")
+
+ASR_samples <- met_samples %>%
+  filter(type == "concrete",
+         asr_logical == TRUE) %>%
+  pull("sample")
+  
+noASR_samples <- met_samples %>%
+  filter(type == "concrete",
+         asr_logical == FALSE) %>%
+  pull("sample")
+
+samples_to_compare <- c(ASR_samples,noASR_samples)
+
+otus <- read_tsv("results/braken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("ASR_positive", "ASR_negative")
+
+asr <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(ASR_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_positive = ./sum(.)) %>% dplyr::select(-`.`)
+  
+asr_neg <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(noASR_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_negative = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(asr, asr_neg) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (ASR_positive + ASR_negative)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(ASR_heat_tree <- obj %>%
+      heat_tree(
+                 node_size = Combined,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 #node_color_range = viridis::viridis(3),
+                 node_color_range = c("#3279a8","grey80", "#ffc559"),
+                 node_color_trans = "linear",
+                 node_color_interval = c(3, -3),
+                 edge_color_interval = c(3, -3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+
+
+  ggsave(plot = ASR_heat_tree, "results/ASR_preDecontam_heat_tree.pdf",  width = 6, height = 6, dpi = 600)
+  ggsave(plot = ASR_heat_tree, "results/ASR_preDecontam_heat_tree.png", width = 6, height = 6, dpi = 600)
+```
+
+
+
+
+## Heat tree of STAR concrete vs. STAR soil 
+```{r}
+
+met_samples <- read_tsv("data/metadata.tsv")
+
+STAR_samples <- met_samples %>%
+  filter(type == "concrete",
+         location == "star") %>%
+  pull("sample")
+  
+star_soil_samples <- met_samples %>%
+  filter(type == "soil",
+         location == "star") %>%
+  pull("sample")
+
+samples_to_compare <- c(STAR_samples,star_soil_samples)
+
+otus <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("STAR_concrete", "STAR_soil")
+
+STAR_concrete <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(STAR_samples)) %>% 
+  rowSums(.) %>% data.frame(STAR_concrete = ./sum(.)) %>% dplyr::select(-`.`)
+  
+STAR_soil <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(star_soil_samples)) %>% 
+  rowSums(.) %>% data.frame(STAR_soil = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(STAR_concrete, STAR_soil) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (STAR_concrete + STAR_soil)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(ASR_heat_tree <- obj %>%
+      heat_tree(
+                 node_size = Combined,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 #node_color_range = viridis::viridis(3),
+                 node_color_range = c("#3279a8","grey80", "#ffc559"),
+                 node_color_trans = "linear",
+                 node_color_interval = c(3, -3),
+                 edge_color_interval = c(3, -3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+
+
+ggsave(plot = ASR_heat_tree, "results/STAR_concrete_vs_soil.pdf",  width = 6, height = 6, dpi = 600)
+ggsave(plot = ASR_heat_tree, "results/STAR_concrete_vs_soil.png", width = 6, height = 6, dpi = 600)
+```
+
+
+
+
+
+
+## NJ bulk concrete vs. ASR gel
+```{r}
+
+met_samples <- read_tsv("data/metadata.tsv")
+
+bulk_concrete_samples <- met_samples %>%
+  filter(type == "concrete",
+         location == "new_jersey",
+         asr_gel_or_bulk_concrete == "bulk_concrete") %>%
+  pull("sample")
+  
+gel_samples <- met_samples %>%
+  filter(type == "concrete",
+         location == "new_jersey",
+         asr_gel_or_bulk_concrete == "asr_gel") %>%
+  pull("sample")
+
+samples_to_compare <- c(bulk_concrete_samples,gel_samples)
+
+otus <- read_tsv("results/decontaminated_bracken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("Bulk_concrete", "ASR_gel")
+
+bulk_concrete <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(bulk_concrete_samples)) %>% 
+  rowSums(.) %>% data.frame(Bulk_concrete = ./sum(.)) %>% dplyr::select(-`.`)
+  
+asr_gel <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(gel_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_gel = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(asr_gel, bulk_concrete) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (Bulk_concrete + ASR_gel)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(ASR_heat_tree <- obj %>%
+      heat_tree(
+                 node_size = Combined,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 #node_color_range = viridis::viridis(3),
+                 node_color_range = c("#3279a8","grey80", "#ffc559"),
+                 node_color_trans = "linear",
+                 node_color_interval = c(3, -3),
+                 edge_color_interval = c(3, -3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+
+
+ggsave(plot = ASR_heat_tree, "results/NJ_ASRgel_vs_concrete.pdf",  width = 6, height = 6, dpi = 600)
+ggsave(plot = ASR_heat_tree, "results/NJ_ASRgel_vs_concrete.png", width = 6, height = 6, dpi = 600)
+```
+
+
+## NJ bulk concrete vs. ASR gel (preDecontam)
+```{r}
+
+met_samples <- read_tsv("data/metadata.tsv")
+
+bulk_concrete_samples <- met_samples %>%
+  filter(type == "concrete",
+         location == "new_jersey",
+         asr_gel_or_bulk_concrete == "bulk_concrete") %>%
+  pull("sample")
+  
+gel_samples <- met_samples %>%
+  filter(type == "concrete",
+         location == "new_jersey",
+         asr_gel_or_bulk_concrete == "asr_gel") %>%
+  pull("sample")
+
+samples_to_compare <- c(bulk_concrete_samples,gel_samples)
+
+otus <- read_tsv("results/braken_count_table.tsv")
+
+taxonomy <- otus %>% dplyr::select(taxonomy_id,taxonomy)
+
+sample_types <- c("Bulk_concrete", "ASR_gel")
+
+bulk_concrete <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(bulk_concrete_samples)) %>% 
+  rowSums(.) %>% data.frame(Bulk_concrete = ./sum(.)) %>% dplyr::select(-`.`)
+  
+asr_gel <- otus %>% column_to_rownames("taxonomy_id") %>% 
+  dplyr::select(one_of(gel_samples)) %>% 
+  rowSums(.) %>% data.frame(ASR_gel = ./sum(.)) %>% dplyr::select(-`.`)
+
+otus <- bind_cols(asr_gel, bulk_concrete) %>% 
+  rownames_to_column("taxonomy_id") %>% 
+  mutate(Combined = (Bulk_concrete + ASR_gel)/length(sample_types)) %>% #For overall structure, equally weighted relative abundance between the sample types
+  left_join(taxonomy) %>% 
+  column_to_rownames("taxonomy_id")
+
+#Read parse the data for metacodeR and group all taxa lower than genus into their genus supertaxa
+obj <- parse_tax_data(otus, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$") %>% 
+        metacoder::filter_taxa(taxon_ranks == "g", 
+                               supertaxa = TRUE,
+                               reassign_obs = TRUE, 
+                               subtaxa = FALSE,
+                               drop_obs = FALSE)
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data",
+                                       cols = c(sample_types,"Combined")) 
+
+#Only plot organisms with abundance greater than threshold 
+thresh <- 0.01 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% dplyr::select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- metacoder::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = sample_types,
+                                      groups = sample_types)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(ASR_heat_tree <- obj %>%
+      heat_tree(
+                 node_size = Combined,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 #node_color_range = viridis::viridis(3),
+                 node_color_range = c("#3279a8","grey80", "#ffc559"),
+                 node_color_trans = "linear",
+                 node_color_interval = c(3, -3),
+                 edge_color_interval = c(3, -3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.0005,0.05),
+                 node_label_size_range = c(.015,.02),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 1.2))
+
+
+ggsave(plot = ASR_heat_tree, "results/NJ_ASRgel_vs_concrete_preDecontam.pdf",  width = 6, height = 6, dpi = 600)
+ggsave(plot = ASR_heat_tree, "results/NJ_ASRgel_vs_concrete_preDecontam.png", width = 6, height = 6, dpi = 600)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,207 @@
+---
+title: "KO modelling"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(vegan)
+```
+
+
+Read in bin info and file mapping KEGGdecoder names to original bin names
+```{r}
+samples_to_use <- read_tsv("data/samples_to_use.tsv")
+
+mag_tax <- read_tsv("data/gtdb/gtdbtk.bac120.summary.tsv") %>% 
+  dplyr::select(-red_value) 
+
+drep_bins <- read_csv("data/drep/data_tables/Wdb.csv") %>% pull("genome") %>% str_remove(".fasta")
+
+checkm <- read_csv("data/drep/data_tables/Chdb.csv") %>% 
+  mutate(old_mag_name = str_remove(`Bin Id`, ".fasta")) %>% 
+  select(old_mag_name, Completeness, Contamination, `Genome size (bp)`, `Strain heterogeneity`)
+  
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+mag_map <- read_tsv("data/kegg/mag_name_map.tsv") %>% 
+  left_join(checkm)
+
+ko_count_matrix <- read_tsv("data/kegg/bin_ko_counts.tsv")
+
+cyano_ko_counts <- ko_count_matrix %>% 
+  select(any_of(mag_map %>% 
+           filter(str_detect(classification,"Microcystis "),
+                  Completeness > 75) %>%
+           pull("kegg_decoder_name"))
+         )
+
+env_data <- read_tsv("data/env_data/merged_env_data.tsv") %>% 
+  filter(`Sample Depth (category)` == "Surface")
+
+strain_collection_info <- read_tsv("data/strain_collection_information.txt") %>% 
+  dplyr::rename(Date = "Collection Date",
+         Site = "Isolation Location") %>% 
+  dplyr::mutate(Date = lubridate::mdy(Date),
+         Site = if_else(str_detect(Site, "WE8-[1-2]"),"WE8",Site),
+         Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  left_join(seqID_to_strainID %>% 
+              dplyr::rename(Culture = "strainDB")) %>% 
+  filter(sequencingID %in% samples_to_use$samples_to_use)
+
+strain_env_data <- strain_collection_info %>% 
+  left_join(env_data)
+```
+
+```{r}
+long_ko <- ko_count_matrix %>% 
+  rownames_to_column("ko") %>% 
+  pivot_longer(-ko,names_to = "kegg_decoder_name",values_to = "count") %>% 
+  left_join(mag_map %>% select(kegg_decoder_name, old_mag_name)) %>% 
+  mutate(sequencingID = str_remove(old_mag_name,"_bin.*")) %>% 
+  filter(sequencingID %in% samples_to_use$samples_to_use) %>% 
+  left_join(strain_env_data)
+```
+
+
+Logistic regression
+```{r}
+library(furrr)
+future::plan(multisession,workers = 16)
+
+
+data <- long_ko %>% 
+  group_by(ko) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  mutate(id = as.character(row_number()))
+
+do_logit <- function(df) {
+  
+  filt_df <- df %>% 
+    filter(!is.na(`Particulate Microcystin (µg/L)`)) %>% 
+    mutate(count = if_else(count > 0, 1, 0))
+  
+  model <- glm(count ~ `Particulate Microcystin (µg/L)`, data = filt_df, family = "binomial")
+  
+  model_tidy_df <- broom::tidy(model)
+
+  return(model_tidy_df)  
+}
+
+logit_results <- future_map_dfr(data$data, do_logit,.id = "id") %>% 
+  left_join(data %>% select(-data))
+
+```
+
+
+Linear regression
+```{r}
+library(furrr)
+future::plan(multisession,workers = 16)
+
+do_lm <- function(df) {
+  
+  filt_df <- df %>% 
+    filter(!is.na(`Particulate Microcystin (µg/L)`))
+  
+  model <- glm(count ~ `Particulate Microcystin (µg/L)`, data = filt_df)
+  
+  model_tidy_df <- broom::tidy(model)
+
+  return(model_tidy_df)  
+}
+
+lm_results <- future_map_dfr(data$data, do_lm,.id = "id") %>% 
+  left_join(data %>% select(-data))
+```
+
+
+```{r}
+long_ko %>% filter(ko == "K21417") %>% ggplot(aes(`Particulate Microcystin (µg/L)`, count
+)) + geom_point() + geom_smooth(method = "lm") + theme_bw()
+```
+
+
+```{r}
+  #Extract taxonomy table from pyloseq obj.
+  tax <- tax_table(sum_phylo) %>%
+    as(Class = "matrix") %>%
+    as.data.frame() %>%
+    rownames_to_column("otu")
+
+  #Make long/tidy table
+  long_table <- table %>%
+    rownames_to_column("otu") %>%
+    gather("sample","abund",-otu) %>%
+    #filter(abund > 0) %>%
+    left_join(tax) %>%
+    left_join(metadata) %>%
+    filter(Type == "Concrete") %>%
+    mutate(ASR = relevel(as.factor(ASR), "unreactive")) %>%
+    group_by(!!sym(tax_lev)) %>%
+    filter(sum(abund) >= 5) %>% #only consider taxa seen at least 5 times
+    ungroup()
+
+
+  unique_taxa <- as.character(unique(long_table %>% pull(tax_lev)))
+
+
+  for (taxa in unique_taxa){
+
+    tryCatch({
+      focused_table <- long_table %>%
+        filter(!!sym(tax_lev) == taxa) %>%
+        group_by(Months)
+
+      tax_obs <- sum(focused_table$abund)
+
+      gam_taxa <- glm(abund ~ ASR*scale(Months), data = focused_table, family = "binomial")
+
+      #gam_taxa <- glm(abund ~ ASR + ASR:scale(Months), data = focused_table, family = "binomial")
+
+      gam_taxa_summary <- summary(gam_taxa)
+
+      if(broom::tidy(gam_taxa) %>% filter(term == "ASRreactive:scale(Months)") %>% .$p.value < 0.05
+         #broom::tidy(gam_taxa) %>% filter(term == "ASRreactive") %>% .$p.value < 0.05
+         #broom::tidy(gam_taxa) %>% filter(term == "scale(Months)") %>% .$p.value < 0.05
+         ){
+
+        model_summary <- broom::tidy(gam_taxa)
+
+        logit_res <- logit_res %>% bind_rows(
+          data.frame(taxa = taxa,
+          n_obs = tax_obs,
+          tax_lev = tax_lev,
+          num_at_tax_level = length(unique_taxa),
+          aic = gam_taxa_summary$aic,
+          coefs = I(list(model_summary))
+        ))
+      }
+    }, error=function(e){}) #if model generates error, ignore that taxa
+  }
+}
+
+unnested_logit_res <- unnest(logit_res,coefs) %>% pivot_wider(id_cols =c(taxa,n_obs,tax_lev,aic,num_at_tax_level), names_from = term, values_from = estimate:p.value)
+
+
+filt_logit_res <- unnested_logit_res %>%
+  filter(estimate_ASRreactive > 0,
+         `estimate_ASRreactive:scale(Months)` > 0,
+         aic < 115) %>%
+  mutate(plot_name = str_remove(taxa, "D_[0-9]__")) %>%
+  mutate(log_odds_months_ASR = round(exp(1) * (`estimate_ASRreactive:scale(Months)` + estimate_ASRreactive), 2),
+         `p.value_ASRreactive:scale(Months)` = signif(`p.value_ASRreactive:scale(Months)`, 2))
+```
+
+
+
+
+
+
+
+

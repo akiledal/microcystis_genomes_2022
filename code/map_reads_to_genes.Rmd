@@ -1,0 +1,384 @@
+---
+title: "read_mapping"
+author: "Anders Kiledal"
+date: "2022-11-12"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(Rsamtools)
+```
+
+
+```{r}
+
+
+#test <- "data/marker_genes/ND-100/16S_mapped.bam"
+
+bam_stats <- function(bam_path){
+
+  bam <- Rsamtools::BamFile(file = bam_path,
+                            index = paste0(bam_path,".bai"))
+  
+  # number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  mod_catalase_pileup <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count)) %>% 
+  group_by(seqnames) %>% 
+    mutate(prop_non_primary = sum(non_primary_base_count) / total_mapped_bases) %>% 
+  group_by(seqnames, pos, seq_length, prop_non_primary, total_mapped_bases) %>% 
+    summarise(depth = sum(count)) %>% 
+    ungroup() %>% 
+    group_by(seqnames) %>% 
+      summarise(percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary * 100,
+             seq_length = seq_length,
+             prop_non_primary = prop_non_primary,
+             total_mapped_bases = total_mapped_bases) %>% 
+    distinct() %>% 
+    left_join(reads_pile) %>% 
+    mutate(bam_path = bam_path)
+}
+
+
+#calculated_bam_stats <- bam_stats(test)
+
+```
+
+```{r}
+bam_stats_w_pileup <- function(bam_path){
+
+  bam <- Rsamtools::BamFile(file = bam_path,
+                            index = paste0(bam_path,".bai"))
+  
+  # number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  mod_catalase_pileup <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count)) %>% 
+  group_by(seqnames) %>% 
+    mutate(prop_non_primary = sum(non_primary_base_count) / total_mapped_bases) %>% 
+  group_by(seqnames, pos, seq_length, prop_non_primary, total_mapped_bases) %>% 
+    summarise(depth = sum(count)) %>% 
+    ungroup() %>% 
+    group_by(seqnames) %>% 
+      mutate(percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary * 100,
+             seq_length = seq_length,
+             prop_non_primary = prop_non_primary,
+             total_mapped_bases = total_mapped_bases) %>% 
+    left_join(reads_pile) %>% 
+    mutate(bam_path = bam_path)
+}
+```
+
+
+
+## Per-gene summary
+Find bam files and then get stats
+```{r}
+id_map <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+bam_files <- system("ls data/gene_PA_read_mapping_BWA/*/mergedRefs_mapped.bam", intern = TRUE)
+
+all_bam_stats <- map_df(bam_files, bam_stats)
+
+plot_data <- all_bam_stats %>% 
+  mutate(sample = bam_path %>% str_remove(".*gene_PA_read_mapping_BWA/") %>% str_remove("/.*")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  left_join(id_map) %>% 
+  filter(!is.na(pubID))
+
+sample_genotype_summary <- plot_data %>% 
+  select(pubID, seqnames, percent_covered_bases, mean_depth,percent_id_to_consensus,depth_var) %>% 
+  distinct() %>% 
+  group_by(pubID) %>% 
+  mutate(n_genes = sum(percent_covered_bases > 50)) %>% 
+  arrange(desc(n_genes), desc(mean_depth)) %>% 
+  write_rds("data/read_mapping_to_genes_summary.rds")
+
+sample_order <- sample_genotype_summary %>% pull(pubID) %>% unique()
+mcy_order <- paste0("mcy", LETTERS[seq( from = 1, to = 10 )])
+
+# plot_data %>% 
+#   mutate(pubID = factor(pubID, levels = sample_order, ordered = TRUE),
+#          seqnames = factor(seqnames, levels = mcy_order, ordered = TRUE)) %>% 
+#   ggplot(aes(pos, depth)) +
+#   geom_line() +
+#   facet_grid(pubID ~ seqnames,scales = "free", space = "free_x") +
+#   theme_bw() + 
+#   scale_x_continuous(guide = guide_axis(angle = -35))
+
+#ggsave("results/mcy_read_coverage.png",width = 12, height = 8, scale =1.5, dpi=300)
+
+```
+
+Check methionine pathways
+```{r}
+met_genes <- c("lysC", "metL", "asd", "hom", "metL", "metA", "metX", "metB", "metY", "metC", "malY", "metH", "yitJ", "metE")
+
+met_genes_unique <- met_genes %>% unique()
+
+steps <- c(1,1,2,3,3,4,4,5,5,6,6,7,7,7)
+
+met_path <- data.frame(gene = met_genes, reaction = steps) %>% 
+  group_by(reaction) %>% 
+  mutate(genes= paste0(gene, collapse = ", "))
+
+path_order <- met_path %>% 
+  select(reaction, genes) %>% 
+  distinct()
+
+all_genes <- expand_grid(seqnames = met_genes,pubID = unique(sample_genotype_summary$pubID)) %>% 
+  mutate(percent_covered_bases = 0)
+
+order <- read_rds("data/strain_plot_order.rds")$label
+
+sample_genotype_summary %>% 
+  bind_rows(all_genes) %>% 
+  group_by(pubID, seqnames) %>% 
+  slice_max(percent_covered_bases, n = 1, with_ties = FALSE) %>% 
+  filter(seqnames %in% met_genes,
+         pubID %in% order) %>% 
+  group_by(pubID) %>% 
+  mutate(percent_complete = sum(percent_covered_bases > 50) / n()) %>% 
+  ggplot(aes(factor(seqnames,levels = met_genes_unique, ordered = TRUE), factor(pubID,levels = order, ordered = TRUE), fill = percent_covered_bases > 50)) +
+  geom_tile(color = "grey50") +
+  theme_bw() +
+  scale_fill_manual(values = c("white", "black")) +
+  labs(x = "gene",
+       y = NULL, 
+       fill = "Present")
+
+sample_genotype_summary %>% 
+  bind_rows(all_genes) %>% 
+  left_join(met_path %>% dplyr::rename(seqnames = "gene")) %>% 
+  group_by(pubID, seqnames, reaction) %>% 
+  slice_max(percent_covered_bases, n = 1, with_ties = FALSE) %>% 
+  filter(seqnames %in% met_genes,
+         pubID %in% order) %>% 
+  group_by(pubID, genes) %>%
+  summarise(complete = percent_covered_bases > 50) %>% 
+  #ggplot(aes(genes, factor(pubID,levels = order, ordered = TRUE), fill = complete)) +
+  ggplot(aes(pubID, factor(genes,levels = rev(path_order$genes), ordered = TRUE), fill = complete)) +
+  geom_tile(color = "grey50") +
+  theme_bw() +
+  scale_fill_manual(values = c("white", "black")) +
+  labs(y = "Pathway steps (one gene required per step)",
+       x = NULL, 
+       fill = "Present") +
+  scale_x_discrete(guide = guide_axis(angle = -35))
+
+ggsave("results/methionine_pathway_mapping.pdf", width = 3, height = 2, scale = 2.25)
+
+
+```
+
+
+## with per-base info
+```{r}
+
+all_bam_stats_w_seqs <- map_df(bam_files, bam_stats_w_pileup)
+
+plot_data <- all_bam_stats_w_seqs %>% 
+  mutate(sample = bam_path %>% str_remove(".*gene_PA_read_mapping_BWA/") %>% str_remove("/.*")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  left_join(id_map) %>% 
+  filter(!is.na(pubID))
+
+katG <- plot_data %>% 
+  filter(seqnames =="katG",
+         pubID == "LE19-131.1")
+
+path <- bam_files %>% 
+  data.frame(path = .) %>% 
+  filter(str_detect(path, "ND-89")) %>% pull(path)
+
+katG_seq <- Rsamtools::pileup(path,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+  filter(seqnames =="katG") %>% 
+  group_by(pos) %>% 
+  slice_max(count,n=1) %>% 
+  pull(nucleotide) %>% 
+  paste0(collapse = "")
+
+sample_genotype_summary <- plot_data %>% 
+  select(pubID, seqnames, percent_covered_bases, mean_depth,percent_id_to_consensus,depth_var) %>% 
+  distinct() %>% 
+  group_by(pubID) %>% 
+  mutate(n_genes = sum(percent_covered_bases > 50)) %>% 
+  arrange(desc(n_genes), desc(mean_depth))
+
+sample_order <- sample_genotype_summary %>% pull(pubID) %>% unique()
+mcy_order <- paste0("mcy", LETTERS[seq( from = 1, to = 10 )])
+
+# plot_data %>% 
+#   mutate(pubID = factor(pubID, levels = sample_order, ordered = TRUE),
+#          seqnames = factor(seqnames, levels = mcy_order, ordered = TRUE)) %>% 
+#   ggplot(aes(pos, depth)) +
+#   geom_line() +
+#   facet_grid(pubID ~ seqnames,scales = "free", space = "free_x") +
+#   theme_bw() + 
+#   scale_x_continuous(guide = guide_axis(angle = -35))
+
+#ggsave("results/mcy_read_coverage.png",width = 12, height = 8, scale =1.5, dpi=300)
+```
+
+
+
+
+
+```{r}
+(sample_genotype_summary %>% 
+   filter(percent_covered_bases > 50,
+          mean_depth > 1) %>% 
+  ggplot(aes(seqnames, pubID, fill = percent_covered_bases)) +
+  geom_tile() +
+  scale_x_discrete(guide = guide_axis(angle = -35)) ) %>% 
+  plotly::ggplotly()
+
+
+sample_genotype_summary %>% 
+  ggplot(aes(percent_covered_bases, mean_depth)) +
+  #geom_point() +
+  geom_density_2d_filled() +
+  scale_y_log10()
+
+```
+
+Work on merging with BLAST data
+```{r}
+
+read_mapping_genes_raw <- Biostrings::readDNAStringSet("data/reference/read_mapping_refs/mergedRefs.fa") %>% 
+  data.frame(seq =., gene = labels(.)) %>% 
+  mutate(gene = case_when(gene == "ccmM"~"cccmM",
+                          #gene == "ndhF3" ~ "ndhF4",
+                          gene == "alkp-like" ~ "MAE_16640",
+                          gene == "sip"~ "MAE_47020",
+                          gene == "pstB_1"~ "pstB2",
+                          TRUE ~ gene)) %>% 
+  pull("gene") %>% 
+  unique()
+
+
+BLAST_genes <- full_simp_plot_data$gene %>% unique()
+
+# Pre name cleanup 
+missing_genes <-   setdiff(BLAST_genes, read_mapping_genes_raw)
+extra_genes <- setdiff(read_mapping_genes_raw, BLAST_genes)
+
+# Clean up gene names from refs
+
+read_mapping_genes <- read_mapping_genes_raw %>% 
+  str_remove("_[0-9]$") %>% 
+  unique()
+
+(missing_genes <-   setdiff(BLAST_genes, read_mapping_genes))
+extra_genes <- setdiff(read_mapping_genes, BLAST_genes)
+
+
+# All set, merge
+
+full_simp_plot_data_W_read_mapping <- full_simp_plot_data %>% 
+  left_join(sample_genotype_summary %>% 
+              filter(percent_covered_bases > 50,
+                     mean_depth > 1) %>% 
+            select(gene = "seqnames", pubID) %>%
+              mutate(read_mapping = 0.5)) %>% 
+  mutate(pres_abs = if_else(pres_abs == FALSE, read_mapping, 1),
+         pres_abs = if_else(is.na(pres_abs), 0, pres_abs))
+
+```
+
+
+
+
+
+
+## Some old code from a similar effort
+```{r}
+no_index <- function(x){
+  !str_detect(x, "bai")
+}
+
+
+bams_to_consensus <- list.files("data/marker_genes","_mapped_to_consensus.bam",recursive = TRUE, full.names = TRUE) %>% 
+  Filter(x = .,f = no_index )
+
+bam_path <- bams_to_consensus[1]
+
+bam_to_consensusMatrix <- function(bam_path){
+  sample <- str_remove(bam_path,".*marker_genes/") %>% str_remove("/.*")
+  gene <- str_remove(bam_path,".*/") %>% str_remove("_mapped_to_consensus.bam")
+  
+  param <- Rsamtools::ScanBamParam(what = "seq")
+  gal  <- GenomicAlignments:::readGAlignments(bam_path, param=param)
+  qseq <- mcols(gal)$seq
+  
+  qseq_on_ref <- GenomicAlignments::sequenceLayer(qseq, GenomicAlignments::cigar(gal),
+                                      from="query", to="reference")
+  
+  qseq_on_ref_by_chrom <- splitAsList(qseq_on_ref, seqnames(gal))
+  qseq_pos_by_chrom <- splitAsList(start(gal), seqnames(gal))
+  
+  cm_by_chrom <- lapply(names(qseq_pos_by_chrom),
+     function(seqname)
+         consensusMatrix(qseq_on_ref_by_chrom[[seqname]],
+                         as.prob=FALSE,
+                         shift=qseq_pos_by_chrom[[seqname]]-1,
+                         width=seqlengths(gal)[[seqname]]))
+  names(cm_by_chrom) <- names(qseq_pos_by_chrom)
+  
+  df <- data.frame(cm_by_chrom) %>% 
+    rownames_to_column("base") %>% 
+    pivot_longer(-base, names_to = "position", values_to = "count") %>% 
+    mutate(position = as.character(str_remove(position, ".*\\.")),
+           gene = gene,
+           sample = sample) 
+  
+  return(df)
+}
+
+
+
+test <- map_df(bams_to_consensus,bam_to_consensusMatrix) %>% 
+  group_by(position,gene,sample) %>% 
+  mutate(site_coverage = sum(count)) %>% 
+  #filter(sample %in% samples_to_use$samples_to_use) %>%
+  ungroup() %>% 
+  group_by(gene, position, sample) %>% 
+  arrange(desc(count)) %>% 
+  mutate(rank = row_number(),
+         percent = count / site_coverage * 100) 
+```
+

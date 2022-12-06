@@ -1,0 +1,543 @@
+---
+title: "kegg_enrichment"
+author: "Anders Kiledal"
+date: "11/12/2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+library(tidyverse)
+library(KEGGREST)
+```
+
+Parse kegg data
+```{r}
+ko00001 <- read_delim("data/reference/ko00001.keg", 
+    "\t", escape_double = FALSE, col_names = FALSE, 
+    trim_ws = TRUE) %>% 
+  separate(X1, into = c("level","id","name"),sep = "      ") %>% 
+  mutate(id = if_else(str_detect(level,"^A"),str_remove(level,"^A"),id),
+         level = if_else(str_detect(level,"^A"),"A",level),
+         id = if_else(str_detect(level,"^B"),str_remove(level,"^B  "),id),
+         level = if_else(str_detect(level,"^B"),"B",level),
+         id = if_else(str_detect(level,"^C"),str_remove(level,"^C    "),id),
+         level = if_else(str_detect(level,"^C"),"C",level)
+         ) %>% 
+  filter(id != "B") %>% 
+  separate(id,into = c("id","name"),sep = "  ") %>% 
+  mutate(name = if_else(level %in% c("A","B","C"),str_remove(id,"[0-9]* "),name),
+         id = if_else(level %in% c("A","B","C"),str_extract(id,"[0-9]*"),id),
+         A = "",
+         B = "",
+         C = "",
+         family = "",
+         path_type = "",
+         pathway = "")
+
+A=""
+B=""
+C=""
+
+ko_process <- function(table) {
+  
+  in_table <- table
+  for (i in 1:nrow(in_table)){
+    if (in_table[i,1]=="A"){
+      A <- in_table[i,"id"]
+      family <- in_table[i,"name"] 
+      
+      #Reset lower values
+      B <- ""
+      c <- ""
+      path_type = ""
+      pathway = ""
+      
+    }
+    if (in_table[i,1]=="B"){
+      B <- in_table[i,"id"]
+      path_type <- in_table[i,"name"]
+      
+      C <- ""
+      pathway <- ""
+    }
+    if (in_table[i,1]=="C"){
+      C <- in_table[i,"id"]
+      pathway <- in_table[i,"name"]
+    }
+    
+    in_table[i,"A"] <- A
+    in_table[i,"B"] <- B
+    in_table[i,"C"] <- C
+    in_table[i,"family"] <- family
+    in_table[i,"path_type"] <- path_type
+    in_table[i,"pathway"] <- pathway
+  }
+  return(in_table)
+}
+
+kegg_data <- ko_process(ko00001)
+
+kegg <- kegg_data %>% 
+  filter(level == "D") %>% 
+  mutate(total = n()) %>% 
+  group_by(pathway) %>% 
+  mutate(n_in = n(),
+         n_out = total - n_in)
+
+kegg %>% write_tsv("data/reference/kegg.tsv")
+
+
+```
+
+Import GHOSTkoala data
+```{r}
+
+kegg <- read_tsv("data/reference/kegg.tsv")
+
+ghost_combined <- data.frame()
+tax_combined <- data.frame()
+
+for (folder in basename(list.dirs("data/GHOSTkoala")[-1])){
+  
+  ghost <- read.table(file.path("data/GHOSTkoala",folder,"user_ko.txt"), quote="\"", comment.char="",fill = TRUE,row.names = NULL,header = FALSE) %>% 
+    rename(contig_name = "V1", id = "V2") %>% 
+    group_by(id) %>% 
+    filter(!is.na(id)) %>% 
+    summarise(meta_abund = n()) %>% 
+    mutate(sample = folder)
+  
+  ghost_combined <- bind_rows(ghost_combined,ghost)
+
+  tax_summary <- read_tsv(file.path("data/GHOSTkoala",folder,"user.out.top"),col_names = F) %>% 
+    select(genus = "X5") %>% 
+    group_by(genus) %>% 
+    summarise(abund = n())
+  
+  tax_combined <- bind_rows(tax_combined,tax_summary)
+}
+```
+
+
+The way Mengyin calculated odds ratios was:
+
+Odds ratios were calculated for each COG category identified in
+the metagenomic data set by calculating the ratio (A/B)/(C/D), where A is
+the number of reads in the metagenome that are in a given COG category,
+B is the number of reads in the metagenome that are in all of the other
+COG categories, C is the number of proteins in the COG database that are
+in a given COG category, and D is the number of proteins in the COG
+database that are in all of the other COG categories. COG categories with
+odds ratios of 1 were considered enriched (42), meaning that they are
+more highly represented in the metagenomic data than in the protein
+database.
+
+
+Calculate odds ratios for Kegg pathways
+```{r}
+# meta_kegg <- read_tsv("data/shogun/burst/taxatable.strain.kegg.txt") %>% 
+#  rename(id = "#KEGG ID") %>% 
+#  gather("sample","abund",-"id") %>% 
+#  mutate(sample = str_remove(sample,"_R[1,2]")) %>% 
+#  group_by(id,sample) %>% 
+#  summarise(meta_abund = sum(abund))
+
+meta_kegg <- ghost_combined
+
+samples <- unique(meta_kegg$sample)
+
+joined_kegg <- kegg %>% 
+  left_join(meta_kegg) %>% 
+  ungroup() %>% 
+  mutate(meta_abund = replace_na(meta_abund,0)) %>% 
+  group_by(sample) %>% 
+  mutate(meta_total = sum(meta_abund)) %>% 
+  group_by(sample, pathway) %>% 
+  mutate(meta_in = sum(meta_abund),
+         meta_out = meta_total - meta_in,
+         OR = (meta_in/meta_out) / (n_in/n_out))
+
+
+fisher <- joined_kegg %>% 
+  filter(!is.na(sample)) %>% 
+  select(sample, family,path_type,pathway,n_in,n_out,meta_total,meta_in,meta_out,OR) %>% 
+  unique() %>% 
+  group_by(sample,pathway) %>% 
+  mutate(fisher.p = fisher.test(matrix(c(meta_in,n_in,meta_out,n_out),nrow=2,ncol=2))$p.value)
+
+pathway_or <- joined_kegg %>% 
+  select(pathway, OR, sample) %>% 
+  distinct()
+```
+
+
+Calculate OR for kegg modules
+```{r}
+kegg_mod <- read_tsv("data/shogun/burst/taxatable.strain.kegg.modules.txt")
+
+mod_info <- read_tsv("data/reference/KEGG_modules_info.tsv",col_names = c("module","name")) %>% distinct()
+
+ko_info <- read_delim("data/reference/ko_info.tsv", "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) %>% 
+  rename(ko = "X1",
+         ko_name = "X2")
+
+get_module_ko <- function(module) {
+  data <- tryCatch(KEGGREST::keggGet(module), error=function(e) NULL)
+  res <- str_replace_all(data[[1]]$DEFINITION,"[\\+(),-]"," ") %>% 
+    str_split("\\s+") %>% 
+    unlist() %>% 
+    Filter(function(x){str_detect(x, "^K")}, .) 
+  
+  if(length(res) > 0){
+  results <- res %>% 
+    data.frame(mod = module,
+               ko = .)
+  }
+  if(length(res) == 0){
+  results <- data.frame(module = module,
+               ko = NA)
+  }
+  
+  return(results)
+  }
+
+
+#mod_test_list <- c("M00014","M00095")
+
+results <- lapply(unique(mod_info$module), get_module_ko)
+
+re2 <- bind_rows(results) %>% select(-module) %>% rename(module = "mod")
+
+write_tsv(re2, "data/reference/kegg_module_mem.tsv")
+
+
+mod_W_abund <- re2 %>% 
+  left_join(meta_kegg %>% rename(ko = "id")) %>% 
+  left_join(mod_info %>% rename(module_name = "name")) %>% 
+  left_join(ko_info) %>% 
+  mutate(meta_abund = replace_na(meta_abund,0)) %>% 
+  group_by(sample) %>% 
+  mutate(meta_total = sum(meta_abund)) %>% 
+  mutate(total = n()) %>% 
+  group_by(module,sample) %>% 
+  mutate(n_in = n(),
+         n_out = total - n_in) %>% 
+  filter(meta_abund > 0) %>% 
+  group_by(module,sample) %>% 
+  mutate(meta_in = sum(meta_abund),
+         meta_out = meta_total - meta_in,
+         OR = (meta_in/meta_out) / (n_in/n_out))
+
+
+fisher_mod <- mod_W_abund %>% 
+  filter(!is.na(sample)) %>% 
+  select(sample, module,module_name,n_in,n_out,meta_total,meta_in,meta_out,OR) %>% 
+  unique() %>% 
+  group_by(sample,module) %>% 
+  mutate(fisher.p = fisher.test(matrix(c(meta_in,n_in,meta_out,n_out),nrow=2,ncol=2))$p.value,
+         fisher.OR = fisher.test(matrix(c(meta_in,n_in,meta_out,n_out),nrow=2,ncol=2))$estimate) %>% 
+  ungroup() %>% group_by(sample) %>% 
+  mutate(fisher.p.fdr = p.adjust(fisher.p,method = "fdr"))
+
+module_or <- mod_W_abund %>% 
+  select(module, module_name, OR, sample) %>% 
+  distinct()
+
+fisher_mod %>% 
+  ggplot(aes(fisher.OR, fisher.p.fdr)) +
+  geom_point() +
+  scale_y_log10() + 
+  scale_x_log10() + 
+  scale_y_reverse()
+
+```
+
+
+Calculate log2 ratios between normal soil and concrete for kegg modules.
+
+```{r}
+
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+mod_rel <- mod_W_abund %>% 
+  mutate(rel_abund = meta_in / meta_total) %>% 
+  filter(!is.na(sample)) %>% 
+  select(sample,rel_abund,module,module_name,-ko_name,-ko) %>% 
+  distinct() %>% 
+  pivot_wider(values_from = "rel_abund", names_from = "sample") %>% 
+  ungroup %>% distinct() %>% 
+  mutate(log2_ratio = log2(S3_Fallen/ERR1939167),
+         mean_rel_abund = (S3_Fallen + ERR1939167)/2)
+
+mod_clr <- mod_rel %>% 
+  pivot_longer(samples) %>% 
+  group_by(name) %>% 
+  mutate(geo_mean = gm_mean(value),
+         clr_micro = log(value) - mean(log(value)),
+         clr_std = log(value) - log(geo_mean)) %>% 
+  ungroup() %>% 
+  select(-value, -clr_micro, -mean_rel_abund, -geo_mean) %>%
+  spread(key = name, value = clr_std) %>% 
+  mutate(clr_diff = S3_Fallen - ERR1939167)
+
+
+mod_rel %>%
+  filter(mean_rel_abund < 0.2) %>% 
+  ggplot(aes(log2_ratio, mean_rel_abund)) +
+  geom_point() +
+  labs(title = "Kegg module log2 ratio concrete / soil")
+
+```
+
+
+
+
+```{r}
+library(DESeq2)
+
+mod_deseq <- mod_W_abund %>% 
+  filter(!is.na(sample)) %>% 
+  select(sample,module,ko,module_name,ko_name,meta_in) %>% 
+  distinct() %>% 
+  pivot_wider(values_from = "meta_in", names_from = "sample") %>% 
+  ungroup %>% distinct() %>% 
+  mutate(S3_Fallen = replace_na(S3_Fallen,0))
+
+col_dat <- data.frame(sample = c("S3_Fallen","ERR1939167"),
+                      type = c("concrete","soil"))
+
+deseq_dat <- DESeqDataSetFromMatrix(countData = mod_deseq %>% select(ERR1939167,S3_Fallen),colData = col_dat,design = ~ 1) 
+
+deseq_res <- DESeq(deseq_dat)
+
+deseq2_tab <- DESeq2::results(deseq_res) %>% data.frame()
+
+deseq2_tab %>% ggplot(aes(log2FoldChange,padj)) +
+  geom_point()
+```
+
+
+
+
+# FOAM
+
+Foam run on biomix with this command
+```{bash}
+hmmsearch --tblout s3_sixframe.txt --cpu 8 -o s3_sixframe.hm ../reference/FOAM-hmm_rel1.hmm six_frame_S3_f.fasta
+```
+
+
+
+## Import the FOAM results and process
+
+Processed the tblout files from hmm with this bash command before importing into R (removes extra whitespace and makes parsing easier)
+
+```{bash}
+tail -n+4 S3_fallen.txt | sed 's/ * / /g' | cut -f 1-10 -d " " > S3_fallen_mod.txt
+```
+
+
+```{r fig.height=12, fig.width=12}
+library(data.table)
+library(vroom)
+library(tidyverse)
+
+names <- c(
+		"target.name",
+		"target.accession",
+		"query.name",
+		"query.accession",
+		"full.sequence.E.value",
+		"full.sequence.score",
+		"full.sequence.bias",
+		"best.1.domain.E.value",
+		"best.1.domain.score",
+		"best.1.domain.bias")
+
+# foam_hmm <- vroom("data/FOAM/S3_sixframe_mod.txt",col_names = names,num_threads = 8) %>% 
+#   filter(best.1.domain.score >= 14) %>%  #Min value used in the FOAM HMMerBestHit.py script
+#   mutate(target.name = str_remove(target.name, "_[0-9]$")) %>% 
+#   group_by(target.name) %>% 
+#   top_n(1,full.sequence.E.value) %>% 
+#   separate_rows(query.name,sep = ",") %>% 
+#   ungroup() %>% group_by(query.name) %>% 
+#   summarise(meta_abund = n()) %>% 
+#   rename(id = "query.name") %>% 
+#   mutate(sample = "S3_fallen",
+#          id = str_remove(id,"KO:"))
+
+foam_hmm <- read_rds("h:/concrete_metagenome_test/data/FOAM/S3_Fallen_combined.rds") %>% 
+  group_by(sample,id) %>% 
+  summarise(meta_abund = sum(meta_abund))
+
+kegg <- read_tsv("data/reference/kegg.tsv")
+mod_info <- read_tsv("data/reference/KEGG_modules_info.tsv",col_names = c("module","name")) %>% distinct()
+kegg_modules <- read_tsv("data/reference/kegg_module_mem.tsv") %>% left_join(mod_info)
+
+
+kegg_ontology <- kegg %>%
+  select(family, path_type, pathway, KO = "id") %>% 
+  write_tsv("data/reference/ontology/kegg.tsv")
+
+kegg_module_ontology <- kegg_modules %>% 
+  select(module = "name", KO = "ko") %>% 
+  write_tsv("kegg_modules.tsv")
+
+#foam_hmm <- read_tsv("data/FOAM/S3_sixframe_summarized.tsv")
+
+foam_ontology <- read_tsv("data/reference/FOAM-onto_rel1.tsv")
+
+
+#make kegg match the FOAM layout
+kegg_ontology <- kegg %>% 
+  select()
+  
+
+
+foam2 <- kegg_module_ontology %>% 
+  gather("level","group", -c(KO)) %>% 
+  group_by(level) %>% 
+  mutate(total = n()) %>% 
+  group_by(level,group) %>% 
+  mutate(n_in = n(),
+         n_out = total - n_in) %>% 
+  rename(id = "KO") %>% 
+  filter(!is.na(group))
+
+
+meta_kegg <- foam_hmm
+samples <- unique(meta_kegg$sample)
+
+
+joined_kegg <- foam2 %>% 
+  left_join(meta_kegg) %>% 
+  ungroup() %>% 
+  mutate(meta_abund = replace_na(meta_abund,0)) %>% 
+  group_by(sample,level) %>% 
+  mutate(meta_total = sum(meta_abund)) %>% 
+  group_by(sample, level,group) %>% 
+  mutate(meta_in = sum(meta_abund),
+         meta_out = meta_total - meta_in,
+         meta_prop= meta_in / meta_total,
+         OR = (meta_in/meta_out) / (n_in/n_out))
+
+
+fisher <- joined_kegg %>% 
+  filter(!is.na(sample)) %>% 
+  #select(sample, L1, L2,n_in,n_out,meta_total,meta_prop,meta_in,meta_out,OR) %>% 
+  unique() %>% 
+  ungroup %>% group_by(sample, level, group) %>%
+  rowwise() %>% 
+  mutate(contingency_table = list(matrix(c(meta_in,n_in,meta_out,n_out),nrow=2)),
+         fisher = list(fisher.test(contingency_table)),
+         fisher.p = fisher$p.value,
+         fisher.OR = fisher$estimate,
+         fisher.ci.lower = fisher$conf.int[1],
+         fisher.ci.upper = fisher$conf.int[2]) %>% 
+  select(sample, level, group, contingency_table, fisher, fisher.p, fisher.OR, fisher.ci.lower, fisher.ci.upper, OR) %>% 
+  unique() %>% 
+  ungroup() %>% group_by(sample, level) %>%
+  mutate(p.fdr = p.adjust(fisher.p,method = "fdr"))
+
+
+fisher_for_plot <- fisher %>% 
+  mutate(neg_log10P = -log10(fisher.p)) %>% 
+  ungroup() %>% group_by(level) %>% 
+  top_n(10,neg_log10P)
+
+
+
+l1_data <- fisher_for_plot %>% 
+  filter(level == "L1") %>% 
+  rename(L1 = "group") %>% 
+  top_n(10,neg_log10P) %>% 
+  mutate(L1 = str_remove(L1, "[0-9]*_"))
+  
+l2_data <- fisher_for_plot %>% 
+  filter(level == "L2") %>% 
+  rename(L2 = "group") %>% 
+  top_n(10,neg_log10P) %>% 
+  left_join(foam_ontology %>% select(L1, L2) %>% unique()) %>% 
+  mutate(L1 = str_remove(L1, "[0-9]*_"))
+  
+l3_data <- fisher_for_plot %>% 
+  filter(level == "L3") %>% 
+  rename(L3 = "group") %>% 
+  top_n(10,neg_log10P) %>% 
+  left_join(foam_ontology %>% select(L1, L2, L3) %>% unique()) %>% 
+  mutate(L1 = str_remove(L1, "[0-9]*_"),
+         levels_above = paste(L1,L2, sep = ";\n"))
+
+
+
+(L1_plot <- l1_data %>% ggplot(aes(neg_log10P,reorder(L1,neg_log10P))) +
+  geom_bar(stat = "identity") +
+  labs(y = NULL, x= "-log10(P-value)", title = "Level 1") +
+    theme_bw()
+)
+
+(L2_plot <- l2_data %>% ggplot(aes(neg_log10P,reorder(L2,neg_log10P), fill = L1)) +
+  geom_bar(stat = "identity") +
+  labs(y = NULL, x= "-log10(P-value)", title = "Level 2") +
+    theme_bw() +
+    theme(legend.position = c(0.8,0.2),)
+)
+
+(L3_plot <- l3_data %>% ggplot(aes(neg_log10P,reorder(L3,neg_log10P), fill = levels_above)) +
+  geom_bar(stat = "identity") +
+  labs(y = NULL, x= "-log10(P-value)", title = "Level 3", fill = NULL) +
+    theme_bw() #+
+    #theme(legend.position = "bottom")
+)
+
+
+(combined_plot <- L1_plot / L2_plot) + ggsave("c:/Users/eande/Desktop/enrichment.png",type = "cairo", width = 6, height = 4, scale = 1.5)
+
+
+ fisher %>% 
+  filter(fisher.OR > 1) %>% 
+  ggplot(aes(fisher.OR, reorder(group,fisher.OR), color = p.fdr < 0.05)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = fisher.ci.lower, xmax = fisher.ci.upper)) +
+  coord_cartesian(xlim = c(0,25)) +
+  geom_vline(xintercept = 1) +
+  theme_bw()
+  
+  
+  
+fisher %>% ggplot(aes())
+
+
+  
+fisher %>% 
+  filter(fisher.p <= 0.05) %>% 
+  ggplot(aes(fisher.OR, meta_prop,color = L1)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = fisher.ci.lower, xmax = fisher.ci.upper)) +
+  coord_cartesian(xlim = c(0,10)) +
+  geom_vline(xintercept = 1) +
+  theme_bw()
+
+
+```
+
+
+From unassembled reads, translated into all 6 frames
+```{bash}
+
+transeq S3_Fallen_R1.fastq -outseq six_frame_S3_f.fasta -frame=6
+ hmmsearch --tblout s3_sixframe.txt --cpu 8 --domT 14 -o s3_sixframe.hm ../reference/FOAM-hmm_rel1.hmm six_frame_S3_f.fasta
+```
+
+
+
+
+
+
+

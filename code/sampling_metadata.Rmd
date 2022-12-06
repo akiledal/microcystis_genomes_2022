@@ -1,0 +1,453 @@
+---
+title: "HAB environmental data"
+output: html_notebook
+---
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+library(tidyverse)
+```
+
+# Data source
+
+Environmental data collected during harmful algal bloom sampling trips performed
+by NOAA GLERL.
+
+The most recent data was obtained from GLERL, while older data (2012-2018) was 
+obtained from NCEI.
+
+# Data processing
+
+## Import data
+
+Data collected on sampling trips
+```{r}
+# The GLERL weekly datashare from more recent samples had different column names than than the NCEI archive for previous years
+# This maps the old and new column names
+map_NCEI_to_GLERLdatashare <- readxl::read_excel("data/env_data/column_map_NCEI_to_GLERL_weekly_datashare.xlsx")
+
+
+# Import 2020 GLERL weekly datashare and cleanup
+env_2020 <- read_csv("data/env_data/2020_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
+  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  type_convert()
+
+# Change 2021 GLERL weekly datashare column names to match NCEI format
+names(env_2020) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2020), map_NCEI_to_GLERLdatashare$GLERL)] 
+
+env_2020 <- env_2020 %>% 
+  select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
+
+
+# Import 2021 GLERL weekly datashare and cleanup
+env_2021 <- read_csv("data/env_data/2021_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
+  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  type_convert()
+
+# Change 2021 GLERL weekly datashare column names to match NCEI format
+names(env_2021) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2021), map_NCEI_to_GLERLdatashare$GLERL)] 
+
+env_2021 <- env_2021 %>% 
+  select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
+
+
+
+# Import NCEI archives from 2012 to 2018
+env_2012_to_2018 <- read_csv("data/env_data/lake_erie_habs_field_sampling_results_2012_2018_v2.csv",na = c("nd","bdl","n/a","na",".")) %>% 
+  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  type_convert()
+
+env_2019 <- read_csv("data/env_data/lake_erie_habs_field_sampling_results_2019.csv", na = c("nd","bdl","n/a","na",".")) %>% 
+  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  type_convert()
+
+env_2020_to_2021 <- read_csv("data/env_data/noaa-glerl-erie-habs-field-sampling-results-2020-2021.csv",na = c("nd","bdl","n/a","na",".")) %>% 
+  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  type_convert()
+```
+
+## Merge data
+
+```{r}
+env_data <- env_2012_to_2018 %>% 
+  full_join(env_2019) %>% 
+  full_join(env_2020_to_2021) %>% 
+  #full_join(env_2021) %>% 
+  #full_join(env_2020) %>% 
+  mutate(Date = lubridate::mdy(Date)) %>% 
+  write_tsv("data/env_data/merged_env_data.tsv")
+```
+
+
+
+## Plot data
+
+### PCA of environmental data
+```{r}
+data_for_pca <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  select(Year,Day_of_year,`Station Depth (m)`,`Local Time (Eastern Time Zone)`,`Latitude (decimal deg)`,`Longitude (decimal deg)`,`Wind speed (knots)`,`Wave Height (ft)`,`Secchi Depth (m)`,`CTD Temperature (°C)`,`CTD Specific Conductivity (µS/cm)`,`CTD Beam Attenuation (m-1)`,`CTD Tramission (%)`,`CTD Dissolved Oxygen (mg/L)`,`CTD Photosynthetically Active Radiation (µE/m2/s)`,`Turbidity (NTU)`,`Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`Extracted Phycocyanin (µg/L)`,`Extracted Chlorophyll a (µg/L)`) %>% 
+  #column_to_rownames("Culture") %>% 
+  filter(!is.na(`Latitude (decimal deg)`)) %>% 
+  #filter(!is.na(`Dissolved Microcystin (µg/L)`)) %>% 
+  type_convert() %>% 
+  mutate(`Local Time (Eastern Time Zone)` = as.numeric(`Local Time (Eastern Time Zone)`)) %>% 
+  scale() %>% 
+  as.data.frame()
+  #as.matrix() %>% 
+  #as.numeric()
+  
+# temp removed columns: Site, Sky, Date
+
+pca_w_missing_imputed <- pcaMethods::pca(data_for_pca)
+
+#pca_w_missing_imputed@loadings %>% view()
+
+#pca_vegan <- vegan::rda(data_for_pca,)
+
+biplot(pca_w_missing_imputed)
+```
+
+
+PCA of just temp, day of year, station, phycocyanin, particulate microcystin and dissolved microcystin
+```{r}
+data_for_pca <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         Site = as.factor(Site)) %>% 
+  select(part_microcystin = `Particulate Microcystin (µg/L)`,dis_microcystin = `Dissolved Microcystin (µg/L)`, phycocyanin =  `Extracted Phycocyanin (µg/L)`, chlorophyll = `Extracted Chlorophyll a (µg/L)`, urea = `Urea (µg N/L)`, `CTD Temperature (°C)`,Day_of_year, Site, Year) %>% 
+  rowwise() %>% 
+  #filter(c_across() == NA) %>% 
+  ungroup() %>% 
+  #column_to_rownames("Culture") %>% 
+  #filter(!is.na(`Latitude (decimal deg)`)) %>% 
+  #filter(!is.na(`Dissolved Microcystin (µg/L)`)) %>% 
+  type_convert() %>% 
+  #scale() %>% 
+  as.data.frame() %>% 
+  filter(if_any(everything(), ~ !is.na(.)))
+  #as.matrix() %>% 
+  #as.numeric()
+  
+# temp removed columns: Site, Sky, Date
+
+pca_w_missing_imputed <- pcaMethods::pca(data_for_pca)
+
+#pca_w_missing_imputed@loadings %>% view()
+
+#pca_vegan <- vegan::rda(data_for_pca,)
+
+ biplot(pca_w_missing_imputed)
+ 
+ test <- pca_w_missing_imputed@completeObs %>% 
+   umap::umap()
+
+test$layout %>% 
+  as.data.frame() %>%
+  bind_cols(data_for_pca) %>% 
+  ggplot(aes(V1, V2, 
+             color = phycocyanin
+             #color = `Site`
+             #color = `Extracted Phycocyanin (µg/L)`
+             #color = `Particulate Microcystin (µg/L)`
+             )) +
+  scale_color_viridis_c(trans = "log") +
+    geom_point()
+ 
+
+data_for_pca %>% 
+  group_by(Year,Day_of_year) %>% 
+  summarise(part_microcystin = max(dis_microcystin),
+            phycocyanin = max(phycocyanin)) %>% 
+  ggplot(aes(Day_of_year, phycocyanin, color = as.factor(Year))) +
+  geom_point() +
+  geom_smooth(se = FALSE) +
+  scale_y_log10() 
+  #facet_grid(Year ~ . )
+
+
+```
+
+
+
+
+
+
+```{r}
+env_data %>% 
+  filter(str_detect(Site,"WE[0-9]")) %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  filter(`Dissolved Microcystin (µg/L)` > 0.1) %>% 
+  ggplot(aes(Day_of_year,`Dissolved Microcystin (µg/L)`, color = as.factor(Year))) +
+  geom_point() +
+  #geom_smooth(se = F) +
+  geom_line() +
+  scale_color_viridis_d() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_log10() +
+  facet_grid(~Site)
+```
+
+
+```{r}
+env_data %>% 
+  filter(str_detect(Site,"WE[0-9]")) %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  ggplot(aes(Day_of_year,`Particulate Microcystin (µg/L)`, color = Year)) +
+  geom_point() +
+  geom_smooth() +
+  #scale_y_log10() +
+  scale_color_viridis_c() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_log10() +
+  facet_grid(~Site)
+```
+
+
+```{r}
+(over_time <- env_data %>% 
+  filter(str_detect(Site,"WE[0-9]")) %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  ggplot(aes(day_and_month,value, measurement = measurement)) +
+  geom_point(aes(color = Site)) +
+  geom_smooth() +
+  #scale_color_viridis_c() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_log10() +
+  facet_grid(measurement ~ Year,scales = "free_y")
+) %>% plotly::ggplotly()
+```
+
+
+Mimic previous report
+```{r}
+colors <- cols <- c("WE2" = "#E6B74B", "WE4" = "#4D92F7", "WE12" = "#DB3B26")
+
+(over_time <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,
+         `Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, 
+         `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,
+                 `CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, 
+                 `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  filter(Site %in% c("WE2","WE4","WE12"),
+         Year >= 2014) %>% 
+  mutate(measurement = str_remove(measurement,"^CTD ")) %>% 
+  ggplot(aes(day_and_month,value, color = Site, measurement = measurement)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values = colors) +
+  scale_x_date(date_breaks = "1 month",date_labels = "%m-%d") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(x = NULL) +
+  #coord_cartesian(ylim = quantile(dfr$y, c(0.1, 0.9)))
+  facet_grid(measurement ~ Year,scales = "free_y", labeller = labeller(.rows = label_wrap_gen(20)))
+) 
+ggsave("results/environmental_data.png", scale = 2, dpi = 300, width = 8, height = 6)
+
+
+# Plotly for interactive 
+
+(over_time <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,
+         `Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, 
+         `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,
+                 `CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, 
+                 `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  filter(Site %in% c("WE2","WE6","WE12"),
+         Year >= 2014) %>% 
+  mutate(measurement = str_remove(measurement,"^CTD ")) %>% 
+  ggplot(aes(day_and_month,value, color = Site, measurement = measurement)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values = colors) +
+  scale_x_date(date_breaks = "2 weeks",date_labels = "%m-%d") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(x = NULL) +
+  facet_grid(measurement ~ Year,scales = "free_y")
+)  %>% plotly::ggplotly()
+```
+
+
+
+
+Mimic the old plot but reduce effects of outliers
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+
+plot_data <- env_data %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,
+         `Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, 
+         `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,
+                 `CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, 
+                 `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  filter(Site %in% c("WE2","WE4","WE12"),
+         Year >= 2014) %>% 
+  mutate(measurement = str_remove(measurement,"^CTD "))
+
+
+plot_data_outliers_removed <- plot_data %>% 
+  group_by(measurement) %>%
+  mutate(upper = quantile(value, 0.95,na.rm = TRUE),
+         lower = quantile(value, 0.05,na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(is.outlier = value < lower | value > upper) %>%
+  mutate(value = ifelse(is.outlier, NA, value))
+
+
+# plot with outliers filtered
+(over_time_no_outliers <- plot_data_outliers_removed %>% 
+  ggplot(aes(day_and_month,value, color = Site, measurement = measurement)) +
+    geom_point() +
+    geom_line() +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = "1 month",date_labels = "%m-%d") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    labs(x = NULL) +
+    facet_grid(measurement ~ Year,scales = "free_y", labeller = labeller(.rows = label_wrap_gen(20)))
+) 
+
+over_time_no_outliers %>% ggsave(plot = ., "results/metadata_plot_outliers_removed.png",, scale = 2, dpi = 300, width = 8, height = 6)
+
+
+
+# intended plot version with full data range
+over_time_plot <- plot_data %>% 
+  ggplot(aes(day_and_month,value, color = Site, measurement = measurement)) +
+    geom_point() +
+    geom_line() +
+    scale_color_manual(values = colors) +
+    scale_x_date(date_breaks = "1 month",date_labels = "%m-%d") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    labs(x = NULL) +
+    facet_wrap(measurement ~ Year,scales = "free_y", labeller = labeller(.rows = label_wrap_gen(20)))
+
+
+p <- ggplot_build(over_time_plot)
+p.alt <- ggplot_build(over_time_no_outliers)
+
+#p$layout$panel_params <- over_time_no_outliers$layout$panel_params
+
+p$layout$panel_params <- p.alt$layout$panel_params
+rm(p.alt)
+
+
+plot(p)
+
+p <- ggplot_gtable(p)
+
+grid::grid.draw(p)
+
+
+
+
+new_plot <- old_plot +
+  geom_ribbon(aes(ymax=upper, ymin=lower))
+
+old_plot_data <- ggplot_build(old_plot)
+new_plot_data <- ggplot_build(new_plot)
+
+new_plot_data$layout$panel_params <- old_plot_data$layout$panel_params
+
+plot(ggplot_gtable(new_plot_data)
+
+
+```
+
+
+```{r}
+over_time_no_outliers
+```
+
+
+
+
+```{r}
+over_time_no_outliers %>% plotly::ggplotly()
+```
+
+
+
+
+
+
+
+Scaled data
+
+
+```{r}
+
+df <- env_data %>% 
+  filter(str_detect(Site,"WE[0-9]")) %>% 
+  mutate(Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date),
+         day_and_month = lubridate::make_date(month = lubridate::month(Date), day = lubridate::day(Date))
+         ) %>% 
+  select(Date, day_and_month, Year, Site, `Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`) %>% 
+  pivot_longer(c(`Extracted Chlorophyll a (µg/L)`, `Extracted Phycocyanin (µg/L)`, `Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`CTD Temperature (°C)`, `CTD Specific Conductivity (µS/cm)`, `CTD Dissolved Oxygen (mg/L)`, `CTD Photosynthetically Active Radiation (µE/m2/s)`, `Turbidity (NTU)`),values_to = "value", names_to = "measurement") %>% 
+  group_by(measurement) %>% 
+  filter(!is.na(measurement)) #%>% 
+   #mutate(value = scale(value,center = FALSE)) %>% 
+
+(over_time <- df %>% 
+  ggplot(aes(day_and_month,value, color = as.factor(Year), group = Year, measurement = measurement)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(se = FALSE,span = 0.5) +
+  #scale_color_viridis_d() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  facet_wrap(~measurement, scales = "free_y", ) 
+  #scale_y_log10()
+
+ 
+) #%>% plotly::ggplotly()
+```
+
+
+```{r}
+library(corrr)
+```
+
+
+```{r}
+meta_cor <- correlate(env_data %>% select(where(is.numeric), -`Sample Temperature (°C)`))
+
+rplot(meta_cor)
+
+
+network_plot(meta_cor,min_cor = 0.9,repel = F)
+```
+
+
+

@@ -1,0 +1,545 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(vegan) #needed for distance calculations and NMDS
+library(ape) #needed for pcoa
+library(umap) #needed for umap
+library(glue)
+library(propr)
+library(decontam)
+
+source(here::here("code/util_funcs.R"))
+```
+
+
+9/9/21 update:
+This document was originally started to combine all of the individual bracken files 
+into a combined abundance table. That functionality has since been moved to the
+Snakemake workflow.
+
+The main items of interest in this document (which should be moved to more appropriate files) are:
+
+- Code used when determining thresholds thresholds of the number of unique minimizers
+that should be requried for krakenUniq like functionality in Kraken2.
+
+
+
+# Kraken / Bracken parsing
+
+## Fully parse each file individually (slow, bad)
+
+Parsing each kraken2 file with the pavian function, works but is really slow. Below, I use this to just parse the database inspection file for GTDB & refseq databases once each, and then join it with agglomerated kraken2 data.
+```{r}
+parse_gtdb_bracken <- function(sample_id){
+  
+  cols <- c("ra_and_subs","reads_and_subs","reads","rank","id","tax")
+  
+  tax_levels <- read_tsv(paste0("data/kraken2/",sample_id,"_brackenReport.txt"), col_names = cols) %>% 
+    pull("rank") %>% 
+    unique() %>% 
+    data.frame(level = .) %>% 
+    mutate(toplevel = str_extract(level,"[A-Z]"),
+           sublevel = str_extract(level,"[0-9]"),
+           sublevel = if_else(is.na(sublevel), 0, as.numeric(sublevel)))
+  
+  #Order the levels
+  tax_lev_df <- data.frame(toplevel = c("R", "D","K", "P", "C", "O", "F", "G", "S")) %>% 
+    left_join(tax_levels) %>% filter(!is.na(level))
+  
+  #Read in the report with all taxonomic levels
+  full_report <- pavian::read_report2(paste0("data/kraken2/",sample_id,"_brackenReport.txt"),
+                       collapse = FALSE,
+                       add_taxRank_columns = TRUE,
+                       keep_taxRanks = tax_lev_df$level)
+  
+  #Cleanup the report
+  full_clean_report <- full_report %>% 
+    filter(taxRank == "S") %>% 
+    mutate(name = str_remove(name,"s_"),
+           sample = sample_id) %>% 
+    dplyr::select(sample,
+           n_read = "taxonReads",
+           taxID,
+           name,
+           lineage = "taxLineage",
+           any_of(tax_lev_df$level))
+  
+  return(full_clean_report)
+}
+  
+
+parse_ncbi_bracken <- function(sample_id){
+  
+  cols <- c("ra_and_subs","reads_and_subs","reads","rank","id","tax")
+  
+  tax_levels <- read_tsv(paste0("data/kraken2_euk/",sample_id,"_brackenReport.txt"), col_names = cols) %>% 
+    pull("rank") %>% 
+    unique() %>% 
+    data.frame(level = .) %>% 
+    mutate(toplevel = str_extract(level,"[A-Z]"),
+           sublevel = str_extract(level,"[0-9]"),
+           sublevel = if_else(is.na(sublevel), 0, as.numeric(sublevel)))
+  
+  #Order the levels
+  tax_lev_df <- data.frame(toplevel = c("R", "D","K", "P", "C", "O", "F", "G", "S")) %>% 
+    left_join(tax_levels) %>% filter(!is.na(level))
+  
+  #Read in the report with all taxonomic levels
+  full_report <- pavian::read_report2(paste0("data/kraken2/",sample_id,"_brackenReport.txt"),
+                       collapse = FALSE,
+                       add_taxRank_columns = TRUE,
+                       keep_taxRanks = tax_lev_df$level)
+  
+  #Cleanup the report
+  full_clean_report <- full_report %>% 
+    filter(taxRank == "S") %>% 
+    mutate(name = str_remove(name,"s_"),
+           sample = sample_id) %>% 
+    dplyr::select(sample,
+           n_read = "taxonReads",
+           taxID,
+           name,
+           lineage = "taxLineage",
+           any_of(tax_lev_df$level))
+  
+  return(full_clean_report)
+}
+
+
+
+
+#Find files to combine and make table of them
+files <-  data.frame(file = list.files("data/kraken2",full.names = TRUE)) %>%
+  filter(str_detect(file,"_bracken.txt")) %>%
+  mutate(sample = str_remove(file, "_bracken.txt"),
+         sample = str_remove(sample, ".*data/kraken2/"))
+
+
+
+library("future.apply")
+plan(multisession,workers = 4) ## Run in parallel on local computer
+
+
+gtdb_bracken_results <- future_lapply(files$sample,parse_gtdb_bracken) %>% 
+  bind_rows()
+
+
+ncbi_bracken_results <- future_lapply(files$sample,parse_ncbi_bracken) %>% 
+  bind_rows()
+
+
+wide_gtdb <- gtdb_bracken_results %>% 
+  pivot_wider(names_from = "sample",
+              values_from = "n_read")
+
+
+wide_ncbi <- ncbi_bracken_results %>% 
+  pivot_wider(names_from = "sample",
+              values_from = "n_read")
+
+
+
+plan(sequential)
+
+```
+
+
+
+## Parse kraken database inspection files, reducing computation for each kraken/bracken file
+
+Parse the kraken database inspection files and clean up results.
+```{r}
+# Parse the GTDB database inspection
+gtdb_kraken_tax <- parse_kraken_inspect("~/work/kraken_gtdb/inspect_backup.txt")
+
+# Further cleanup the inspection and make it match refseq
+gtdb_kraken_taxa_clean <- gtdb_kraken_tax %>% 
+  dplyr::select(taxID,D:S) %>% 
+  mutate(across(D:S, ~str_remove(.x,"^[a-z]_")),
+         taxID = paste0("gtdb_",taxID)) %>% 
+  unite("taxonomy",D:S,sep = "; ",remove = FALSE) %>% 
+  mutate(taxonomy = paste0("r__cellular organisms; ", taxonomy)) %>% 
+  dplyr::rename(Domain = "D"
+                , Phylum = "P"
+                , Class = "C"
+                , Order = "O"
+                , Family = "F"
+                , Genus = "G"
+                , Species = "S"
+                , taxonomy_id = "taxID"
+                ) %>% 
+  write_tsv("data/reference/gtdb_kraken_tax.tsv")
+
+
+#Was looking into reassigning refseq classified bacteria and archaea to corresponding gtdb entries
+# gtdb_bac <- read_tsv("data/reference/bac120_metadata_r95.tsv")
+# gtdb_ar <- read_tsv("data/reference/ar122_metadata_r95.tsv")
+# 
+# gtdb_bac_simple <- gtdb_bac %>% 
+#   dplyr::select(gtdb_taxonomy,ncbi_taxid) %>% 
+#   mutate(taxonomy_id = paste0("refseq_",ncbi_taxid)) %>% 
+#   dplyr::select(-ncbi_taxid)
+# 
+# gtdb_arc_simple <- gtdb_ar %>% 
+#   dplyr::select(gtdb_taxonomy,ncbi_taxid) %>% 
+#   mutate(taxonomy_id = paste0("refseq_",ncbi_taxid)) %>% 
+#   dplyr::select(-ncbi_taxid)
+# 
+# gtdb_simple <- bind_rows(gtdb_bac_simple,gtdb_arc_simple)
+
+
+
+
+# Parse the refseq database inspection file
+refseq_kraken_tax <- parse_kraken_inspect("~/work/kraken_refseq/inspect.txt")
+
+
+refseq_kraken_taxa_clean <- refseq_kraken_tax %>% 
+  dplyr::select(taxID, lineage,R:ncol(.)) %>% 
+  mutate(across(R:ncol(.), ~str_remove(.x,"^[a-z]_")),
+         taxID = paste0("refseq_",taxID)) %>% 
+  mutate(R1 = str_replace(R1,pattern = "^r1_",replacement = "r__"),
+         D = paste0("d__",D),
+         P = paste0("p__",P),
+         C = paste0("c__",C),
+         O = paste0("o__",O),
+         F = paste0("f__",F),
+         G = paste0("g__",G),
+         S = paste0("s__",S)
+         ) %>% 
+  dplyr::rename(Root = "R1"
+                , Domain = "D"
+                , Phylum = "P"
+                , Class = "C"
+                , Order = "O"
+                , Family = "F"
+                , Genus = "G"
+                , Species = "S"
+                , full_lineage = "lineage"
+                , taxonomy_id = "taxID"
+                ) %>% 
+  unite("taxonomy",c("Root","Domain","Phylum","Class","Order","Family","Genus","Species"),sep = "; ",remove = FALSE,na.rm = TRUE) %>% 
+  write_tsv("data/reference/refseq_kraken_tax.tsv")
+
+  
+```
+
+
+
+## Combine bracken files & supplement tax information from parsed DB inspection
+
+
+Import the kraken 2 results
+```{r}
+#Find files to combine and make table of them
+gtdb_files <-  data.frame(file = list.files("data/kraken2_uniq_gtdb",full.names = TRUE)) %>%
+  filter(!str_detect(file,"_for_bracken.txt"),
+         str_detect(file,"_bracken.txt")) %>%
+  mutate(sample = str_remove(file, "_bracken.txt"),
+         sample = str_remove(sample, ".*data/kraken2_uniq_gtdb/"),
+         source = row_number())
+
+
+gtdb_bracken <- gtdb_files$file %>% map_dfr(read_tsv, .id = "source",num_threads = 4, show_col_types = FALSE) %>% 
+  left_join(gtdb_files %>% dplyr::select(source, sample) %>% mutate(source = as.character(source))) %>% 
+  dplyr::select(sample, everything(), -source)
+
+
+wide_gtdb_bracken <- gtdb_bracken %>% 
+  filter(new_est_reads > 2) %>% 
+  dplyr::select(taxonomy_id,sample,new_est_reads) %>% 
+  mutate(taxonomy_id = paste0("gtdb_",taxonomy_id)) %>% 
+  pivot_wider(names_from = "sample", values_from = new_est_reads,values_fill = 0) %>% 
+  left_join(gtdb_kraken_taxa_clean %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  relocate(taxonomy_id,taxonomy)
+
+
+#Find files to combine and make table of them
+refseq_files <- data.frame(file = list.files("data/kraken2_uniq_refseq",full.names = TRUE)) %>%
+  filter(!str_detect(file,"_for_bracken.txt"),
+         str_detect(file,"_bracken.txt")) %>%
+  mutate(sample = str_remove(file, "_bracken.txt"),
+         sample = str_remove(sample, ".*data/kraken2_uniq_refseq/"),
+         source = row_number())
+
+
+refseq_bracken <- refseq_files$file %>% map_dfr(read_tsv, .id = "source", num_threads = 4, show_col_types = FALSE) %>% 
+  left_join(refseq_files %>% dplyr::select(source, sample) %>% mutate(source = as.character(source))) %>% 
+  dplyr::select(sample, everything(), -source)
+
+
+wide_refseq_bracken <- refseq_bracken %>% 
+  filter(new_est_reads > 2) %>%
+  dplyr::select(taxonomy_id,sample,new_est_reads) %>% 
+  mutate(taxonomy_id = paste0("refseq_",taxonomy_id)) %>% 
+  pivot_wider(names_from = "sample", values_from = new_est_reads,values_fill = 0) %>% 
+  left_join(refseq_kraken_taxa_clean %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  relocate(taxonomy_id,taxonomy) %>% 
+  filter(!str_detect(taxonomy, "d__Bacteria"),
+         !str_detect(taxonomy, "d__Archaea")) 
+
+combined_braken <- bind_rows(wide_gtdb_bracken,wide_refseq_bracken) %>% 
+  write_tsv("results/braken_count_table.tsv")
+
+
+abund_mat <- combined_braken %>% dplyr::select(-taxonomy) %>% column_to_rownames("taxonomy_id")
+
+
+taxonomy <- bind_rows(gtdb_kraken_taxa_clean %>% dplyr::select(taxonomy_id,taxonomy),
+                      refseq_kraken_taxa_clean %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  dplyr::rename(name = "taxonomy", otu = "taxonomy_id")
+
+```
+
+
+
+
+
+# Test krakenuniq (like) thresholds for unique minimizers in Kraken2
+
+Testing KrakenUniq like feature in Kraken2
+```{r}
+
+
+inspect_cols <- c("ra_and_subs","kmers_and_subs","unique_kmers","rank","taxonomy_id","tax")
+gtdb_inspect <- read_tsv("~/work/kraken_gtdb/inspect.txt",col_names = inspect_cols) 
+
+
+
+cols <- c("percent_of_reads_in_tax_and_subs", "num_reads_tax_and_subs", "num_reads_tax", "num_associated_kmers_observed", "num_uniq_kmers_observed", "rank","taxonomy_id","name")
+
+
+
+test <- read_tsv("data/kraken2_uniq_refseq/DD1c_report.txt",col_names = cols)
+
+
+(test2 %>% ggplot(aes(percent_of_reads_in_tax_and_subs,num_uniq_kmers_observed, label = name)) + geom_point()) %>% plotly::ggplotly()
+
+bracken_input <- read_tsv("data/kraken2_uniq_refseq/DD1c_for_bracken.txt",col_names = inspect_cols)
+
+report_filtered_for_bracken <- test %>% 
+  filter(rank =="S",
+        num_uniq_kmers_observed > 25)
+
+braken_report <- read_tsv("data/kraken2_uniq_refseq/DD1c_bracken.txt")
+
+test %>% filter(str_detect(rank,"S")) %>% ggplot(aes(num_reads_tax_and_subs, num_uniq_kmers_observed)) + geom_point() + scale_x_log10() + scale_y_log10() + geom_abline(slope = 1) + geom_hline(yintercept = 50)
+
+test %>% ggplot(aes(num_uniq_kmers_observed)) + geom_histogram() + scale_x_log10() + geom_vline(xintercept = 50)
+
+
+test2 <- test %>% 
+  filter(rank == "S") %>% 
+  left_join(gtdb_inspect %>% dplyr::select(taxonomy_id,kmers_and_subs)) %>% 
+  mutate(uniq_to_all_kmers_ratio = num_uniq_kmers_observed / num_associated_kmers_observed,
+         uniq_to_reads_ratio = num_uniq_kmers_observed / num_reads_tax_and_subs,
+         ratio_corrected_reads = uniq_to_all_kmers_ratio * num_reads_tax_and_subs,
+         kmer_coverage = num_uniq_kmers_observed / kmers_and_subs)
+
+(test2 %>% ggplot(aes(uniq_to_reads_ratio, uniq_to_all_kmers_ratio, label = name)) + geom_point() + scale_x_log10() + scale_y_log10()) %>% plotly::ggplotly()
+
+
+```
+
+
+Determine uniq kmer threshold for filtering
+```{r}
+
+cols <- c("percent_of_reads_in_tax_and_subs", "num_reads_tax_and_subs", "num_reads_tax", "num_associated_kmers_observed", "num_uniq_kmers_observed", "rank","taxonomy_id","name")
+
+gtdb_files <-  data.frame(file = list.files("data/kraken2_uniq_gtdb",full.names = TRUE)) %>%
+  filter(str_detect(file,"_report.txt")) %>%
+  mutate(sample = str_remove(file, "_report.txt"),
+         sample = str_remove(sample, ".*data/kraken2_uniq_gtdb/"),
+         source = row_number())
+
+
+gtdb_kraken_uniq <- gtdb_files$file %>% map_dfr(read_tsv, .id = "source",num_threads = 4, show_col_types = FALSE, col_names = cols) %>% 
+  filter(str_detect(rank,"S")) %>% 
+  left_join(gtdb_files %>% dplyr::select(source, sample) %>% mutate(source = as.character(source))) %>% 
+  dplyr::select(sample, everything(), -source)
+
+
+refseq_files <-  data.frame(file = list.files("data/kraken2_uniq_refseq",full.names = TRUE)) %>%
+  filter(str_detect(file,"_report.txt")) %>%
+  mutate(sample = str_remove(file, "_report.txt"),
+         sample = str_remove(sample, ".*data/kraken2_uniq_refseq/"),
+         source = row_number())
+
+
+refseq_kraken_uniq <- refseq_files$file %>% map_dfr(read_tsv, .id = "source",num_threads = 4, show_col_types = FALSE, col_names = cols) %>% 
+  filter(str_detect(rank,"S")) %>% 
+  left_join(refseq_files %>% dplyr::select(source, sample) %>% mutate(source = as.character(source))) %>% 
+  dplyr::select(sample, everything(), -source)
+
+
+
+combined_kraken_uniq <- bind_rows(refseq_kraken_uniq, gtdb_kraken_uniq)
+
+
+unique_species <- combined_kraken_uniq %>% 
+  group_by(taxonomy_id) %>% 
+  filter(num_uniq_kmers_observed == max(num_uniq_kmers_observed))
+
+
+unique_species %>%  ggplot(aes(num_uniq_kmers_observed)) + geom_histogram(bins = 200) + scale_x_log10() + scale_y_log10() +
+  geom_vline(xintercept = 50, color = "yellow") +
+  geom_vline(xintercept = 100, color = "orange") +
+  geom_vline(xintercept = 150, color = "red") +
+  geom_vline(xintercept = 200, color = "purple") +
+  geom_vline(xintercept = 250, color = "black") +
+  geom_vline(xintercept = 1000, color = "pink") +
+  theme_bw()
+
+
+unique_species %>% 
+  ungroup() %>% 
+  arrange(desc(num_uniq_kmers_observed)) %>% 
+  mutate(n_species = row_number()) %>% 
+  ggplot(aes(num_uniq_kmers_observed,n_species)) + geom_line() + scale_x_log10() +
+  geom_vline(xintercept = 50, color = "yellow") +
+  geom_vline(xintercept = 100, color = "orange") +
+  geom_vline(xintercept = 150, color = "red") +
+  geom_vline(xintercept = 200, color = "purple") +
+  geom_vline(xintercept = 250, color = "black") +
+  geom_vline(xintercept = 1000, color = "pink") +
+  theme_bw()
+
+```
+
+
+
+
+
+
+
+
+# Dashing containment of samples (determine sample similarity by pairwise kmer containment)
+
+This is unseful for sample comparison, and determining the relative contamination of samples.
+
+How similar is each sample, measured in terms of the proportion of one sample's kmers contained in the other
+
+In the long format, it is interpreted as the fraction of kmers in s1 that are in s1 and s2
+
+
+```{r}
+library(patchwork)
+
+metadata <- read_tsv("data/metadata.tsv")
+
+neg_controls <- metadata %>% filter(neg_control == TRUE) %>% pull("sample")
+
+dist <- read_tsv("code/dashing/dashing/dist_mat.txt") %>% 
+  dplyr::rename(s1 = "##Names") %>% 
+  pivot_longer(-s1,names_to = "s2", values_to = "containment") %>% 
+  mutate(across(c("s1","s2"), ~str_remove(.x,".*files\\/")),
+         across(c("s1","s2"), ~str_remove(.x,"_R1.*")))
+
+dist_negs <- dist %>% 
+  filter(s1 %in% neg_controls,
+         !s2 %in% neg_controls,
+         !str_detect(s1,"NEG"),
+         !str_detect(s2,"NEG"),
+         s1 != s2) %>% 
+  group_by(s2) %>% 
+  arrange(desc(containment)) %>% 
+  mutate(sim_rank = row_number()) %>% 
+  filter(sim_rank == 1) %>% 
+  dplyr::rename(contamination = "containment",
+                most_similar_negative_control = "s1",
+                sample = "s2") %>% 
+  dplyr::select(-sim_rank)
+
+metadata <- metadata %>% left_join(dist_negs)
+
+
+sample_order <- metadata %>% arrange(location) %>% 
+  dplyr::select(s1 = "sample", location)
+
+
+locations <- metadata$location %>% unique()
+
+
+location_bar <- sample_order %>% filter(!s1 %in% neg_controls) %>% mutate(location_num = as.numeric(factor(location, levels = locations,ordered = T))) %>% ggplot(aes(reorder(s1, location_num), y = 1, fill = location)) + geom_tile() +theme_void()
+
+
+location_bar / (dist %>% left_join(sample_order) %>% filter(!str_detect(s2,"NEG") & !s1 %in% neg_controls) %>% mutate(location_num = as.numeric(factor(location, levels = locations,ordered = T))) %>% filter(s2 %in% neg_controls) %>% ggplot(aes(reorder(s1,location_num),s2,fill = containment)) +geom_tile() + scale_fill_viridis_c() + theme(axis.text.x = element_text(angle = 45,hjust = 1, vjust = 1))) + plot_layout(guides = "collect",heights = c(0.2,0.8)) 
+
+
+
+clean_dist <- dist %>% filter(s2 %in% neg_controls) %>% pivot_wider(id_cols = s1, names_from = "s2", values_from = "containment") %>% column_to_rownames("s1") %>% as.matrix()
+
+
+heatmap(clean_dist,scale = "none")
+
+```
+
+Weighted jaccard dashing instead of containment
+```{r}
+library(patchwork)
+
+metadata <- read_tsv("data/metadata.tsv")
+
+neg_controls <- metadata %>% filter(neg_control == TRUE) %>% pull("sample")
+
+dist <- read_tsv("data/dashing/wjaccard_distmat.txt") %>% 
+  dplyr::rename(s1 = "##Names") %>% 
+  pivot_longer(-s1,names_to = "s2", values_to = "containment") %>% 
+  mutate(across(c("s1","s2"), ~str_remove(.x,".*files\\/")),
+         across(c("s1","s2"), ~str_remove(.x,"_R1.*")))
+
+dist_negs <- dist %>% 
+  filter(s1 %in% neg_controls,
+         !s2 %in% neg_controls,
+         !str_detect(s1,"NEG"),
+         !str_detect(s2,"NEG"),
+         s1 != s2) %>% 
+  group_by(s2) %>% 
+  arrange(desc(containment)) %>% 
+  mutate(sim_rank = row_number()) %>% 
+  filter(sim_rank == 1) %>% 
+  dplyr::rename(contamination = "containment",
+                most_similar_negative_control = "s1",
+                sample = "s2") %>% 
+  dplyr::select(-sim_rank)
+
+metadata <- metadata %>% left_join(dist_negs)
+
+
+sample_order <- metadata %>% 
+  arrange(location) %>% 
+  dplyr::select(s1 = "sample", location)
+
+
+locations <- metadata$location %>% unique()
+
+
+location_bar <- sample_order %>% filter(!s1 %in% neg_controls) %>% mutate(location_num = as.numeric(factor(location, levels = locations,ordered = T))) %>% ggplot(aes(reorder(s1, location_num), y = 1, fill = location)) + geom_tile() +theme_void()
+
+
+location_bar / (dist %>% left_join(sample_order) %>% filter(!str_detect(s2,"NEG") & !s1 %in% neg_controls) %>% mutate(location_num = as.numeric(factor(location, levels = locations,ordered = T))) %>% filter(s2 %in% neg_controls) %>% ggplot(aes(reorder(s1,location_num),s2,fill = containment)) +geom_tile() + scale_fill_viridis_c() + theme(axis.text.x = element_text(angle = 45,hjust = 1, vjust = 1))) + plot_layout(guides = "collect",heights = c(0.2,0.8)) 
+
+
+
+clean_dist <- dist %>% filter(s2 %in% neg_controls) %>% pivot_wider(id_cols = s1, names_from = "s2", values_from = "containment") %>% column_to_rownames("s1") %>% as.matrix()
+
+
+heatmap(clean_dist,scale = "none")
+
+```
+
+
+
+
+
+
+
+

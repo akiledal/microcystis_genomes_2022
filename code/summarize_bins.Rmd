@@ -1,0 +1,586 @@
+---
+title: "Bin Summary"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load required packages
+library(tidyverse)
+library(Biostrings)
+library(heatmaply)
+```
+
+## Bin summary metrics
+Read in GTDB-tk results
+```{r}
+gtdbtk_summary <- read_tsv("data/gtdb/gtdbtk.bac120.summary.tsv",na = c("N/A","NA","")) %>% 
+  rename_with(~paste0("gtdb_",.x)) %>% 
+  dplyr::rename(bin = "gtdb_user_genome") %>% 
+  write_tsv("data/gtdb/bac_and_arc_summary.tsv")
+```
+
+Read in file mapping sequencing ids to strain ids
+```{r}
+samples_to_use <- read_tsv("data/samples_to_use.tsv")
+
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+```
+
+
+Read in checkM results (calculated during run of drep)
+```{r}
+checkm_summary <- read_tsv("data/drep/data/checkM/checkM_outdir/results.tsv") %>% 
+  dplyr::rename(bin = "Bin Id") %>% 
+  mutate(bin = str_remove(bin,".fasta")) %>% 
+  rename_with(~paste0("checkM_",.x), 
+              .cols = -c(bin))
+```
+
+Read in drep results to include in summary
+```{r}
+drep_info <- read_csv("data/drep/data_tables/genomeInfo.csv") %>% 
+   dplyr::select(bin = "genome", length, N50) %>% 
+    mutate(bin = str_remove(bin,".fasta"))
+
+drep <- read_csv("data/drep/data_tables/Wdb.csv") %>% 
+  dplyr::rename(bin = "genome",drep_score = "score") %>% 
+  mutate(bin = str_remove(bin,".fasta"),
+         drep_representative = TRUE) %>% 
+  left_join(drep_info)
+
+drep_bins <- drep$bin
+
+gtdb_drep <- gtdbtk_summary %>%
+  filter(bin %in% drep_bins)
+```
+
+
+Combine GTDBtk & CheckM results
+```{r}
+bin_summary <- checkm_summary %>% 
+  left_join(gtdbtk_summary) %>% 
+  left_join(drep) %>%
+  mutate(sample = str_remove(bin,"_bin_.*")) %>% 
+  #filter(checkM_Completeness > 80) %>% 
+  group_by(sample) %>% 
+  mutate(number_of_bins = n()) %>% 
+  ungroup() %>% 
+  mutate(cyano = str_detect(gtdb_classification, "Cyanobacteria")) %>% 
+  left_join(seqID_to_strainID %>% select(sample = "sequencingID", culture = "pubID"))
+
+simple_bin_summary <- bin_summary %>% 
+  dplyr::select(sample, 
+         bin,
+         gtdb_classification, 
+         checkM_Completeness, 
+         checkM_Contamination, 
+         length,
+         N50,
+         drep_score, 
+         cyano)
+```
+
+
+How many bins were identified in each sample?
+```{r fig.height=6, fig.width=4}
+bin_summary %>% ggplot(aes(reorder(sample,number_of_bins))) + 
+  geom_bar(position = "dodge") + 
+  coord_flip() + 
+  theme_bw() + 
+  scale_fill_viridis_d(begin = 0.2, end = 0.8) +
+  labs(title = "Number of bins", 
+       subtitle = "After DAStool dereplication", 
+       x = "Sample")
+```
+How many bins for each taxa?
+```{r fig.height=8, fig.width=15}
+bin_summary %>% 
+  group_by(gtdb_classification) %>% 
+  mutate(n_class = n()) %>% 
+  ggplot(aes(reorder(gtdb_classification, n_class))) + 
+  geom_bar() + 
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Number of bins by taxonomy", x = NULL) 
+  ggsave("results/number_of_bins_by_taxonomy.png", type = "cairo" , height = 6, width = 8, scale = 1.5)
+
+```
+
+
+Number of bins at each completeness level
+```{r}
+
+bin_summary2 <- bin_summary %>% ungroup() %>% 
+  mutate(count_less_complete = map_int(checkM_Completeness, ~ sum(.x <= checkM_Completeness))) %>% 
+  dplyr::select(bin,checkM_Completeness, count_less_complete)
+
+bin_summary2 %>% ggplot(aes(checkM_Completeness, count_less_complete)) + 
+  geom_line() + 
+  scale_x_reverse() +
+  labs(title = "Bin completion", subtitle = "Determined with checkm", x = "% Completness", y = "Cumulative number of bins") +
+  theme_bw() 
+  ggsave("results/completion.png",width = 2.5, height = 1.5, scale = 2, type = "cairo")
+
+```
+
+
+Number of bins at each contamination level
+```{r}
+
+bin_summary2 <- bin_summary %>% ungroup() %>% 
+  mutate(count_more_contaminated = map_int(checkM_Contamination, ~ sum(.x >= checkM_Contamination))) %>% 
+  dplyr::select(bin,checkM_Contamination, count_more_contaminated)
+
+bin_summary2 %>% ggplot(aes(checkM_Contamination, count_more_contaminated)) + 
+  geom_line() +
+  labs(title = "Bin contamination", subtitle = "Determined with checkm", x = "% contamination", y = "Cumulative number of bins") +
+  theme_bw() 
+  ggsave("results/bin_contamination.png",width = 2.5, height = 1.5, scale =2, type = "cairo")
+
+```
+
+Interactive bin summary of all bins
+```{r}
+(
+bin_summary %>% ggplot(aes(x = checkM_Completeness, 
+                           y = checkM_Contamination,
+                           taxonomy = gtdb_classification, 
+                           sample = sample,
+                           length = length,
+                           bin_name = bin, 
+                           fill = drep_representative)) + 
+  geom_point(alpha = 0.6) +
+  scale_y_reverse() +
+  theme_bw()
+) %>% plotly::ggplotly()
+
+```
+
+
+Interactive summary of unique taxa bins (best for each taxa)
+```{r}
+(
+test <- bin_summary %>% 
+  group_by(gtdb_classification) %>% 
+  mutate(bin_quality = checkM_Completeness * (100 - checkM_Contamination) * length) %>% 
+  top_n(1,bin_quality) %>% 
+  
+  
+  ggplot(aes(x = checkM_Completeness, 
+                           y = checkM_Contamination,
+                           taxonomy = gtdb_classification, 
+                           sample = sample,
+                           length = length,
+                           bin_name = bin)) + 
+  geom_point(alpha = 0.6) +
+  scale_y_reverse() +
+  theme_bw()
+) %>% plotly::ggplotly()
+```
+
+
+## Bin Coverage
+
+Read in and tidy CoverM file
+```{r}
+coverm_tidy <- read_tsv("results/bin_coverage.tsv") %>% 
+  pivot_longer(-Genome, names_to = "metric", values_to = "value") %>% 
+  separate(metric, into = c("reads", "metric"),sep = " ", extra = "merge") %>% 
+  mutate(
+    sample_reads = str_remove(reads, "_R1.*"),
+    metric = case_when(
+      metric == "Relative Abundance (%)" ~ "percent_abund",
+      metric == "Covered Bases" ~ "covered_bases",
+      metric == "Mean" ~ "mean",
+      metric == "Variance" ~ "variance",
+      metric == "Length" ~ "length")
+    ) %>% 
+  rename(bin = "Genome")
+  
+coverm_tidy_wide <- coverm_tidy %>% 
+  pivot_wider(names_from = metric, values_from = value ) %>% 
+  left_join(simple_bin_summary %>% dplyr::select(bin, length)) %>% 
+  mutate(percent_bin_bases_covered = covered_bases/length*100) %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(sample_reads = "sequencingID"))
+
+rel_abund_long <- coverm_tidy %>% 
+  filter(metric == "percent_abund") %>% 
+  dplyr::select(-metric)
+
+rel_abund <- rel_abund_long %>%
+  pivot_wider(-reads, names_from = "sample_reads",values_from = "value") %>%
+  filter(bin != "unmapped") %>%
+  column_to_rownames("bin") %>% 
+  write_tsv("data/bin_rel_abund.tsv")
+
+coverage_long <- coverm_tidy %>% 
+  filter(metric == "mean") %>% 
+  dplyr::select(-metric)
+
+coverage <- coverage_long %>%
+  pivot_wider(-reads, names_from = "sample_reads",values_from = "value") %>%
+  filter(bin != "unmapped") %>%
+  column_to_rownames("bin")
+
+```
+
+What percent of reads are unmapped per sample?
+Provides an indication of which samples have abundant unbinned organisms.
+```{r}
+unmapped_reads_per_sample <- rel_abund_long %>%
+  filter(bin == "unmapped") %>%
+  dplyr::select(bin, sample_reads, percent_abund = "value") %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(sample_reads = "sequencingID"))
+```
+
+
+Heatmap of bin relative abundance in each sample
+```{r}
+log_ra <- microbiome::transform(rel_abund,transform = "log10")
+
+heatmaply(log_ra)
+```
+
+Heatmap of drep'd bin relative abundance in each sample
+```{r}
+unique_bin_ra <- log_ra %>% 
+  rownames_to_column("bin") %>% 
+  filter(bin %in% drep_bins) %>% 
+  column_to_rownames("bin")
+
+heatmaply(t(unique_bin_ra),scale = "row")
+```
+
+#Which samples are each bin observed in?
+
+## Bin presence in samples
+
+Determine bin presence in samples
+```{r}
+# all bins with more than 50% of bases covered
+bin_presence <- coverm_tidy_wide %>% 
+  filter(percent_bin_bases_covered > 50) %>% 
+  left_join(simple_bin_summary,by = "bin") %>% 
+  select(bin,pubID,percent_abund, gtdb_classification) %>% 
+  pivot_wider(names_from = pubID, values_from = percent_abund) %>% 
+  write_tsv("results/percent_abundance_of_all_bins_with_50_percent_covered_bases.tsv") %>% 
+  write_rds("results/percent_abundance_of_all_bins_with_50_percent_covered_bases.rds")
+
+# Dereplciated bins with >50% of bases covered
+rep_bin_coverage <- coverm_tidy_wide %>% 
+  filter(bin %in% drep$bin,
+         percent_bin_bases_covered > 50) %>% 
+  left_join(simple_bin_summary) %>% 
+  group_by(sample_reads) %>% 
+  mutate(n_bins = n())
+
+rep_bin_presence <- rep_bin_coverage %>% 
+  select(bin,pubID,percent_abund, gtdb_classification) %>% 
+  pivot_wider(names_from = pubID, values_from = percent_abund) %>% 
+  write_tsv("results/percent_abundance_of_deprelicated_bins_with_50_percent_covered_bases.tsv")
+```
+
+Abundance of bins in each sample
+```{r}
+
+per_sample_bin_abund <- coverm_tidy_wide %>% 
+  mutate(bin_sample = str_remove_all(bin,"_bin.*")) %>% 
+  filter(bin_sample == sample_reads) %>% 
+  left_join(simple_bin_summary) %>% 
+  group_by(bin_sample) %>% 
+  mutate(n_bins = n())
+
+
+per_sample_bin_abund %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-n_bins), bin, fill = percent_abund)) +
+  geom_tile() +
+  scale_fill_viridis_c(trans = "log") +
+  theme_bw() +
+  labs(x = NULL, 
+       y = NULL, 
+       fill = "Percent of\nsample reads\nmapped to bin",
+       title = "Percent of reads mapping to bins in the same sample") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggsave("results/per_sample_bin_abund.png",width = 6, height = 10, scale = 2, dpi = 600)
+```
+
+
+
+
+Percent abundance of dereplicated bins across samples
+```{r}
+rep_bin_coverage %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-n_bins), bin, fill = percent_abund)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_bw() +
+  labs(x = NULL, 
+       y = NULL, 
+       fill = "Percent of\nsample reads\nmapped to MAG",
+       title = "Dereplicated bin abundance in each sample") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggsave("results/drep_bin_presence.png",width = 6, height = 10, scale = 1.25, dpi = 600)
+```
+
+## Binned heterotroph taxa presence in samples
+```{r}
+tax_bin_coverage <- coverm_tidy_wide %>% 
+  filter(bin %in% drep$bin,
+         percent_bin_bases_covered > 50) %>% 
+  left_join(simple_bin_summary) %>% 
+  group_by(gtdb_classification, sample_reads, pubID, cyano) %>% 
+  summarise(percent_abund = sum(percent_abund)) %>% ungroup()
+
+non_microcystis_abund <- tax_bin_coverage %>% 
+  filter(!str_detect(gtdb_classification,"Microcystis"),
+         !is.na(pubID)) %>% 
+  group_by(pubID) %>% 
+  summarise(percent_abund = sum(percent_abund))
+
+microcystis_abund <- tax_bin_coverage %>% 
+  filter(str_detect(gtdb_classification,"Microcystis"),
+         !is.na(pubID)) %>% 
+  group_by(pubID) %>% 
+  summarise(percent_abund = sum(percent_abund))
+
+
+tax_bin_presence <- tax_bin_coverage %>% 
+  select(gtdb_classification,pubID,percent_abund) %>% 
+  pivot_wider(names_from = pubID, values_from = percent_abund) %>% 
+  write_tsv("results/percent_abundance_of_taxa_with_50_percent_covered_bases.tsv")
+
+het_bin_presence <- tax_bin_coverage %>% 
+  filter(cyano == FALSE) %>% 
+  select(gtdb_classification,pubID,percent_abund) %>% 
+  pivot_wider(names_from = pubID, values_from = percent_abund) %>% 
+  write_tsv("results/percent_abundance_of_heterotrophs_with_50_percent_covered_bases.tsv")
+  
+(hetero_abund <- tax_bin_coverage %>% 
+  filter(cyano == FALSE,
+         percent_abund > 1) %>%
+  group_by(gtdb_classification) %>%  mutate(num_samples_obs_in = n()) %>% ungroup %>% 
+  group_by(sample_reads) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  mutate(short_tax = str_extract(gtdb_classification,"g_.*")) %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(short_tax, num_samples_obs_in), fill = percent_abund)) +
+    geom_tile() +
+    scale_fill_viridis_c(trans = "log") +
+    theme_bw() +
+    labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+    #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+)
+
+ggsave("results/heterotroph_tax_presence.png",width = 5, height = 3.5, scale = 2, dpi = 600)
+```
+
+## Binned cyano. taxa presence in samples
+```{r}
+(cyano_abund <- tax_bin_coverage %>% 
+  filter(cyano == TRUE,
+         percent_abund > 1) %>%
+  group_by(gtdb_classification) %>%  mutate(num_samples_obs_in = n()) %>% ungroup %>% 
+  group_by(sample_reads) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  mutate(short_tax = str_extract(gtdb_classification,"g_.*")) %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(short_tax, num_samples_obs_in), fill = percent_abund)) +
+    geom_tile() +
+    scale_fill_viridis_c(trans = "log") +
+    theme_bw() +
+    labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+    #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+)
+
+ggsave("results/cyano_tax_presence.png",width = 5, height = 2.5, scale = 2, dpi = 600)
+```
+Coverage of both cyanos and heterotrophs in sample
+```{r}
+(tax_bin_coverage %>% 
+  mutate(cyano = if_else(cyano == TRUE, "Cyanobacteria", "Heterotroph")) %>% 
+  filter(percent_abund > 1) %>%
+  group_by(gtdb_classification) %>% mutate(num_samples_obs_in = n()) %>% ungroup %>% 
+  group_by(sample_reads) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  mutate(short_tax = str_extract(gtdb_classification,"g_.*")) %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(short_tax, num_samples_obs_in), fill = percent_abund)) +
+    geom_tile() +
+    scale_fill_viridis_c(trans = "log") +
+    theme_bw() +
+    labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+    #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_grid(cyano ~ .,scales = "free_y",space = "free_y",)
+)
+
+ggsave("results/cyano_and_het_tax_presence.png",width = 5, height = 3.5, scale = 2, dpi = 600)
+```
+
+### Coverage of both cyanos and heterotrophs, and unmapped reads per sample
+
+#### To the species level
+```{r}
+(cyano_het_unmapped_coverage <- tax_bin_coverage %>% 
+  mutate(cyano = if_else(cyano == TRUE, "Cyanobacteria", "Non-Cyanobacteria")) %>% 
+  filter(percent_abund > 1) %>%
+  group_by(gtdb_classification) %>% mutate(num_samples_obs_in = n()) %>% ungroup %>% 
+  group_by(sample_reads) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  mutate(short_tax = str_extract(gtdb_classification,"g_.*")) %>% 
+  full_join(unmapped_reads_per_sample %>% 
+              dplyr::rename(gtdb_classification = "bin") %>% 
+              mutate(cyano = " ",
+                     short_tax = "Unmapped",
+                     num_samples_obs_in = length(unique(.$sample_reads)),
+                     num_tax_in_sample = 1)) %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(short_tax, num_samples_obs_in), fill = percent_abund)) +
+  geom_tile() +
+  scale_fill_viridis_c(trans = "log") +
+  theme_bw() +
+  labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+  #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  facet_grid(cyano ~ .,scales = "free_y",space = "free_y",)
+)
+
+ggsave("results/unmapped_cyano_het_tax_presence.png",width = 5, height = 3.5, scale = 2, dpi = 600)
+```
+
+#### To the genus level
+```{r}
+(cyano_genus_het_unmapped_coverage <- tax_bin_coverage %>% 
+  mutate(cyano = if_else(cyano == TRUE, "Cyanobacteria", "Non-Cyanobacteria")) %>% 
+  filter(percent_abund > 0.1) %>%
+  group_by(gtdb_classification) %>% mutate(num_samples_obs_in = n()) %>% ungroup %>% 
+  group_by(sample_reads) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  mutate(short_tax = str_extract(gtdb_classification,"g_.*"),
+         genus = short_tax %>% str_remove("g__") %>% str_remove(";s__.*")) %>% 
+  full_join(unmapped_reads_per_sample %>% 
+              dplyr::rename(gtdb_classification = "bin") %>% 
+              mutate(cyano = " ",
+                     short_tax = "Unmapped",
+                     num_samples_obs_in = length(unique(.$sample_reads)),
+                     num_tax_in_sample = 1)) %>% 
+  filter(sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(genus, num_samples_obs_in), fill = percent_abund)) +
+  geom_tile() +
+  scale_fill_viridis_c(trans = "log") +
+  theme_bw() +
+  labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+  #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  facet_grid(cyano ~ .,scales = "free_y",space = "free_y",)
+)
+
+ggsave("results/unmapped_genus_cyano_het_tax_presence.png",width = 5, height = 3.5, scale = 2, dpi = 600)
+```
+
+
+
+## Kraken2 taxonomic profiles of each microcystis strain sample
+```{r}
+# Read in species level bracken abundance data
+bracken_abund <- read_tsv("results/braken_count_table.tsv")
+
+# Convert to relative abundance
+bracken_rel_abund_mat <- bracken_abund %>% 
+  mutate(across(-c("taxonomy_id","taxonomy"),~.x/sum(.x)))
+
+# Split out lineage and summarize and genus level
+tax_levels <- c("root","domain","phylum","class","order","family","genus","species")
+
+genus_abund <- bracken_rel_abund_mat %>% 
+  separate(taxonomy,into = tax_levels,sep = "; [a-z]__") %>% 
+  group_by(root,domain,phylum,class,order,family,genus) %>% 
+  summarise(across(where(is.numeric), sum)) 
+
+filtered_genus_abund_long <- genus_abund %>%
+  pivot_longer(where(is.numeric),names_to = "sample", values_to = "rel.abund") %>% 
+  group_by(root,domain,phylum,class,order,family,genus) %>% 
+  filter(max(rel.abund) > 0.01) %>% 
+  left_join(seqID_to_strainID %>%
+              dplyr::rename(sample = "sequencingID"))
+
+non_bac <- genus_abund %>%
+  pivot_longer(where(is.numeric),names_to = "sample", values_to = "rel.abund") %>% 
+  group_by(root,domain,phylum,class,order,family,genus) %>% 
+  filter(domain != "Bacteria") %>% 
+  left_join(seqID_to_strainID %>%
+              dplyr::rename(sample = "sequencingID"))
+
+percent_abundance_bracken_genera <- filtered_genus_abund_long %>% 
+  filter(sample %in% samples_to_use$samples_to_use) %>% 
+  mutate(percent_abund = rel.abund * 100) %>% 
+  filter(percent_abund > 0.1) %>% 
+  select(any_of(tax_levels),pubID,percent_abund) %>% 
+  pivot_wider(names_from = pubID,values_from = percent_abund) %>% 
+  write_tsv("results/percent_abundance_bracken_genera.tsv")
+
+prev_and_abund_for_Esmee <- percent_abundance_bracken_genera %>% 
+  pivot_longer(-c(root:genus), names_to = "strain", values_to = "rel_abund") %>% 
+  group_by(domain, phylum, class, order, family, genus) %>% 
+  summarise(prevalence = sum(!is.na(rel_abund)) / n() * 100,
+            mean_abund = mean(rel_abund,na.rm = TRUE)) %>% 
+  filter(!str_detect(genus, "^Homo$")) %>% 
+  write_tsv("results/prev_and_abund_for_esmee_bracken_genus_WLE_cultures.tsv")
+```
+
+
+```{r}
+(bracken_cyano_and_het_abund <- filtered_genus_abund_long %>% 
+   filter(!is.na(pubID)) %>% 
+   filter(sample %in% samples_to_use$samples_to_use) %>% 
+  mutate(cyano = if_else(phylum == "Cyanobacteria","Cyanobacteria","Non-Cyanobacteria"),
+         percent_abund = rel.abund * 100) %>% 
+  filter(percent_abund > 0.1) %>% 
+  group_by(root,domain,phylum,class,order,family,genus) %>% mutate(num_samples_obs_in = n()) %>% ungroup() %>% 
+  group_by(sample) %>% mutate(num_tax_in_sample = n()) %>% ungroup() %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(genus, num_samples_obs_in), fill = percent_abund, label = round(percent_abund,1))) +
+  geom_tile() +
+  geom_text(color = "grey90", size = 1.5)+
+  scale_fill_viridis_c(trans = "log") +
+  theme_bw() +
+  labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+  #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)) +
+  facet_grid(cyano ~ .,scales = "free_y",space = "free_y",)
+)
+
+ggsave("results/bracken_cyano_and_het_abund.png", width = 4, height = 4, scale = 2, dpi = 600)
+```
+
+Combined figures
+```{r}
+bin_coverage_and_bracken <- bracken_cyano_and_het_abund$data %>% 
+  mutate(method = "Bracken") %>% 
+  full_join(cyano_genus_het_unmapped_coverage$data %>% 
+              mutate(method = "Bin Coverage",
+                     genus = if_else(gtdb_classification == "unmapped", "unmapped", genus)) %>% 
+            separate(gtdb_classification,into = tax_levels[-1],sep = ";[a-z]__")) %>% 
+  mutate(genus = if_else(genus == "", paste0("Other ",family),genus),
+         genus = if_else(domain == "unmapped", "unmapped",genus))
+
+(bracken_and_bin_coverage_facets <- bin_coverage_and_bracken %>% 
+  filter(!str_detect(pubID, paste0(samples_to_use$samples_to_use,collapse = "|"))) %>% 
+  filter(sample %in% samples_to_use$samples_to_use | sample_reads %in% samples_to_use$samples_to_use) %>% 
+  ggplot(aes(reorder(pubID,-num_tax_in_sample), reorder(genus, num_samples_obs_in), fill = percent_abund, label = round(percent_abund,1))) +
+  geom_tile() +
+  geom_text(color = "grey90", size = 1.75)+
+  scale_fill_viridis_c(trans = "log", labels=scales::trans_format("identity", function(x) round(x,1))) +
+  theme_bw() +
+  labs(x = NULL, y = NULL, fill = "Percent of\nsample reads") +
+  #scale_y_discrete(labels = function(x) str_wrap(x, width = 10)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  facet_grid(cyano ~ method,scales = "free_y",space = "free_y")
+)
+
+ggsave("results/bin_coverage_and_bracken_abund_faceted.png", width = 8, height = 5, scale = 2, dpi = 200)
+```

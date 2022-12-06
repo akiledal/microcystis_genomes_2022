@@ -1,0 +1,951 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(ape)
+library(ggtree)
+library(patchwork)
+
+# Paths to required files
+pres_abs_fp <- "data/gene_presence_absence.tsv"
+tree_fp <- "data/jacob_tree2.nwk"
+strain_het_shannon_fp <- "results/strain_het_by_marker_gene_mean_shannon_diversity.tsv" 
+strain_het_checkm_fp <- "results/strain_het_from_checkm.tsv"
+
+
+samples_to_use <- read_tsv("data/samples_to_use.tsv")
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+strain_env_data <- read_rds("results/strain_env_data.rds")
+strain_collection_info <- read_rds("data/strain_collection_information.rds")
+sample_genotype_summary <- read_rds("data/read_mapping_to_genes_summary.rds")
+
+# Read in the Microcystis tree that Jacob made
+tree <- read.tree(tree_fp)
+
+# Get a list of the Lake Erie strains in Jacob's data
+tree_strains <- tree$tip.label %>% 
+  data.frame(strain = .) %>% 
+  filter(str_detect(strain, "LE"),
+         !strain %in% c("LE3", "LE013_01", "LE13_04"))
+
+# Read in the gene presence/absence matrix
+data_for_plot <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1Mj3IR_CAMZsZbYq5Z2KY4znf6N6S192hTq3JJOa0UeU/edit#gid=1474076659", sheet = "for_paper_figure") %>% 
+  mutate(across(where(is.numeric), ~replace_na(.x, 0))) # Replace any missing values with absent
+
+# Make "longer" version of the data
+full_data_for_plot_long <- data_for_plot %>% 
+  pivot_longer(-c(gene_type,gene, gene_group), names_to = "strainID", values_to = "pres_abs") %>% 
+  group_by(strainID, gene_type,gene, gene_group) %>%
+  summarise(pres_abs = sum(pres_abs)) %>% 
+  left_join(seqID_to_strainID) %>% 
+  left_join(sample_genotype_summary %>% 
+              filter(percent_covered_bases > 50,
+                     mean_depth > 1) %>% 
+            select(gene = "seqnames", pubID) %>%
+              mutate(read_mapping = 0.5), by = c("gene", "pubID")) %>%
+  filter(strainID %in% tree_strains$strain,
+         !is.na(pubID)) %>% 
+  group_by(gene) %>%
+  mutate(pres_abs = if_else(pres_abs == FALSE, read_mapping, 1),
+         pres_abs = if_else(is.na(pres_abs), 0, pres_abs),
+         percent_present = length(pres_abs[pres_abs > 0]) / n())
+
+# data_for_Reagan <- full_data_for_plot_long %>% 
+#   left_join(collection_dates) %>% 
+#   filter(gene_type == "Carbon genes") %>% 
+#   select(pubID, Date, Day_of_year, pres_abs, gene, gene_group) %>% 
+#   pivot_wider(id_cols = c(pubID, Date, Day_of_year), names_from = "gene", values_from = "pres_abs") %>% 
+#   write_tsv("results/carbon_gene_table_for_Reagan.tsv")
+
+carbon_gene_types <- full_data_for_plot_long %>% 
+  filter(gene_type == "Carbon genes") %>% 
+  select(gene, gene_group) %>% 
+  distinct()
+
+present_in_all <- full_data_for_plot_long %>% 
+  filter(percent_present == 1)
+
+present_in_all$gene %>% unique() %>% paste0(collapse  =", ")
+
+absent_in_all <- full_data_for_plot_long %>% 
+  filter(percent_present == 0)
+
+absent_in_all$gene %>% unique() %>% paste0(collapse  =", ")
+
+data_for_plot_long <- full_data_for_plot_long %>% 
+  filter(!gene %in% present_in_all$gene,
+         !gene %in% absent_in_all$gene)
+
+
+shared_strains <- intersect(unique(data_for_plot_long$strainID), tree$tip.label)
+
+missing_strains <- setdiff(tree$tip.label,unique(data_for_plot_long$strainID)) %>% data.frame(strain = .) %>% filter(str_detect(strain,"LE"))
+
+# Make a subset of the tree with only our strains
+trimmed_tree <- tree %>% 
+  keep.tip(shared_strains)
+
+equiv_names <- seqID_to_strainID %>% 
+  filter(strainID %in% shared_strains) %>% 
+  arrange(factor(strainID, levels = trimmed_tree$tip.label, ordered = TRUE))
+
+
+tree_renamed <- trimmed_tree
+tree_renamed$tip.label <- equiv_names$pubID
+
+#trimmed_tree$tip.label <- tree_label_swap$pubID
+
+
+# Plot the tree
+(p <- ggtree(tree_renamed) + geom_tiplab(align = TRUE) + scale_x_continuous(expand=expansion(mult = 1))
+  )
+
+# Get the order strains are plotted in the tree to order the heatmap
+tip_order <- p$data %>% select(label, y) %>% 
+  filter(!is.na(label)) %>% 
+  arrange(y) %>% 
+  write_rds("data/strain_plot_order.rds")
+
+# Simplify & filter data for plotting
+simp_plot_data <- data_for_plot_long %>%
+    #mutate(pres_abs = as.logical(if_else(is.na(pres_abs), 0, pres_abs))) %>%
+  filter(strainID %in% shared_strains) %>% 
+  arrange(gene_type,gene)
+
+gene_group_order <- unique(simp_plot_data$gene_group)
+
+mcy <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1Mj3IR_CAMZsZbYq5Z2KY4znf6N6S192hTq3JJOa0UeU/edit#gid=955526461", sheet = "mcy_genotypes") %>% 
+              dplyr::rename(strainID = "culture") %>% 
+              left_join(seqID_to_strainID)
+
+# Get MCY genotype information
+mcy_genotype <- tip_order %>% dplyr::rename(pubID = "label") %>% 
+  left_join(mcy, by = "pubID") %>% 
+  mutate(pubID = factor(pubID,tip_order$label, ordered = TRUE),
+         genotype = if_else(is.na(genotype), "absent", genotype),
+         genotype = factor(genotype, levels = c("complete", "partial", "absent"), ordered = TRUE))
+
+
+
+(mcy_plt <- mcy_genotype %>% 
+  ggplot(aes(1, pubID, fill = genotype)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_tile(size = 0.25, color = "black", fill = NA) +
+  theme_minimal() + 
+  scale_fill_manual(values = c("forestgreen", "goldenrod1", "white") ) +
+  labs(x = NULL, y= NULL, fill = "mcy genotype") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+
+collection_dates <- strain_collection_info %>% 
+  dplyr::rename(strainID = "culture_paper") %>% 
+  left_join(seqID_to_strainID) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  mutate(doy = lubridate::yday(Date),
+         adj_date = as.Date(doy, origin = "2022-01-01"))
+         
+(collection_date <-  tip_order %>% dplyr::rename(pubID = "label") %>%
+   left_join(collection_dates) %>% 
+  ggplot(aes(1, factor(pubID, levels = tip_order$label, ordered = TRUE), fill = adj_date)) +
+    #scale_fill_gradient(low = "chartreuse4", high = "darkorange1",  trans = "date",na.value = "white") +
+    scale_fill_viridis_c(trans = "date") +
+  geom_tile(color = "white", size = 0.5) +
+  geom_tile(size = 0.25, color = "black", fill = NA) +
+  theme_minimal() +
+  labs(x = NULL, y= NULL, fill = "Collected") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+
+
+# Get strain heterogeneity information
+
+strain_het_checkm <- read_tsv(strain_het_checkm_fp) %>% 
+  select(-strainID) %>% 
+  left_join(seqID_to_strainID %>% select(sequencingID, pubID), by = "sequencingID") %>% 
+  full_join(data.frame(pubID = equiv_names$pubID),by = "pubID") %>% # import but also make sure all strains are represented, even if no strain het information is available
+  mutate(method = "checkM") %>% 
+  dplyr::rename(strain_het ="Strain heterogeneity")
+
+strain_het_shannon <- data.frame(pubID = shared_strains) %>% left_join(read_tsv(strain_het_shannon_fp) %>% left_join(seqID_to_strainID)) %>% mutate(method ="shannon diversity")
+
+strain_het <- strain_het_checkm %>% 
+  select(method, strain = "pubID", het = strain_contam) %>% 
+  bind_rows(strain_het_shannon %>% select(method, strain = "pubID", het =  "mean_shannon"))
+
+(strain_het_checkM_plot <- data.frame(strain = tip_order$label) %>% left_join(strain_het) %>%
+    filter(method =="checkM") %>% 
+    dplyr::rename(checkM_het = "het") %>% 
+  ggplot(aes(method, factor(strain,levels = tip_order$label, ordered = TRUE), fill = checkM_het,label = strain)) +
+    geom_tile(color = "black") +
+    scale_fill_continuous(trans="log") +
+    #geom_text() +
+    #scale_fill_viridis_c() +
+    labs(y = NULL, x = NULL, fill = "CheckM strain\ncontamination") +
+    theme_bw() +
+     theme(axis.text.x = element_blank(),
+           axis.ticks.x = element_blank(),
+          #axis.text.x = element_text(angle = -45, hjust =0, vjust = 1),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          #legend.position = "none"
+          ) +
+    facet_grid(~"Strain het.")
+)
+
+(strain_het_shannon_plot <- strain_het %>% 
+    filter(method =="shannon diversity") %>% 
+    dplyr::rename(shannon_het = "het") %>% 
+  ggplot(aes(method, factor(strain,levels = tip_order$label, ordered = TRUE), fill = shannon_het)) +
+    geom_tile(color = "black") +
+    #scale_fill_viridis_c() +
+    labs(y = NULL, x = NULL) +
+     theme(axis.text.x = element_text(angle = -45, hjust =0, vjust = 1), 
+          axis.text.y = element_blank(),
+          legend.position = "none") +
+    facet_grid(~"Strain het.")
+)
+
+(strain_het_plots <- strain_het_checkM_plot + strain_het_shannon_plot + plot_layout(guides = "collect")
+)
+
+library(RColorBrewer)
+n <- 60
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+colors <- c(col_vector[1:length(gene_group_order)-1],"white")
+
+# Plot gene presence/absence
+(strain_gene_plot <- simp_plot_data %>%
+    mutate(gene_group = if_else(is.na(gene_group),"other", gene_group)) %>% 
+  ggplot(aes(gene, factor(pubID,levels = tip_order$label, ordered = TRUE), fill = factor(pres_abs), color = factor(gene_group, levels = c(gene_group_order,"other"), ordered = TRUE))) +
+  geom_tile(size = 1) +
+  #geom_tile(color = "black") + # black lines around cells
+  scale_fill_manual(values = c("white", "grey50", "black")) + 
+  scale_color_manual(values = colors)+
+  facet_grid(~gene_type,scales = "free_x",space = "free_x") +
+    theme(axis.text.x = element_text(angle = -45, hjust =0, vjust = 1), 
+          axis.text.y = element_blank()) +
+    labs(y = NULL, x = NULL, fill = NULL, color = "Gene group")
+)
+
+
+(strain_gene_plot_no_colors <- simp_plot_data %>%
+    mutate(gene_group = if_else(is.na(gene_group),"other", gene_group)) %>% 
+  ggplot(aes(gene, factor(pubID,levels = tip_order$label, ordered = TRUE), fill = factor(pres_abs), ordered = TRUE)) +
+  geom_tile(size = 0.5, color = "white") +
+  geom_tile(size = 0.25, color = "black", fill = NA) +
+  #geom_tile(color = "black") + # black lines around cells
+  scale_fill_manual(values = c("white", "grey50", "black")) + 
+  scale_color_manual(values = colors) +
+  facet_grid(~gene_type,scales = "free_x",space = "free_x") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = -45, hjust =0, vjust = 1), 
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    labs(y = NULL, x = NULL, fill = NULL, color = "Gene group"))
+
+# Plot combined tree and heatmap
+(combined_plot_genes <- p + collection_date + mcy_plt + strain_gene_plot + strain_het_checkM_plot + plot_layout(widths = c(0.19,0.01,0.01,0.8, 0.05), guides = "collect"))
+ggsave(plot = combined_plot_genes, "results/microcystis_gene_tree.png", width = 6, height = 3, scale =3, dpi= 300)
+ggsave(plot = combined_plot_genes, "results/microcystis_gene_tree.pdf", width = 6, height = 3, scale =3, dpi= 300)
+
+(combined_plot_genes_no_colors <- p + collection_date + mcy_plt + strain_gene_plot_no_colors + strain_het_checkM_plot + plot_layout(widths = c(0.19,0.01,0.01,0.8, 0.05), guides = "collect"))
+ggsave(plot = combined_plot_genes_no_colors, "results/microcystis_gene_tree_no_colors.png", width = 6, height = 3, scale =3, dpi= 300)
+ggsave(plot = combined_plot_genes_no_colors, "results/microcystis_gene_tree_no_colors.pdf", width = 6, height = 3, scale =3, dpi= 300)
+
+
+# Plot the full set of genes (don't remove genes present or absent in all samples)
+
+# Simplify & filter data for plotting
+full_simp_plot_data <- full_data_for_plot_long %>%
+    #mutate(pres_abs = as.logical(if_else(is.na(pres_abs), 0, pres_abs))) %>%
+  filter(strainID %in% shared_strains) %>% 
+  arrange(gene_type,gene) %>% 
+  write_rds("results/gene_PA_BLAST_data.rds")
+
+full_gene_group_order <- unique(full_simp_plot_data$gene_group)
+full_colors <- c(col_vector[1:length(full_gene_group_order)-1],"white")
+
+
+# Plot gene presence/absence
+(full_strain_gene_plot <- full_simp_plot_data %>%
+    mutate(gene_group = if_else(is.na(gene_group),"other", gene_group)) %>% 
+  ggplot(aes(gene, factor(pubID,levels = tip_order$label, ordered = TRUE), fill = as.factor(pres_abs), color = factor(gene_group, levels = c(full_gene_group_order,"other"), ordered = TRUE))) +
+  geom_tile(size = 1) +
+  #geom_tile(color = "black") + # black lines around cells
+  scale_fill_manual(values = c("white", "grey50", "black")) + 
+  scale_color_manual(values = full_colors)+
+  facet_grid(~gene_type,scales = "free_x",space = "free_x") +
+    theme(axis.text.x = element_text(angle = -45, hjust =0, vjust = 1), 
+          axis.text.y = element_blank()) +
+    labs(y = NULL, x = NULL, fill = NULL, color = "Gene group")
+)
+
+
+# Plot combined tree and heatmap
+(full_combined_plot_genes <- p + collection_date + mcy_plt + full_strain_gene_plot + strain_het_checkM_plot + plot_layout(widths = c(0.18,0.01,0.01,0.8, 0.02), guides = "collect"))
+ggsave(plot = full_combined_plot_genes, "results/microcystis_gene_tree_FULL.png", width = 10, height = 3, scale =3, dpi= 300)
+ggsave(plot = full_combined_plot_genes, "results/microcystis_gene_tree_FULL.pdf", width = 10, height = 3, scale =3, dpi= 300)
+
+
+# Plot summarized gene data (completeness of groupings)
+(strain_gene_plot2 <- simp_plot_data %>%
+    filter(!is.na(gene_group)) %>% # remove genes not part of any group
+    group_by(gene_group,pubID, gene_type) %>% 
+    summarise(group_completion = sum(pres_abs) / n()) %>% 
+  ggplot(aes(gene_group, factor(pubID,levels = tip_order$label, ordered = TRUE), fill = group_completion)) +
+  geom_tile(color = "black") + 
+  #scale_fill_manual(values = c("white", "black")) +
+    scale_fill_viridis_c() +
+  facet_grid(~gene_type,scales = "free_x",space = "free_x") +
+    theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1), 
+          axis.text.y = element_blank()) +
+    labs(y = NULL, x = NULL, fill = NULL)
+)
+
+
+# Plot combined tree and simplified heatmap
+(combined_plot_simplified <- p + strain_gene_plot2 + strain_het_plots + plot_layout(widths = c(0.2,0.7, 0.1), guides = "collect"))
+
+ggsave(plot = combined_plot_simplified, "results/microcystis_gene_tree_simplified.png", width = 12, height = 6, scale = 1.5, dpi= 300)
+
+```
+
+
+
+## Tree of heterotrophs
+
+```{r}
+mlr <- read_tsv("results/processed_blast_results/mlr.tsv")
+
+tprx2 <- read_tsv("results/processed_blast_results/t2prx.tsv")
+
+catalase <- read_tsv("results/processed_blast_results/catalase.tsv") %>% 
+  mutate(katG = TRUE)
+
+katG <- read_tsv("results/processed_blast_results/katG.tsv") %>% 
+  mutate(katG = TRUE) %>% 
+  bind_rows(catalase)
+
+bin_presence <- read_rds("results/percent_abundance_of_all_bins_with_50_percent_covered_bases.rds")
+
+mlr_and_kat <- full_join(mlr, katG)
+
+mlr_strings <- mlr_and_kat %>% 
+  left_join(seqID_to_strainID) %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  #pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  #filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  mutate(mlrA = if_else(mlrA == TRUE, "a", ""),
+         mlrB = if_else(mlrB == TRUE, "b", ""),
+         mlrC = if_else(mlrC == TRUE, "c", ""),
+         mlrD = if_else(mlrD == TRUE, "d", ""),
+         katG = if_else(katG == TRUE, "*", "") %>% str_replace_all("NA",""),
+         mlr = paste0(mlrA,mlrB, mlrC, mlrD) %>% str_replace_all("NA",""),
+         genus = if_else(genus == "", glue::glue("other_{family}"),genus))
+
+
+summarized_bin_abund <- bin_presence %>% 
+  filter(!is.na(gtdb_classification)) %>% 
+  separate(gtdb_classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  #filter(genus != "Microcystis") %>% 
+  mutate(genus = if_else(genus == "", glue::glue("other_{family}"),genus)) %>% 
+  dplyr::select(bin,domain,phylum,class,order,family,genus,species, one_of(seqID_to_strainID$pubID)) %>% 
+  pivot_longer(-c(bin,domain,phylum,class,order,family,genus,species),names_to = "pubID", values_to = "rel_abund") %>% 
+  filter(!is.na(pubID),
+         pubID != "NA",
+        rel_abund != "NULL") %>%
+  mutate(rel_abund = as.numeric(rel_abund), 
+         bin_sample = bin %>% str_remove("_bin.*")) %>% 
+    left_join(seqID_to_strainID) #%>% 
+  #filter(sequencingID == bin_sample)
+
+
+het_clust <- summarized_bin_abund %>% 
+  filter(rel_abund > 0.1) %>%
+  filter(pubID %in% tip_order$label) %>% 
+  group_by(pubID, genus) %>% 
+  summarise(rel_abund = sum(rel_abund)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = genus, values_from = rel_abund, values_fill = 0) %>% 
+  column_to_rownames("pubID") %>% 
+  t() %>% 
+  vegan::vegdist() %>% 
+  hclust(method = "ward.D")
+
+(het_dend <- ggtree(het_clust) + geom_tiplab(align = TRUE, angle = -45) + scale_x_continuous(expand=expansion(mult = 1)) + coord_flip() + scale_x_reverse())
+
+het_order <- het_dend$data %>% 
+  arrange(y) %>% 
+  filter(!is.na(label)) %>% pull("label")
+
+
+#het_order <- het_clust$labels[het_clust$order]
+
+het_plot_data <- summarized_bin_abund %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  filter(rel_abund > 0.1) %>% 
+  group_by(pubID, genus) %>% 
+  summarise(rel_abund = sum(rel_abund))
+
+cultures_w_no_hets <- seqID_to_strainID %>% 
+  filter(!pubID %in% het_plot_data$pubID) %>% 
+  select(pubID = "pubID") %>% 
+  mutate(genus = "", rel_abund = 0)
+
+het_plot_data <- rbind(het_plot_data,cultures_w_no_hets) %>% 
+  filter(pubID %in% seqID_to_strainID$pubID,
+         !is.na(pubID),
+         pubID %in% tree_renamed$tip.label)
+
+# Make a subset of the tree with only our strains having associated heterotroph bins
+trimmed_tree_het <- tree_renamed %>% 
+  keep.tip(het_plot_data$pubID)
+
+# Plot the tree
+(p_hets <- ggtree(trimmed_tree_het) + geom_tiplab(align = TRUE) + scale_x_continuous(expand=expansion(mult = 1))
+  )
+
+het_order_microcystis_first <- factor(het_order, level = het_order, ordered = TRUE) %>%  forcats::fct_relevel("Microcystis", after = length(.)) %>% sort
+
+(hets_plot <- het_plot_data %>% 
+    mutate(genus = factor(genus, het_order_microcystis_first, ordered = TRUE),
+           genus_num = as.numeric(genus)) %>% 
+  ggplot(
+    aes(
+      factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+      factor(pubID, levels = tip_order$label, ordered = TRUE) , 
+      fill = rel_abund)) +
+  geom_tile() +
+  geom_text(data = mlr_strings %>% select(genus, culture = "pubID", mlr), 
+            aes(factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+                factor(culture, levels = tip_order$label, ordered = TRUE), label = mlr), 
+            color = "white", inherit.aes = FALSE, position = position_nudge(x = 0, y = -0.2)) +
+    geom_text(data = mlr_strings %>% select(genus, culture = "pubID", katG), 
+              aes(factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+                  factor(culture, levels = tip_order$label, ordered = TRUE), label = katG), 
+              color = "white", inherit.aes = FALSE, position = position_nudge(x = 0, y = 0.2)) +
+  viridis::scale_fill_viridis() +
+  labs(y = NULL, x = NULL, fill = "% abundance") +
+  theme_minimal() +
+   theme(axis.text.y = element_blank(),
+         axis.text.x = element_text(angle = -30, hjust =0, vjust = 1)) )
+  
+layout <- 
+"
+#B
+AC"
+
+
+#(het_w_dend <- p_hets + het_dend + hets_plot + plot_layout(design = layout))
+(het_plt <- p_hets + mcy_plt + hets_plot + plot_layout(widths = c(0.25, 0.02, 0.75),guides = "collect"))
+ggsave("results/het_plot.png", width = 5, height = 3, dpi = 300, scale = 2.75)
+ggsave("results/het_plot.pdf", width = 5, height = 3, dpi = 300, scale = 2.75)
+ggsave("results/het_plot.eps", width = 5, height = 3, dpi = 300, scale = 2.75)
+
+
+library(RColorBrewer)
+n <- 60
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+(hets_plot <- het_plot_data %>% 
+  ggplot(aes(factor(pubID, levels = tip_order$label, ordered = TRUE), rel_abund, fill = factor(genus, rev(het_order), ordered = TRUE) %>% forcats::fct_relevel("Microcystis",after = Inf))) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = col_vector) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -30, hjust =0, vjust = 1)) +
+  labs(y = "Relative abundance", x = NULL, fill = NULL))
+ggsave("results/hets_bar_plot.png", width = 5, height = 3, scale = 2, dpi = 300)
+
+
+mlr %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, factor(pubID,levels = tip_order$label, ordered = TRUE) , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw()
+
+ggsave("results/mlr.png", width = 4, height = 3, dpi = 300, scale = 1.5)
+
+
+
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, genus , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw()
+
+
+(katg_genes <- katG %>% 
+  mutate(gene = "katG", 
+         pres = TRUE) %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, genus , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw())
+
+
+```
+
+
+
+## mlr HMMs
+```{r}
+mlr_hmm_fps <- system("ls data/hmms/mlr/*__formatted.txt",intern = TRUE)
+
+read_hmmer <- function(fp){
+  
+  names <- c(
+		"target.name",
+		"target.accession",
+		"query.name",
+		"query.accession",
+		"full.sequence.E.value",
+		"full.sequence.score",
+		"full.sequence.bias",
+		"best.1.domain.E.value",
+		"best.1.domain.score",
+		"best.1.domain.bias")
+  
+  bin <- str_remove(fp, ".*/") %>% str_remove("__formatted.*")
+
+  table <- data.table::fread(fp, col.names = names) %>% 
+    as.data.frame() %>% 
+    mutate(bin = bin)
+}
+
+test <- read_hmmer(mlr_hmm_fps[1])
+ 
+
+bin_tax <- read_tsv("data/gtdb/classify/gtdbtk.bac120.summary.tsv") %>%
+  select(bin = "user_genome", classification) %>% 
+  mutate(culture = str_remove(bin,"_.*")) %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(culture = "sequencingID")) %>% 
+  mutate(culture_and_tax = paste0(strainID, "__", classification)) %>% 
+  filter(!is.na(pubID))
+
+
+mlr_hmmer_hits <- map_dfr(mlr_hmm_fps,read_hmmer)
+
+
+top_mlr_hits <- mlr_hmmer_hits %>% 
+  group_by(query.name, bin) %>% 
+  top_n(1, -full.sequence.E.value) %>% 
+  group_by(bin) %>% 
+  mutate(n_hits = n())
+
+mlr_hmmer <- top_mlr_hits %>% 
+  mutate(sequencingID = str_remove(bin, "_bin.*")) %>% 
+  left_join(seqID_to_strainID) %>% 
+  left_join(summarized_bin_abund)
+
+mlr_hmm <- mlr_hmmer %>% 
+  filter(full.sequence.E.value < 0.001) %>% 
+  mutate(gene = str_extract(query.name,"mlr[A,B,C,D]")) %>% 
+  select(bin,gene) %>% 
+  distinct() %>% 
+  left_join(bin_tax %>% select(-culture_and_tax,-strainDB)) %>% 
+  mutate(pres_abs = TRUE) %>% 
+  pivot_wider(names_from = gene, values_from = pres_abs) %>% 
+  relocate(mlrA,mlrB,mlrC,mlrD, .after = strainID) %>% 
+  ungroup()
+
+hmm_completion <- mlr_hmmer %>% 
+  ungroup() %>% 
+  select(genus,query.name) %>% 
+  distinct() 
+
+
+blast_mlr <- mlr %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  select(bin, gene)
+
+hmm_completion %>% 
+  ggplot(aes(query.name, genus)) +
+  geom_tile()
+```
+
+
+
+## Tree of heterotrophs with mlr from HMMS
+
+```{r}
+mlr <- mlr_hmm
+
+tprx2 <- read_tsv("results/processed_blast_results/t2prx.tsv")
+
+catalase <- read_tsv("results/processed_blast_results/catalase.tsv") %>% 
+  mutate(katG = TRUE)
+
+katG <- read_tsv("results/processed_blast_results/katG.tsv") %>% 
+  mutate(katG = TRUE) %>% 
+  bind_rows(catalase)
+
+bin_presence <- read_rds("results/percent_abundance_of_all_bins_with_50_percent_covered_bases.rds")
+
+mlr_and_kat <- full_join(mlr, katG)
+
+mlr_strings <- mlr_and_kat %>% 
+  left_join(seqID_to_strainID) %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  #pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  #filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  mutate(mlrA = if_else(mlrA == TRUE, "a", ""),
+         mlrB = if_else(mlrB == TRUE, "b", ""),
+         mlrC = if_else(mlrC == TRUE, "c", ""),
+         mlrD = if_else(mlrD == TRUE, "d", ""),
+         katG = if_else(katG == TRUE, "*", "") %>% str_replace_all("NA",""),
+         mlr = paste0(mlrA,mlrB, mlrC, mlrD) %>% str_replace_all("NA",""),
+         genus = if_else(genus == "", glue::glue("other_{family}"),genus))
+
+
+summarized_bin_abund <- bin_presence %>% 
+  filter(!is.na(gtdb_classification)) %>% 
+  separate(gtdb_classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  #filter(genus != "Microcystis") %>% 
+  mutate(genus = if_else(genus == "", glue::glue("other_{family}"),genus)) %>% 
+  dplyr::select(bin,domain,phylum,class,order,family,genus,species, one_of(seqID_to_strainID$pubID)) %>% 
+  pivot_longer(-c(bin,domain,phylum,class,order,family,genus,species),names_to = "pubID", values_to = "rel_abund") %>% 
+  filter(!is.na(pubID),
+         pubID != "NA",
+        rel_abund != "NULL") %>%
+  mutate(rel_abund = as.numeric(rel_abund), 
+         bin_sample = bin %>% str_remove("_bin.*")) %>% 
+    left_join(seqID_to_strainID) #%>% 
+  #filter(sequencingID == bin_sample)
+
+
+
+het_clust <- summarized_bin_abund %>% 
+  filter(rel_abund > 0.1) %>%
+  filter(pubID %in% tip_order$label) %>% 
+  group_by(pubID, genus) %>% 
+  summarise(rel_abund = sum(rel_abund)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = genus, values_from = rel_abund, values_fill = 0) %>% 
+  column_to_rownames("pubID") %>% 
+  t() %>% 
+  vegan::vegdist() %>% 
+  hclust(method = "ward.D")
+
+(het_dend <- ggtree(het_clust) + geom_tiplab(align = TRUE, angle = -45) + scale_x_continuous(expand=expansion(mult = 1)) + coord_flip() + scale_x_reverse())
+
+het_order <- het_dend$data %>% 
+  arrange(y) %>% 
+  filter(!is.na(label)) %>% pull("label")
+
+
+#het_order <- het_clust$labels[het_clust$order]
+
+het_plot_data <- summarized_bin_abund %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  filter(rel_abund > 0.1) %>% 
+  group_by(pubID, genus) %>% 
+  summarise(rel_abund = sum(rel_abund))
+
+cultures_w_no_hets <- seqID_to_strainID %>% 
+  filter(!pubID %in% het_plot_data$pubID) %>% 
+  select(pubID = "pubID") %>% 
+  mutate(genus = "", rel_abund = 0)
+
+het_plot_data <- rbind(het_plot_data,cultures_w_no_hets) %>% 
+  filter(pubID %in% seqID_to_strainID$pubID,
+         !is.na(pubID),
+         pubID %in% tree_renamed$tip.label)
+
+# Make a subset of the tree with only our strains having associated heterotroph bins
+trimmed_tree_het <- tree_renamed %>% 
+  keep.tip(het_plot_data$pubID)
+
+# Plot the tree
+(p_hets <- ggtree(trimmed_tree_het) + geom_tiplab(align = TRUE) + scale_x_continuous(expand=expansion(mult = 1))
+  )
+
+het_order_microcystis_first <- factor(het_order, level = het_order, ordered = TRUE) %>%  forcats::fct_relevel("Microcystis", after = length(.)) %>% sort
+
+(hets_plot <- het_plot_data %>% 
+    mutate(genus = factor(genus, het_order_microcystis_first, ordered = TRUE),
+           genus_num = as.numeric(genus)) %>% 
+  ggplot(
+    aes(
+      factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+      factor(pubID, levels = tip_order$label, ordered = TRUE) , 
+      fill = rel_abund)) +
+  geom_tile(color = "white") +
+  geom_text(data = mlr_strings %>% select(genus, culture = "pubID", mlr), 
+            aes(factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+                factor(culture, levels = tip_order$label, ordered = TRUE), label = mlr), 
+            color = "white", inherit.aes = FALSE, position = position_nudge(x = 0, y = -0.2)) +
+    geom_text(data = mlr_strings %>% select(genus, culture = "pubID", katG), 
+              aes(factor(genus, rev(het_order_microcystis_first), ordered = TRUE), 
+                  factor(culture, levels = tip_order$label, ordered = TRUE), label = katG), 
+              color = "white", inherit.aes = FALSE, position = position_nudge(x = 0, y = 0.2)) +
+  viridis::scale_fill_viridis() +
+  labs(y = NULL, x = NULL, fill = "% abundance") +
+  theme_minimal() +
+   theme(axis.text.y = element_blank(),
+         axis.text.x = element_text(angle = -30, hjust =0, vjust = 1)) )
+  
+layout <- 
+"
+#B
+AC"
+
+
+#(het_w_dend <- p_hets + het_dend + hets_plot + plot_layout(design = layout))
+(het_plt <- p_hets + mcy_plt + hets_plot + plot_layout(widths = c(0.25, 0.02, 0.75),guides = "collect"))
+ggsave("results/mlr_hmm_het_plot.png", width = 5, height = 3, dpi = 300, scale = 2.75)
+ggsave("results/mlr_hmm_het_plot.pdf", width = 5, height = 3, dpi = 300, scale = 2.75)
+#ggsave("results/het_plot.eps", width = 5, height = 3, dpi = 300, scale = 2.75)
+
+
+library(RColorBrewer)
+n <- 60
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+mlr %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, factor(pubID,levels = tip_order$label, ordered = TRUE) , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw()
+
+ggsave("results/mlr_hmm.png", width = 4, height = 3, dpi = 300, scale = 1.5)
+
+
+# Num gene obs per genus
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  group_by(genus, gene) %>% 
+  mutate(gene_count = n()) %>% 
+  ggplot(aes(gene, genus , fill = gene_count, label = gene_count)) +
+  #scale_fill_viridis_d() +
+  scale_fill_viridis_c() +
+  geom_tile() +
+  geom_text() +
+  labs(y = NULL) +
+  theme_bw()
+
+# Num cultures with mlr genes
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  select(pubID) %>% distinct() %>% nrow()
+
+# Num gene obs per culture 
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  group_by(pubID, gene) %>% 
+  mutate(gene_count = n()) %>% 
+  ggplot(aes(gene, pubID , fill = gene_count, label = gene_count)) +
+  #scale_fill_viridis_d() +
+  scale_fill_viridis_c() +
+  geom_tile() +
+  geom_text() +
+  labs(y = NULL) +
+  theme_bw()
+
+# Num of cultures with gene obs 
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  select(gene, pubID) %>% 
+  distinct() %>% 
+  group_by(gene) %>% 
+  mutate(gene_count = n()) %>% 
+  ggplot(aes(gene, 1 , fill = gene_count, label = gene_count)) +
+  #scale_fill_viridis_d() +
+  scale_fill_viridis_c() +
+  geom_tile() +
+  geom_text() +
+  labs(y = NULL) +
+  theme_bw()
+
+mlr %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  pivot_longer(c(mlrA, mlrB, mlrC, mlrD), names_to = "gene", values_to = "pres") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, genus , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw()
+
+
+(katg_genes <- katG %>% 
+  mutate(gene = "katG", 
+         pres = TRUE) %>% 
+  separate(classification, c("domain","phylum", "class", "order", "family", "genus", "species"),sep = ";[a-z]__") %>% 
+  mutate(domain = str_remove(domain, "d__")) %>% 
+  filter(genus != "Microcystis") %>% 
+  filter(pres == TRUE) %>% 
+  filter(pubID %in% tip_order$label) %>% 
+  ggplot(aes(gene, genus , fill = pres)) +
+  scale_fill_viridis_d() +
+  geom_tile() +
+  labs(y = NULL) +
+  theme_bw())
+```
+
+
+
+
+# KeggDecoder results
+```{r}
+groupings <- read_tsv("data/reference/kegg_decoder_groupings.txt")
+
+kegg_decoder_res <- system("ls data/kegg_decoder/*/kegg_decoder_list.tsv", intern = TRUE)
+
+path <- kegg_decoder_res[1]
+
+read_kegg_decoder <- function(path){
+  sample <- str_remove(path, ".*/kegg_decoder/") %>% str_remove("/kegg_decoder_list.*")
+  
+  table <- read_tsv(path) %>% 
+    mutate(sample = sample)
+}
+
+
+all_kegg_decoder_res <- map_df(kegg_decoder_res, read_kegg_decoder)
+
+kegg_decoder_res_long <- all_kegg_decoder_res %>% 
+  rename(bin = "Function") %>% 
+  mutate(bin = str_replace(bin, "bin","_bin_"),
+         sequencingID = str_remove(bin, "_bin.*")) %>% 
+  pivot_longer(-c(bin, sample, sequencingID), names_to = "term", values_to = "completeness") %>% 
+  left_join(groupings) %>% 
+  left_join(seqID_to_strainID) %>% 
+  left_join(gtdbtk_summary)
+
+
+kegg_decoder_res_long %>% 
+  filter(group =="Amino-acid synthesis",
+         !is.na(pubID),
+         !str_detect(gtdb_classification, "Microcystis")) %>% 
+  ggplot(aes(term, bin, fill = completeness)) +
+  geom_tile() +
+  facet_grid(pubID~., scales = "free_y")
+
+
+kegg_decoder_res_long %>% 
+  filter(group =="Amino-acid synthesis",
+         !is.na(pubID),
+         !str_detect(gtdb_classification, "Microcystis")) %>% 
+  ggplot(aes(bin, term, fill = 100*completeness)) +
+  geom_tile(color = "grey50") +
+  facet_grid(~pubID, scales = "free_x") +
+  scale_fill_viridis() +
+  labs(fill = "Marker completeness (%)", y = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)) 
+ggsave("results/AA_synth_hets.pdf", width = 10, height = 3, dpi = 300, scale = 2)
+
+
+kegg_decoder_res_long %>% 
+  filter(term %in% c("thiamin biosynthesis", "transporter: thiamin", "methionine"),
+         !is.na(pubID),
+         !str_detect(gtdb_classification, "Microcystis")) %>% 
+  ggplot(aes(bin, term, fill = 100*completeness)) +
+  geom_tile(color = "grey50") +
+  facet_grid(~pubID, scales = "free_x") +
+  scale_fill_viridis() +
+  labs(fill = "Marker completeness (%)", y = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)) 
+ggsave("results/methionine_and_thiamin_hets.pdf", width = 10, height = 3, dpi = 300, scale = 2)
+
+
+
+kegg_decoder_res_long %>% 
+  filter(term %in% c("thiamin biosynthesis", "transporter: thiamin", "methionine"),
+         !is.na(pubID),
+         str_detect(gtdb_classification, "Microcystis")) %>% 
+  ggplot(aes(bin, term, fill = 100 *completeness)) +
+  geom_tile(color = "grey50") +
+  facet_grid(~pubID, scales = "free_x") +
+  scale_fill_viridis() +
+  labs(fill = "Marker completeness (%)", y = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)) 
+ggsave("results/methionine_and_thiamin_microcystis.pdf", width = 10, height = 3, dpi = 300, scale = 2)
+
+
+```
+
+
+
+

@@ -1,0 +1,291 @@
+---
+title: "Process BLAST Results"
+author: "Anders Kiledal"
+date: "1/21/22"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+
+library(tidyverse)
+library(scales)
+```
+
+
+Import sequencingID to strain ID map and bin taxonomy
+```{r}
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+bin_tax <- read_tsv("data/gtdb/classify/gtdbtk.bac120.summary.tsv") %>%
+  select(bin = "user_genome", classification) %>% 
+  mutate(culture = str_remove(bin,"_.*")) %>% 
+  left_join(seqID_to_strainID %>% rename(culture = "sequencingID")) %>% 
+  mutate(culture_and_tax = paste0(strainID, "__", classification)) %>% 
+  filter(!is.na(pubID))
+```
+
+
+## Concatenate results processed with the lab's post-BLAST script
+
+Get location of post-blast outputs
+```{}
+# Get a list of files, and make columns for bin and which BLAST search this is
+catalase <- list.files("data/BLAST",pattern = ".*.pb",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"catalase")) %>% 
+  mutate(bin = str_remove(file,".pb") %>% str_remove_all(".*/"),
+         blast = "catalase")
+  
+mlr_nuc <- list.files("data/BLAST",pattern = ".*.pb",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"mlr"),
+         str_detect(file,"nuc")) %>% 
+  mutate(bin = str_remove(file,".pb") %>% str_remove_all(".*/"),
+         blast = "mlr_nuc")
+
+mlr_prot <- list.files("data/BLAST",pattern = ".*.pb",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"mlr"),
+         str_detect(file,"prot")) %>%
+  mutate(bin = str_remove(file,".pb") %>% str_remove_all(".*/"),
+         blast = "mlr_prot")
+```
+
+Import and combine all post-blast results
+```{}
+# Function for importing .pb results, specifies column types to import and adds file name to data frame
+read_pb_results <- function(file){
+  read_tsv(file, skip = 1,col_types = "ccdiddiiiidd") %>% 
+    mutate(file = file) %>% 
+    rename(Query = "#Columns: Query")
+}
+
+# Take list of files, import and merge them all
+combined_catalase <- map_df(catalase$file, ~read_pb_results(.)) %>% 
+  left_join(catalase) # add bin and which BLAST search
+
+# Take list of files, import and merge them all
+combined_mlr_nuc <- map_df(mlr_nuc$file, ~read_pb_results(.)) %>% 
+  left_join(mlr_nuc) # add bin and which BLAST search
+
+# Take list of files, import and merge them all
+combined_mlr_prot <- map_df(mlr_prot$file, ~read_pb_results(.)) %>% 
+  left_join(mlr_prot) # add bin and which BLAST search
+
+# Merge catalase and mlr results and export to .tsv
+all_blast_hits <- bind_rows(combined_catalase,combined_mlr_nuc, combined_mlr_prot) %>% 
+  write_tsv("results/catalase_and_mlr_POSTblast_results.tsv")
+```
+
+
+## Concatenate the raw BLAST results
+
+Get location of blast outputs
+```{r}
+# Get a list of files, and make columns for bin and which BLAST search this is
+raw_catalase <- list.files("data/BLAST",pattern = ".blastn",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"catalase")) %>% 
+  mutate(bin = str_remove(file,".blastn") %>% str_remove_all(".*/"),
+         blast = "catalase")
+
+raw_katG <- list.files("data/BLAST",pattern = ".blastn",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"katG")) %>% 
+  mutate(bin = str_remove(file,".blastn") %>% str_remove_all(".*/"),
+         blast = "katG")
+
+raw_mlr_nuc <- list.files("data/BLAST",pattern = ".*.blastn",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"mlr"),
+         str_detect(file,"nuc")) %>% 
+  mutate(bin = str_remove(file,".blastn") %>% str_remove_all(".*/"),
+         blast = "mlr_nuc")
+
+raw_mlr_prot <- list.files("data/BLAST",pattern = ".*.blastp",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"mlr"),
+         str_detect(file,"prot")) %>%
+  mutate(bin = str_remove(file,".blastp") %>% str_remove_all(".*/"),
+         blast = "mlr_prot")
+
+raw_t2prx_prot <- list.files("data/BLAST",pattern = ".*.blastp",full.names = TRUE,recursive = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  filter(str_detect(file,"t2prx"),
+         str_detect(file,"prot")) %>%
+  mutate(bin = str_remove(file,".blastp") %>% str_remove_all(".*/"),
+         blast = "t2prx_prot")
+```
+
+Import and combine all blast results
+```{r}
+blast6_cols <- c("Query", "Subject", "Percent_ID", "Aln_Len", "Mismatch", "Gap", "Query_Start", "Query_Stop", "Subject_Start", "Subject_Stop", "E-Value", "Bit_Score", "percent_of_query_aligned", "subject_title","aligned_qeuery_seq", "aligned_subject_seq")
+
+# Function for importing .pb results, specifies column types to import and adds file name to data frame
+read_blast_results <- function(file){
+  read_tsv(file, skip = 1,col_types = "ccdiddiiiidddccc", col_names = blast6_cols) %>% 
+    mutate(file = file)
+}
+
+# Take list of files, import and merge them all
+raw_combined_catalase <- map_df(raw_catalase$file, ~read_blast_results(.)) %>% 
+  left_join(raw_catalase) # add bin and which BLAST search
+
+raw_combined_katG <- map_df(raw_katG$file, ~read_blast_results(.)) %>% 
+  left_join(raw_katG) # add bin and which BLAST search
+
+# Take list of files, import and merge them all
+raw_combined_mlr_nuc <- map_df(raw_mlr_nuc$file, ~read_blast_results(.)) %>% 
+  left_join(raw_mlr_nuc) # add bin and which BLAST search
+
+raw_combined_mlr_prot <- map_df(raw_mlr_prot$file, ~read_blast_results(.)) %>% 
+  left_join(raw_mlr_prot) # add bin and which BLAST search
+
+raw_combined_t2prx_prot <- map_df(raw_t2prx_prot$file, ~read_blast_results(.)) %>% 
+  left_join(raw_t2prx_prot) # add bin and which BLAST search
+
+# Merge catalase and mlr results and export to .tsv
+raw_blast_hits <- bind_rows(raw_combined_catalase,raw_combined_mlr_nuc,raw_combined_mlr_prot) %>% 
+  write_tsv("results/catalase_and_mlr_raw_blast_results.tsv")
+```
+
+
+mlr protein blast filtering using eggnog mapper values, but with percentID lowered from 40 to 35%
+```{r}
+
+mlr_prot_hits <- raw_combined_mlr_prot %>% 
+  filter(`E-Value` < 0.001, Bit_Score > 60, Percent_ID > 35, percent_of_query_aligned > 20)
+
+simplified_mlr_hits <- mlr_prot_hits %>% 
+  mutate(gene = str_extract(Subject,"mlr[A,B,C,D]")) %>% 
+  select(bin,gene) %>% 
+  distinct() %>% 
+  left_join(bin_tax %>% select(-culture_and_tax,-strainDB)) %>% 
+  mutate(pres_abs = TRUE) %>% 
+  pivot_wider(names_from = gene, values_from = pres_abs) %>% 
+  relocate(mlrA,mlrB,mlrC,mlrD, .after = strainID) %>% 
+  write_tsv("results/processed_blast_results/mlr.tsv")
+
+```
+
+
+t2prx protein blast filtering using eggnog mapper values
+```{r}
+
+t2prx_prot_hits <- raw_combined_t2prx_prot %>% 
+  filter(`E-Value` < 0.001, Bit_Score > 60, Percent_ID > 40, percent_of_query_aligned > 20)
+
+simplified_t2prx_hits <- t2prx_prot_hits %>% 
+  select(bin) %>% 
+  distinct() %>% 
+  left_join(bin_tax %>% select(-culture_and_tax,-strainDB)) %>% 
+  filter(!is.na(pubID)) %>% 
+  mutate(is_microcystis = if_else(str_detect(classification,"Microcystis"),TRUE,FALSE)) %>% 
+  write_tsv("results/processed_blast_results/t2prx.tsv")
+```
+
+catalase
+```{r}
+
+catalase_lengths <- Biostrings::readDNAStringSet("data/reference/BLAST/nuc/catalase.fasta") %>% 
+  data.frame(seq = .) %>% 
+  rownames_to_column("subject_title") %>% 
+  mutate(seq_len = nchar(seq))
+
+# KatE
+catalase_hits <- raw_combined_catalase %>% 
+  left_join(catalase_lengths) %>% 
+   mutate(percent_of_query_aligned = Aln_Len / seq_len *100) %>% 
+  filter(`E-Value` < 1e-5, percent_of_query_aligned > 70) %>% 
+  select(bin, percent_of_query_aligned, `E-Value`, Aln_Len, Percent_ID, subject_title) %>% 
+  group_by(bin) %>% 
+  top_n(1, percent_of_query_aligned * Percent_ID) %>% 
+  distinct() %>% 
+  left_join(bin_tax %>% select(-culture_and_tax,-strainDB)) %>%
+  filter(!is.na(pubID)) %>% 
+  mutate(is_microcystis = if_else(str_detect(classification,"Microcystis"),TRUE,FALSE)) %>% 
+  write_tsv("results/processed_blast_results/catalase.tsv")
+
+katG_lengths <- Biostrings::readDNAStringSet("data/reference/BLAST/nuc/katG.fasta",use.names = TRUE) %>% 
+  data.frame(seq = .,
+             subject_title = .@ranges@NAMES) %>% 
+  mutate(seq_len = nchar(seq))
+
+katG_hits <- raw_combined_katG %>% 
+  left_join(katG_lengths) %>% 
+  mutate(percent_of_query_aligned = Aln_Len / seq_len *100) %>% 
+  filter(`E-Value` < 1e-5, percent_of_query_aligned > 70) %>% 
+  select(bin, percent_of_query_aligned, `E-Value`, Aln_Len, Percent_ID, subject_title) %>% 
+  group_by(subject_title) %>% 
+  #top_n(1, percent_of_query_aligned * Percent_ID) %>% 
+  mutate(n_hits = n()) %>% 
+  group_by(bin) %>% 
+  filter(subject_title %in% c("298_Burkholderia size.5", "278_Serratia size.7","104_Chlorobaculum size.1", "195_Synechococcus size.1", "42_Streptomyces size.3", "89_Bacteroidales size.1", "101_Chlorobium size.1","318_Rubritalea size.1","303_Leptospira size.1", "52_Riemerella size.7")) %>% 
+  top_n(1, n_hits) %>% 
+  distinct() %>% 
+  left_join(bin_tax %>% select(-culture_and_tax,-strainDB)) %>% 
+  filter(!is.na(pubID)) %>% 
+  mutate(is_microcystis = if_else(str_detect(classification,"Microcystis"),TRUE,FALSE)) %>% 
+  write_tsv("results/processed_blast_results/katG.tsv")
+```
+
+
+
+
+
+Parameters Will used:
+-   min percent id: 95 
+-   bitscore: 50 
+-   min e-value: 1e-5
+```{r}
+raw_combined_catalase %>% 
+  ggplot(aes(`E-Value`)) + 
+  geom_histogram() + 
+  scale_x_log10() + 
+  geom_vline(xintercept = 1e-5, color = "red") +
+  theme_bw() +
+  labs(title = "Catalase BLAST e-values")
+
+raw_combined_mlr_prot %>% 
+  mutate(pseudo_p = 1 / ( 2 ^ Bit_Score)) %>% 
+  ggplot(aes(`Percent_ID`)) + 
+  geom_histogram() + 
+  #scale_x_log10() + 
+  geom_vline(xintercept = 1e-5, color = "red") +
+  theme_bw() +
+  labs(title = "Catalase BLAST e-values")
+
+# raw_combined_mlr_prot %>% 
+#   mutate(pseudo_p = 1 / ( 2 ^ Bit_Score)) %>% 
+#   ggplot(aes(`Percent_ID`,Aln_Len)) + 
+#   geom_point(alpha = 0.3) +
+#   scale_y_log10() + 
+#   geom_vline(xintercept = 1e-5, color = "red") +
+#   theme_bw() +
+#   labs(title = "Catalase BLAST e-values")
+
+
+raw_blast_hits %>% 
+  ggplot(aes(`E-Value`, fill = blast)) +
+  geom_histogram(alpha = 0.5) +
+  scale_y_log10()  +
+  scale_x_log10() + 
+  facet_grid(blast ~ .)
+  
+
+raw_blast_hits %>% 
+  ggplot(aes(percent_of_query_aligned,Percent_ID, fill = blast)) +
+  #geom_histogram(alpha = 0.5) +
+  geom_point() +
+  scale_y_log10()  +
+  scale_x_log10() + 
+  facet_grid(blast ~ .)
+
+```
+
+
+

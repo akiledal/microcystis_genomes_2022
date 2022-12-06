@@ -1,0 +1,79 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+library(tidyverse)
+
+```
+
+
+
+```{r}
+env_data <- read_tsv("data/env_data/merged_env_data.tsv") 
+
+env_data <- env_data %>% 
+  filter(`Sample Depth (category)` == "Surface")
+
+strain_collection_info <- read_tsv("data/strain_collection_information.txt") 
+
+strain_collection_info <- strain_collection_info %>% 
+  dplyr::rename(Date = "Collection Date",
+         Site = "Isolation Location") %>% 
+  dplyr::mutate(Date = if_else(Date == "6/12/15", "6/08/15", Date),
+         Date = if_else(Date == "8/31/21", "8/30/21", Date),
+         Date = if_else(Date == "9/21/21", "9/20/21", Date),
+         Date = lubridate::mdy(Date),
+         Site = if_else(str_detect(Site, "WE8-[1-2]"),"WE8",Site),
+         Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date))
+
+strain_collection_info %>% write_rds("data/strain_collection_information.rds")
+```
+
+```{r}
+strain_env_data <- strain_collection_info %>% 
+  left_join(env_data) %>% 
+  write_tsv("results/strain_env_data.tsv") %>% 
+  write_rds("results/strain_env_data.rds")
+```
+
+```{r}
+library(pcaMethods)
+```
+
+```{r}
+
+data_for_pca <- strain_env_data %>% 
+  select(Culture,Year,Day_of_year,`Station Depth (m)`,`Local Time (Eastern Time Zone)`,`Latitude (decimal deg)`,`Longitude (decimal deg)`,`Wind speed (knots)`,`Wave Height (ft)`,`Secchi Depth (m)`,`CTD Temperature (°C)`,`CTD Specific Conductivity (µS/cm)`,`CTD Beam Attenuation (m-1)`,`CTD Tramission (%)`,`CTD Dissolved Oxygen (mg/L)`,`CTD Photosynthetically Active Radiation (µE/m2/s)`,`Turbidity (NTU)`,`Particulate Microcystin (µg/L)`,`Dissolved Microcystin (µg/L)`,`Extracted Phycocyanin (µg/L)`,`Extracted Chlorophyll a (µg/L)`) %>% 
+  column_to_rownames("Culture") %>% 
+  filter(!is.na(`Latitude (decimal deg)`)) %>% 
+  filter(!is.na(`Dissolved Microcystin (µg/L)`)) %>% 
+  type_convert() %>% 
+  mutate(`Local Time (Eastern Time Zone)` = as.numeric(`Local Time (Eastern Time Zone)`)) %>% 
+  scale() %>% 
+  as.data.frame()
+  #as.matrix() %>% 
+  #as.numeric()
+  
+# temp removed columns: Site, Sky, Date
+
+pca_w_missing_imputed <- pcaMethods::pca(data_for_pca,)
+
+pca_vegan <- vegan::rda(data_for_pca)
+
+pca <- PCAtools::pca(t(data_for_pca))
+
+biplot(pca_w_missing_imputed)
+
+autoplot(pca_vegan)
+
+
+PCAtools::biplot(pca,showLoadings = TRUE)
+```
+
+
+
+

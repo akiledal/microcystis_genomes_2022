@@ -1,0 +1,49 @@
+---
+title: "Heterotrophs associated with Microcystis genomes"
+author: "Anders Kiledal"
+date: "1/6/2022"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+```
+
+Read in coverage information calculated with coverm using the minimap2 aligner,
+drep results, and GTDB-tk classifications.
+```{r}
+bin_coverage <- read_tsv("metagenome_pipeline/results/bin_coverage.tsv")
+
+drep_dereplicated <- read_csv("metagenome_pipeline/data/drep/data_tables/Wdb.csv")
+drep_clusters <- read_csv("metagenome_pipeline/data/drep/data_tables/Cdb.csv")
+drep_info <- read_csv("metagenome_pipeline/data/drep/data_tables/genomeInformation.csv")
+
+gtdb_class <- read_tsv("metagenome_pipeline/data/gtdb/gtdbtk.bac120.summary.tsv")
+```
+
+```{r}
+bin_coverage_tidy <- bin_coverage %>% 
+  pivot_longer(cols = -Genome,names_to = "key",values_to = "value") %>% 
+  mutate(sample = str_remove(key,"_R1_deduped_trimmed_screened.fq.*"),
+         metric = str_remove(key,".*.fq ")) %>% 
+  dplyr::select(-key) %>% 
+  filter(!is.na(value))
+
+bin_coverage_wider <- bin_coverage_tidy %>% 
+  pivot_wider(names_from = metric,
+              values_from = value) %>% 
+  mutate(percent_covered_bases = `Covered Bases` / Length * 100)
+```
+
+
+```{r}
+(bin_coverage_wider %>% 
+  filter(Genome != "unmapped",
+         percent_covered_bases > 25) %>% 
+  ggplot(aes(percent_covered_bases, `Relative Abundance (%)`,genome = Genome, sample = sample)) + 
+  geom_point() +
+  scale_y_log10()) %>% 
+  plotly::ggplotly()
+```
+
+

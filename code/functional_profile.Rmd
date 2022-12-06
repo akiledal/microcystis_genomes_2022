@@ -1,0 +1,1116 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+#Pathway abundance
+
+```{r}
+
+metadata <- read_tsv("data/metadata.tsv")
+
+pathway_abund_files <- list.files("data/humann3",pattern = "_humann_pathabundance.tsv", recursive = TRUE,full.names = TRUE) %>% 
+  data.frame(file = .) %>% 
+  mutate(sample = str_remove(file,"data/humann3/.*/"),
+         sample = str_remove(sample,"_humann_pathabundance.tsv"))
+
+path_abund <- read_tsv(pathway_abund_files$file[1])
+
+for (file in pathway_abund_files$file[2:nrow(pathway_abund_files)]){
+  
+  new_file <- read_tsv(file)
+  
+  path_abund <- path_abund %>% full_join(new_file) %>% rename_all(~str_remove(.x,"_humann_Abundance"))
+}
+
+path_abund <- path_abund %>% dplyr::rename(pathway = "# Pathway")
+
+
+notax_path_abund <- path_abund %>% 
+  dplyr::filter(!str_detect(pathway,"\\|"))
+
+
+path_abund_notax <- notax_path_abund %>% 
+  group_by(pathway) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x))) %>% 
+  column_to_rownames("pathway") %>% 
+  mutate(across(everything(),~replace_na(.x,0)))
+
+## Scale to counts, with minimum of 1 count
+min_abund <- min(path_abund_notax[path_abund_notax > 0])
+path_abund_notax <- path_abund_notax * 1 / min_abund
+path_abund_notax <- round(path_abund_notax)
+
+
+concrete_metadata <- metadata %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+aldex_path_abund <- path_abund_notax[,rownames(concrete_metadata)]
+
+treatments <- concrete_metadata %>% pull("asr_logical")
+
+aldex_out_path <- ALDEx2::aldex(aldex_path_abund, treatments, mc.samples=1000, test="t", include.sample.summary=FALSE, verbose=FALSE, denom = "all",effect = TRUE)
+
+signif_aldex_out_path <- aldex_out_path %>% 
+  filter(we.ep <= 0.05) %>% 
+  rownames_to_column("pathway")
+
+```
+
+
+```{r}
+asr_paths <- signif_aldex_out_path %>% filter(effect > 0) %>% top_n(20,effect) %>% mutate(color = "blue")
+non_asr_paths <- signif_aldex_out_path %>% filter(effect < 0) %>% top_n(20,-effect) %>% mutate(color = "orange")
+
+plot_paths <- bind_rows(asr_paths,non_asr_paths)
+
+(asr_pathways <- plot_paths %>% ggplot(aes(reorder(pathway,effect), effect, fill = color)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_identity() +
+  labs(x = NULL) +
+  theme_bw()
+  #theme(axis.text.x = element_text(angle = -45, vjust = 1, hjust = 0)) 
+)
+  
+ggsave("results/asr_pathways.png",asr_pathways,width = 5, height = 3.5, dpi = 600, scale = 2)
+
+```
+
+
+
+
+
+
+
+
+Other testing attempted (aldex was better)
+```{}
+clr_notax <- notax_path_abund %>% 
+  mutate(across(-pathway,~if_else(is.na(.x),0,.x))) %>% 
+  column_to_rownames("pathway") %>% as.matrix() %>% 
+  microbiome::transform(transform = "clr") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("pathway")
+
+
+long_notax_path <- clr_notax %>% 
+  pivot_longer(-pathway, names_to = "sample",values_to = "abund") %>% 
+  left_join(metadata) %>% 
+  filter(type == "concrete") %>% 
+  mutate(abund = if_else(is.na(abund),0,abund)) %>% 
+  group_by(pathway)
+
+
+
+
+test <- long_notax_path %>%
+  #group_by(experiment_number, food_type) %>%
+  do(broom::tidy(t.test(.$abund, .$asr_logical,
+                 alternative = "two.sided",
+                 mu = 0,
+                 paired = FALSE,
+                 var.equal = FALSE,
+                 conf.level = 0.95
+                 ))) %>% 
+  ungroup() %>% 
+  mutate(p.fdr = p.adjust(p.value))
+
+
+
+long_notax_path %>% 
+  filter(pathway == "PWY-181: photorespiration") %>% 
+  ggplot(aes(asr_logical, abund)) + 
+  geom_boxplot() +
+  theme_bw()
+
+
+
+test2 <- long_notax_path %>%
+  #group_by(experiment_number, food_type) %>%
+  do(broom::tidy(lm(abund ~ asr_logical,.))) %>% 
+  ungroup() %>% 
+  mutate(p.fdr = p.adjust(p.value))
+
+
+top_paths <- test2 %>% 
+  filter(!pathway %in% c("UNMAPPED","UNINTEGRATED"),
+  term == "asr_logicalTRUE",
+  p.value <= 0.05) %>%  
+  top_n(10,estimate) %>% 
+  arrange(estimate) %>% 
+  dplyr::select(estimate,pathway) %>% distinct
+
+
+(top_asr_functional_changes <- long_notax_path %>% 
+  #filter(pathway == "PWY-6174: mevalonate pathway II (haloarchaea)") %>% 
+  filter(pathway %in% top_paths$pathway) %>% 
+  left_join(top_paths) %>% 
+  ggplot(aes(asr_logical, abund)) + 
+  geom_point() +
+  geom_boxplot() +
+  #geom_smooth(method = "lm") +
+  theme_bw() +
+  scale_y_log10() +
+  facet_wrap(~reorder(pathway,abs(estimate)),scales = "free_y",ncol = 3,labeller = label_wrap_gen())
+)  
+  
+ggsave(plot = top_asr_functional_changes, "results/asr_functions.png",width = 5, height = 4, dpi = 600,scale = 2.5)
+ggsave(plot = top_asr_functional_changes, "results/asr_functions.pdf",width = 5, height = 4, dpi = 600,scale = 2.5)
+
+```
+
+
+# All Uniref abundance (no decontamination or stratification by taxa)
+
+```{r}
+metadata <- read_tsv("data/metadata.tsv")
+
+go_map_wide <- read_tsv("data/reference/humann_map2/map_go_uniref90.txt.gz",col_names = FALSE) 
+
+go_names <- read_tsv("data/reference/humann_map/map_go_name.txt.gz",col_names = F) %>% 
+  dplyr::rename(go = "X1", go_name = "X2")
+
+go_map <- go_map_wide  %>% 
+  pivot_longer(-X1, names_to = "delete", values_to = "uniref") %>% 
+  dplyr::select(go = "X1", uniref) %>% 
+  filter(!is.na(uniref)) %>% 
+  left_join(go_names)
+
+
+
+uniref_abund_files <- list.files("data/humann3",pattern = "_humann_genefamilies.tsv", recursive = TRUE,full.names = TRUE) %>% 
+  data.frame(file = .) %>% 
+  mutate(sample = str_remove(file,"data/humann3/.*/"),
+         sample = str_remove(sample,"_humann_pathabundance.tsv"))
+
+ur_abund <- read_tsv(pathway_abund_files$file[1],show_col_types = FALSE)
+
+for (file in uniref_abund_files$file[2:nrow(uniref_abund_files)]){
+  
+  new_file <- read_tsv(file,show_col_types = FALSE)
+  
+  ur_abund <- ur_abund %>% full_join(new_file) %>%  rename_all(~str_remove(.x,"_humann_Abundance-RPKs"))
+}
+```
+
+Wilcox test
+```{r}
+all_uniref <- ur_abund %>% 
+  rename(uniref = "# Gene Family") %>% 
+  filter(!str_detect(uniref,"\\|")) %>% 
+  mutate(across(-uniref,~replace_na(.x,0)),
+         across(-uniref,~.x/sum(.x)))
+
+annotated_all_uniref <- all_uniref %>% 
+  left_join(go_map) %>% 
+  dplyr::relocate(uniref,go,go_name)
+
+all_go <- annotated_all_uniref %>% 
+  filter(!is.na(go))
+
+
+all_go_long <- all_go %>% 
+  pivot_longer(any_of(metadata$sample), names_to = "sample", values_to = "rel_abund") %>% 
+  left_join(metadata %>% dplyr::select(sample, asr_logical,type))
+
+
+go_fc <- all_go_long %>%
+  filter(type == "concrete") %>% 
+  group_by(go,asr_logical,sample) %>%
+  summarise(rel_abund = sum(rel_abund)) %>% 
+  ungroup %>% group_by(go,asr_logical) %>% 
+  summarise(rel_abund = mean(rel_abund)) %>% 
+  pivot_wider(id_cols = c(go),names_from = "asr_logical",values_from = "rel_abund",values_fill = 0) %>% 
+  ungroup() %>% group_by(go) %>% 
+  summarise(log2_fc = log2(`TRUE`/`FALSE`))
+
+
+#Differential abundance of GO terms in concrete across ASR status, by wilcox test (nonparametric)
+non_para <- all_go_long %>%
+  filter(type == "concrete") %>% 
+  group_by(go,asr_logical,sample) %>%
+  summarise(rel_abund = sum(rel_abund)) %>% 
+  pivot_wider(c(go,sample), names_from = asr_logical, values_from = rel_abund, values_fill = 0) %>% 
+  pivot_longer(c(`TRUE`,`FALSE`),names_to = "asr_logical", values_to = "rel_abund") %>% #pivot back and forth to re-introduce zeros
+  do(broom::tidy(wilcox.test(.$rel_abund ~ .$asr_logical,
+                 alternative = "two.sided",
+                 mu = 0,
+                 paired = FALSE,
+                 var.equal = FALSE,
+                 conf.level = 0.95
+                 )))
+
+
+
+non_para_w_names <- non_para %>% 
+  left_join(go_names) %>% 
+  left_join(go_fc) %>% 
+  mutate(p.BH = p.adjust(p.value, "BH" ))
+```
+
+
+
+## ALDEx2 differential abundance testing of GO terms
+
+export data so this can run in the background
+```{r}
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+all_uniref <- ur_abund %>% 
+  rename(uniref = "# Gene Family") %>% 
+  filter(!str_detect(uniref,"\\|")) %>% 
+  mutate(across(-uniref,~replace_na(.x,0)),
+         across(-uniref,~.x/sum(.x)))
+
+annotated_all_uniref <- all_uniref %>% 
+  left_join(go_map) %>% 
+  dplyr::relocate(uniref,go,go_name) %>% 
+  mutate(go = if_else(is.na(go),"no_go",go),
+         go_name = if_else(is.na(go_name),"no go term",go),
+         go = if_else(uniref == "UNMAPPED", "UNMAPPED", go),
+         go_name = if_else(uniref == "UNMAPPED", "UNMAPPED", go_name)) %>% 
+  group_by(go) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x))) %>% 
+  column_to_rownames("go")
+
+min_abund <- min(annotated_all_uniref[annotated_all_uniref > 0])
+
+
+annotated_all_uniref <- annotated_all_uniref * 1 / min_abund
+
+annotated_all_uniref <- round(annotated_all_uniref)
+
+write_rds(annotated_all_uniref,"data/humann3/annotated_all_uniref.rds")
+
+```
+
+Run ALDEx2
+```{r}
+
+library(tidyverse)
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+annotated_all_uniref <- read_rds("data/humann3/annotated_all_uniref.rds")
+
+aldex_uniref_table <- annotated_all_uniref[,rownames(metadata)]
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_uniref <- aldex(aldex_uniref_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_uniref,"results/aldex/aldex_out_uniref.rds")
+
+
+
+aldex_out <- read_rds("results/aldex/aldex_out_uniref.rds")
+
+aldex.plot(aldex_out_uniref, type="MW")
+
+aldex.plot(aldex_out_uniref, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out_uniref, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_w_names <- aldex_out_uniref %>% rownames_to_column("go") %>% left_join(go_names)
+
+
+all_go_long <- all_go %>% 
+  pivot_longer(any_of(metadata$sample), names_to = "sample", values_to = "rel_abund") %>% 
+  left_join(metadata %>% dplyr::select(sample, asr_logical,type))
+```
+
+## NMDS & PERMANOVA
+
+```{r}
+#Read in metadata
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+
+#Select only needed columns and perform Hellinger transformation
+simple_rel.abund <- annotated_all_uniref %>% 
+  dplyr::select(any_of(simple_meta$sample)) %>% 
+  as.matrix() %>% 
+  microbiome::transform("hellinger")
+
+#Transpose matrix for Vegan
+t_abund <- t(simple_rel.abund)
+
+#Calculate Bray-Curtis distances
+bc_dist <- vegdist(t_abund,method = "bray") 
+```
+
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(bc_dist)) %>% column_to_rownames("sample") #%>% filter(type == "concrete")
+
+(permanova_bc <- adonis2(bc_dist ~ percent_contam + location + asr_logical, ordered_metadata))
+```
+
+#### NMDS:
+
+```{r}
+
+#Calculate NMDS
+nmds <- metaMDS(bc_dist,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(uniref_all_function_nmds <- points %>% left_join(simple_meta) %>% 
+    mutate(asr_logical = if_else(asr_logical == TRUE,"Reactive","Unreactive"),
+           location =case_when(
+             location == "delaware" ~ "DelDOT",
+             location == "new_jersey" ~ "NJDOT",
+             location == "star" ~ "STAR",
+             location == "series" ~ "Cylinder\nseries")) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = asr_logical,
+               shape = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+    labs(color = "ASR",
+         shape = "Sample source") +
+    annotate("text", label = glue::glue("Stress: {round(nmds$stress,3)}"), -.15, -.22) +  
+    scale_color_manual(values = c("#ef8a62", "#67a9cf")) +
+    geom_point(size = 2) +
+      theme_bw()
+  )
+
+ggsave("results/uniref_all_function_nmds.png",plot = uniref_all_function_nmds,width = 5, height = 4, dpi = 600, scale = 1.2)
+
+```
+
+
+
+
+
+
+
+
+
+
+# Decontaminated functional profiles
+```{r}
+metadata <- read_tsv("data/metadata.tsv")
+
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy_id, taxonomy)
+
+contaminants <- read_tsv("results/contaminants.txt") %>% 
+  pull("taxonomy_id")
+
+contam_genus_and_species <- taxonomy %>% 
+  filter(taxonomy_id %in% contaminants) %>% 
+  mutate(genus_and_species = str_extract(taxonomy,"g__.*"),
+         genus_and_species = str_replace(genus_and_species, "; s__", ";s__"),
+         genus_and_species = str_replace(genus_and_species, " ", "_"))
+
+#Make UniRef abundance table stratified by taxa
+tax_annotated_uniref <- ur_abund %>% 
+  rename(uniref = "# Gene Family") %>% 
+  filter(str_detect(uniref,"\\|") | uniref =="UNMAPPED") %>% 
+  mutate(across(-uniref,~replace_na(.x,0)),
+         across(-uniref,~.x/sum(.x)))
+
+tax_uniref <- tax_annotated_uniref %>% 
+  mutate(taxonomy = str_extract(uniref, "g__.*"),
+         taxonomy = str_remove(taxonomy, "__[0-9]*$"),
+         uniref = str_remove(uniref,"\\|.*")) %>% 
+  relocate(uniref,taxonomy)
+
+tax_uniref_decontam <- tax_uniref %>% 
+  filter(! taxonomy %in% contam_genus_and_species$genus_and_species )
+
+
+
+# Make uniref abundance table without taxonomic stratification
+uniref_abund <- tax_uniref_decontam %>% 
+  group_by(uniref) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x))) %>% 
+  column_to_rownames("uniref")
+
+## Scale to counts, with minimum of 1 count
+min_abund <- min(uniref_abund[uniref_abund > 0])
+uniref_abund <- uniref_abund * 1 / min_abund
+uniref_abund <- round(uniref_abund)
+write_rds(uniref_abund,"data/humann3/uniref_abund.rds")
+
+
+# Make GO term abundance table
+annotated_tax_uniref <- tax_uniref_decontam %>% 
+  left_join(go_map) %>% 
+  dplyr::relocate(uniref,go,go_name) %>% 
+  mutate(go = if_else(is.na(go),"no_go",go),
+         go_name = if_else(is.na(go_name),"no_go_name",go),
+         go = if_else(uniref == "UNMAPPED", "UNMAPPED", go),
+         go_name = if_else(uniref == "UNMAPPED", "UNMAPPED", go_name)) %>% 
+  group_by(go) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x))) %>% 
+  column_to_rownames("go")
+
+## Scale to counts, with minimum of 1 count
+min_abund <- min(annotated_tax_uniref[annotated_tax_uniref > 0])
+annotated_tax_uniref <- annotated_tax_uniref * 1 / min_abund
+annotated_tax_uniref <- round(annotated_tax_uniref)
+write_rds(annotated_tax_uniref,"data/humann3/annotated_tax_uniref.rds")
+
+```
+
+## ALDEx2 differential abundance testing of UniRef90 clusters
+```{r}
+
+library(tidyverse)
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+uniref_abund <- read_rds("data/humann3/uniref_abund.rds")
+
+aldex_uniref_abund <- uniref_abund[,rownames(metadata)]
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_uniref_decontam <- aldex(aldex_uniref_abund, treatments, test="t", include.sample.summary=FALSE, verbose=FALSE)
+
+saveRDS(aldex_out_uniref_decontam,"results/aldex/aldex_out_uniref_decontam.rds")
+
+
+
+aldex_out_uniref_decontam <- read_rds("results/aldex/aldex_out_uniref_decontam.rds")
+
+aldex.plot(aldex_out_uniref_decontam, type="MW")
+
+aldex.plot(aldex_out_uniref_decontam, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out_uniref_decontam, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+
+ASR_DA <- aldex_out_uniref_decontam %>% 
+  filter(effect > 0 & we.ep <= 0.05)
+
+
+noASR_DA <- aldex_out_uniref_decontam %>% 
+  filter(effect < 0 & we.ep <= 0.05)
+
+```
+
+
+
+
+
+
+
+
+
+
+## ALDEx2 differential abundance testing of GO terms
+```{r}
+library(tidyverse)
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+annotated_tax_uniref <- read_rds("data/humann3/annotated_tax_uniref.rds")
+
+aldex_uniref_tax_table <- annotated_tax_uniref[,rownames(metadata)]
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_go_tax <- aldex(aldex_uniref_tax_table, treatments, mc.samples=1000, test="t", effect=TRUE, include.sample.summary=FALSE, verbose=FALSE, denom = "all")
+
+saveRDS(aldex_out_go_tax,"results/aldex/aldex_out_go_tax.rds")
+
+
+
+aldex_out_go_tax <- read_rds("results/aldex/aldex_out_go_tax.rds")
+
+ALDEx2::aldex.plot(aldex_out_go_tax, type="MW")
+
+ALDEx2::aldex.plot(aldex_out_go_tax, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+ALDEx2::aldex.plot(aldex_out_go_tax, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+aldex_out_go_tax_w_names <- aldex_out_go_tax %>% rownames_to_column("go") %>% left_join(go_names)
+
+
+
+
+```
+
+
+
+### NMDS & PERMANOVA
+```{r}
+#Read in metadata
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+
+
+#Select only needed columns and perform Hellinger transformation
+simple_rel.abund <- annotated_tax_uniref %>% 
+  dplyr::select(any_of(simple_meta$sample)) %>% 
+  as.matrix() %>% 
+  microbiome::transform("hellinger")
+
+#Transpose matrix for Vegan
+t_abund <- t(simple_rel.abund)
+
+#Calculate Bray-Curtis distances
+bc_dist <- vegdist(t_abund,method = "bray") 
+```
+
+
+#### PERMANOVA testing of differences
+```{r}
+ordered_metadata <- simple_meta %>% filter(sample %in% labels(bc_dist)) %>% column_to_rownames("sample") #%>% filter(type == "concrete")
+
+(permanova_bc <- adonis2(bc_dist ~ location + asr_logical, ordered_metadata))
+```
+#### NMDS
+```{r}
+
+#Calculate NMDS
+nmds <- metaMDS(bc_dist,k=2,trymax = 1000)
+
+#Extract NMDS values for plotting
+points <- nmds$points %>% as.data.frame %>% 
+  rownames_to_column("sample")
+
+#Plot NMDS
+(uniref_tax_function_nmds <- points %>% left_join(simple_meta) %>% 
+    mutate(asr_logical = if_else(asr_logical == TRUE,"Reactive","Unreactive"),
+           location =case_when(
+             location == "delaware" ~ "DelDOT",
+             location == "new_jersey" ~ "NJDOT",
+             location == "star" ~ "STAR",
+             location == "series" ~ "Cylinder\nseries")) %>% 
+    ggplot(aes(MDS1,MDS2, 
+               color = asr_logical,
+               shape = location, 
+               info=sample, 
+               notes = notes, 
+               ident_info = ident_info, 
+               other_notes=other_notes)) +
+    labs(color = "ASR",
+         shape = "Sample source") +
+    annotate("text", label = glue::glue("Stress: {round(nmds$stress,3)}"), -.22, -.18) +  
+    scale_color_manual(values = c("#ef8a62", "#67a9cf")) +
+    geom_point(size = 2) +
+      theme_bw()
+  )
+
+ggsave("results/uniref_tax_function_nmds.png",plot = uniref_tax_function_nmds,width = 5, height = 4, dpi = 600, scale = 1.2)
+
+```
+
+
+
+
+
+
+#Decontaminated pathway differential abundance
+
+
+```{r}
+metadata <- read_tsv("data/metadata.tsv")
+
+pathway_abund_files <- list.files("data/humann3",pattern = "_humann_pathabundance.tsv", recursive = TRUE,full.names = TRUE) %>% 
+  data.frame(file = .) %>% 
+  mutate(sample = str_remove(file,"data/humann3/.*/"),
+         sample = str_remove(sample,"_humann_pathabundance.tsv"))
+
+path_abund <- read_tsv(pathway_abund_files$file[1])
+
+for (file in pathway_abund_files$file[2:nrow(pathway_abund_files)]){
+  
+  new_file <- read_tsv(file)
+  
+  path_abund <- path_abund %>% full_join(new_file) %>% rename_all(~str_remove(.x,"_humann_Abundance"))
+}
+
+path_abund <- path_abund %>% dplyr::rename(pathway = "# Pathway")
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+metadata <- read_tsv("data/metadata.tsv")
+
+taxonomy <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(taxonomy_id, taxonomy)
+
+contaminants <- read_tsv("results/contaminants.txt") %>% 
+  pull("taxonomy_id")
+
+contam_genus_and_species <- taxonomy %>% 
+  filter(taxonomy_id %in% contaminants) %>% 
+  mutate(genus_and_species = str_extract(taxonomy,"g__.*"),
+         genus_and_species = str_replace(genus_and_species, "; s__", ";s__"),
+         genus_and_species = str_replace(genus_and_species, " ", "_"))
+
+#Make UniRef abundance table stratified by taxa
+tax_annotated_pathway <- path_abund %>% 
+  filter(str_detect(pathway,"\\|") | pathway =="UNINTIGRATED") %>% 
+  mutate(across(-pathway,~replace_na(.x,0)),
+         across(-pathway,~.x/sum(.x)))
+
+tax_pathway <- tax_annotated_pathway %>% 
+  mutate(taxonomy = str_extract(pathway, "g__.*"),
+         taxonomy = str_remove(taxonomy, "__[0-9]*$"),
+         pathway = str_remove(pathway,"\\|.*")) %>% 
+  relocate(pathway,taxonomy)
+
+tax_path_decontam <- tax_pathway %>% 
+  filter(! taxonomy %in% contam_genus_and_species$genus_and_species )
+
+
+# Make uniref abundance table without taxonomic stratification
+path_abund_notax <- tax_path_decontam %>% 
+  group_by(pathway) %>% 
+  summarise(across(any_of(metadata$sample), ~ sum(.x))) %>% 
+  column_to_rownames("pathway") %>% 
+  mutate(across(everything(),~replace_na(.x,0)))
+
+## Scale to counts, with minimum of 1 count
+min_abund <- min(path_abund_notax[path_abund_notax > 0])
+path_abund_notax <- path_abund_notax * 1 / min_abund
+path_abund_notax <- round(path_abund_notax)
+write_rds(path_abund_notax,"data/humann3/path_abund_notax.rds")
+
+```
+
+Test differential abundance with ALEx2
+```{r}
+
+library(tidyverse)
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample") %>% 
+  filter(type == "concrete")
+
+#path_abund_notax <- read_rds("data/humann3/path_abund_notax.rds")
+
+aldex_path_abund <- path_abund_notax[,rownames(metadata)]
+
+treatments <- metadata %>% pull("asr_logical")
+
+aldex_out_path_decontam <- ALDEx2::aldex(aldex_path_abund, treatments, mc.samples=1000, test="t", include.sample.summary=FALSE, verbose=FALSE, denom = "all",effect = TRUE)
+
+saveRDS(aldex_out_uniref_decontam,"results/aldex/aldex_out_uniref_decontam.rds")
+
+
+
+aldex_out_uniref_decontam <- read_rds("results/aldex/aldex_out_uniref_decontam.rds")
+
+aldex.plot(aldex_out_uniref_decontam, type="MW")
+
+aldex.plot(aldex_out_uniref_decontam, type="MA", test="welch", xlab="Log-ratio abundance",
+    ylab="Difference")
+aldex.plot(aldex_out_uniref_decontam, type="MW", test="welch", xlab="Dispersion",
+    ylab="Difference")
+
+
+
+
+
+
+
+clr_notax <- path_abund_notax %>% rownames_to_column("pathway") %>% 
+  filter(pathway != "UNINTEGRATED") %>% 
+  mutate(across(-pathway,~if_else(is.na(.x),0,.x))) %>% 
+  column_to_rownames("pathway") %>% as.matrix() %>% 
+  microbiome::transform(transform = "compositional") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("pathway")
+
+
+long_notax_path <- clr_notax %>% 
+  pivot_longer(-pathway, names_to = "sample",values_to = "abund") %>% 
+  left_join(metadata) %>% 
+  filter(type == "concrete") %>% 
+  mutate(abund = if_else(is.na(abund),0,abund)) %>% 
+  group_by(pathway)
+
+
+
+
+test <- long_notax_path %>%
+  #group_by(experiment_number, food_type) %>%
+  do(broom::tidy(t.test(.$abund, .$asr_logical,
+                 alternative = "two.sided",
+                 mu = 0,
+                 paired = FALSE,
+                 var.equal = FALSE,
+                 conf.level = 0.95
+                 ))) %>% 
+  ungroup() %>% 
+  mutate(p.fdr = p.adjust(p.value))
+
+
+
+long_notax_path %>% 
+  filter(pathway == "PWY-181: photorespiration") %>% 
+  ggplot(aes(asr_logical, abund)) + 
+  geom_boxplot() +
+  theme_bw()
+
+
+
+test2 <- long_notax_path %>%
+  #group_by(experiment_number, food_type) %>%
+  do(broom::tidy(lm(abund ~ asr_num,.))) %>% 
+  ungroup() %>% 
+  mutate(p.fdr = p.adjust(p.value))
+
+
+
+```
+
+
+# Enrichment
+
+## GO enrichment of significant DA 
+
+
+
+#Re-doing HUMANN analysis
+
+```{r}
+
+#Full go term mapping from HUMANN3
+go_map_wide <- read_tsv("data/reference/humann_map2/map_go_uniref90.txt.gz",col_names = FALSE) 
+
+go_map <- go_map_wide  %>% 
+  pivot_longer(-X1, names_to = "delete", values_to = "uniref") %>% 
+  dplyr::select(go = "X1", uniref) %>% 
+  filter(!is.na(uniref))
+
+go_names <- read_tsv("data/reference/humann_map/map_go_name.txt.gz",col_names = F) %>% 
+  dplyr::rename(go = "X1", go_name = "X2")
+
+
+
+da_uniref_W_go <- 
+  left_join(go_map) %>% left_join(go_names)
+
+
+
+sample_go_count <- uniref_abund %>% 
+  group_by(go) %>% 
+  summarise(go_count = n()) %>% 
+  left_join(go_names) %>% 
+  filter(!is.na(go))
+
+go_background <- go_map %>%
+  group_by(go) %>% 
+  summarize(go_count = n()) %>% 
+  left_join(go_names)
+
+
+go_of_interest <- sample_go_count$go_count
+
+names(go_of_interest) <- sample_go_count$go_name
+
+
+```
+
+## GO Biological Process Enrichment
+
+```{r}
+#library(clusterProfiler)
+library(topGO)
+
+#Read in go term names
+go_names <- read_tsv("data/reference/humann_map/map_go_name.txt.gz",col_names = F) %>% 
+  dplyr::rename(go = "X1", go_name = "X2")
+
+#Full go term mapping from HUMANN3
+go_map_wide <- read_tsv("data/reference/humann_map2/map_go_uniref90.txt.gz",col_names = FALSE) 
+
+go_map2 <- go_map_wide %>% column_to_rownames("X1") %>% t()
+
+
+go_map <- go_map_wide  %>% 
+  pivot_longer(-X1, names_to = "delete", values_to = "uniref") %>% 
+  dplyr::select(go = "X1", uniref) %>% 
+  filter(!is.na(uniref))
+
+#List of uniref clusters in full mapping file
+uniref_in_uniref2go <- go_map %>% pull(uniref) %>% unique()
+
+rownames(go_map2) <- NULL
+
+my_list2 <- list()
+for(i in 1:ncol(go_map2)) { # Using for-loop to add columns to list
+  my_list2[[i]] <- go_map2[ , i]
+}
+
+names(my_list2) <- colnames(go_map2) 
+
+my_list2 <- lapply(my_list2, function(x) x[!is.na(x)])
+
+str(head(my_list2))
+
+geneID2GO <- inverseList(my_list2)
+
+names(uniref_in_uniref2go) <- uniref_in_uniref2go
+
+#names(uniref_in_sample) <- uniref_in_sample
+
+da_uniref <- rownames(ASR_DA)
+
+interesting_uniref <- factor(as.integer(uniref_in_uniref2go %in% da_uniref))
+
+names(interesting_uniref) <- uniref_in_uniref2go
+
+all_uniref_factor <- as.factor(uniref_in_uniref2go)
+
+
+# abund <- path_gfam %>% filter(is.na(tax), uniref != "UNMAPPED")
+# 
+# abund_list <- abund$`S3_Fallen_humann_Abundance-RPKs`
+# 
+# names(abund_list) <- abund$uniref
+
+
+topgo_data <- new("topGOdata",
+  description = "ALDEx2 DA abundant in ASR", ontology = "BP",
+  allGenes = interesting_uniref,
+  nodeSize = 2,
+  annot = annFUN.gene2GO, gene2GO = geneID2GO)
+
+
+##export topgo data so doens't have to be re-processed if interactively running enrichment tests again
+##qs package used because rds was either too slow or wasn't working properly
+
+qs::qsave(topgo_data,"data/humann3/topgoBP.qs",preset = "fast",nthreads = 2)
+
+```
+
+Read in topgo data (for interactive testing)
+```{r}
+topgo_data <- qs::qread("data/humann3/topgoBP.qs",nthreads = 2)
+
+```
+
+Using topGO's default weight01 which down-weights the upper level enrichments (get lower level results)
+And fisher for testing
+```{r}
+resultWeight <- runTest(topgo_data, statistic = "fisher")
+
+weight_res <- as.data.frame(resultWeight@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(weight_res,"results/weight_goBP_results.tsv")
+
+```
+
+Using topGO's default weight01 which down-weights the upper level enrichments (get lower level results)
+And the KS test for significance testing
+```{r}
+resultWeightKS <- runTest(topgo_data, statistic = "ks")
+
+
+weight_res_KS <- as.data.frame(resultWeightKS@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(weight_res_KS,"results/weight_goBP_KS_results.tsv")
+
+```
+
+
+Plot top 25 enriched terms
+```{r}
+weight_res %>% 
+  mutate(go_name = str_remove(go_name, "\\[BP\\]")) %>% 
+  top_n(25,-`resultWeight@score`) %>% 
+  filter(`resultWeight@score` <= 0.01) %>% 
+  ggplot(aes(`resultWeight@score`, reorder(go_name,-`resultWeight@score`))) +
+  geom_point() +
+  theme_bw() +
+  scale_x_log10() +
+  coord_cartesian(xlim = c(1e-7,0.01)) +
+  labs(y = NULL,
+       x = "topGO weight01 score",
+       title = "GO Biological Process Enrichment") +
+  ggsave("results/figures/goBP_enrichment.tiff",width = 4, height = 2.5,scale = 1.75) +
+  ggsave("results/figures/goBP_enrichment.png",width = 4, height = 2.5,scale = 1.75)
+  
+
+
+
+res_simp <- go_res %>% 
+  mutate(score = format(`resultWeight@score`, scientific = F, digits = 3))
+
+```
+
+
+
+
+
+
+Standard classical Fisher tests
+```{r}
+test.stat <- new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+
+resultFisher <- getSigGroups(topgo_data, test.stat)
+
+fisher_res <- as.data.frame(resultFisher@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(fisher_res,"results/fisher_goBP_results.tsv")
+```
+
+
+
+## GO Molecular Function Enrichment
+
+```{r}
+topgo_MF <- new("topGOdata",
+  description = "S3 Fallen Go Enrichment", ontology = "MF",
+  allGenes = interesting_uniref,
+  nodeSize = 2,
+  annot = annFUN.gene2GO, gene2GO = geneID2GO)
+
+
+##export topgo data so doens't have to be re-processed if interactively running enrichment tests again
+##qs package used because rds was either too slow or wasn't working properly
+
+qs::qsave(topgo_MF,"data/humann3/topgo_MF.qs",preset = "fast",nthreads = 2)
+
+```
+
+Read in topgo data (for interactive testing)
+```{r}
+if (!exists("topgo_MF")){
+topgo_MF <- qs::qread("data/humann3/topgo_MF.qs",nthreads = 2)
+}
+```
+
+
+```{r}
+#Using topGO's default weight01 which down-weights the upper level enrichments (get lower level results)
+
+resultWeight_MF <- runTest(topgo_MF, statistic = "fisher")
+
+weight_res_MF <- as.data.frame(resultWeight_MF@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(weight_res_MF,"results/weightMF_go_results.tsv")
+
+```
+
+
+Standard classical Fisher tests
+```{r}
+test.stat <- new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+
+resultFisher_MF <- getSigGroups(topgo_MF, test.stat)
+
+fisher_resMF <- as.data.frame(resultFisher_MF@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(fisher_resMF,"results/fisher_goMF_results.tsv")
+```
+
+
+
+##GO Cellular Component Enrichment
+
+
+```{r}
+topgo_CC <- new("topGOdata",
+  description = "S3 Fallen Go Enrichment", ontology = "CC",
+  allGenes = interesting_uniref,
+  nodeSize = 2,
+  annot = annFUN.gene2GO, gene2GO = geneID2GO)
+
+
+##export topgo data so doens't have to be re-processed if interactively running enrichment tests again
+##qs package used because rds was either too slow or wasn't working properly
+
+qs::qsave(topgo_CC,"data/humann3/topgo_CC.qs",preset = "fast",nthreads = 2)
+
+```
+
+Read in topgo data (for interactive testing)
+```{r}
+
+if (!exists("topgo_CC")){
+topgo_CC <- qs::qread("data/humann3/topgo_CC.qs",nthreads = 2)
+}
+```
+
+
+```{r}
+#Using topGO's default weight01 which down-weights the upper level enrichments (get lower level results)
+
+resultWeight_CC <- runTest(topgo_CC, statistic = "fisher")
+
+weight_res_CC <- as.data.frame(resultWeight_CC@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(weight_res_CC,"results/weightCC_go_results.tsv")
+
+```
+
+
+Standard classical Fisher tests
+```{r}
+test.stat <- new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+
+resultFisher_CC <- getSigGroups(topgo_CC, test.stat)
+
+fisher_resCC <- as.data.frame(resultFisher_CC@score) %>% 
+  rownames_to_column("go") %>% 
+  left_join(go_names)
+
+write_tsv(fisher_resCC,"results/fisher_goCC_results.tsv")
+```
+
+

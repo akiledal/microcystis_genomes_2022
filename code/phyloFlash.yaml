@@ -1,0 +1,8 @@
+channels:
+  - defaults
+  - bioconda
+  - conda-forge
+dependencies:
+  - phyloflash=3.4.1
+  - sortmerna=2.1b
+  

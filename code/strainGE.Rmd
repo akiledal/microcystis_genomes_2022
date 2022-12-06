@@ -1,0 +1,63 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+full_sample_data <- read_csv("~/Downloads/SraRunTable2.csv")
+
+simp_sample_data <- full_sample_data %>% 
+  select(sample = "Run", Collection_Date, Depth, Lat_Lon, Fraction) %>% 
+  mutate(lat = str_remove(Lat_Lon, " N.*") %>% as.numeric(),
+         lon = str_remove(Lat_Lon, ".* N ") %>% str_remove(" W") %>% as.numeric(),
+         Date = lubridate::mdy(Collection_Date))
+
+ref_similarities <- read_tsv("data/strainge/ref_similarities.tsv")
+```
+
+
+
+```{r}
+straingst_test_stats <- read_tsv("data/strainge/results/SRR7182492.stats.tsv")
+straingst_test_strains <- read_tsv("data/strainge/results/SRR7182492.strains.tsv")
+```
+
+```{r}
+all_stats <- system("ls data/strainge/results/SRR*.stats.tsv",intern = TRUE) %>% map_df(read_tsv)
+
+read_strains <- function(fp){
+  sample <- str_remove(fp,"data/strainge/results/") %>% str_remove(".strains.tsv")
+  df <- read_tsv(fp) %>% 
+    mutate(sample = sample) %>% 
+    relocate(sample)
+}
+
+all_strains <- system("ls data/strainge/results/SRR*.strains.tsv",intern = TRUE) %>% map_df(read_strains) %>% 
+  left_join(simp_sample_data)
+```
+
+
+```{r}
+
+(all_strains %>% 
+  group_by(Date,strain) %>% 
+  summarise(rapct = sum(rapct)) %>% 
+  group_by(Date) %>% 
+  #mutate(rapct = rapct / sum(rapct)) %>% 
+  ggplot(aes(Date, rapct, fill = strain)) +
+  geom_area()
+   #geom_bar(stat = "identity")
+) %>% plotly::ggplotly()
+
+```
+
+

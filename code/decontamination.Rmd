@@ -1,0 +1,864 @@
+---
+title: "Decontamination"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(vegan) #needed for distance calculations and NMDS
+library(ape) #needed for pcoa
+library(umap) #needed for umap
+library(glue)
+library(propr)
+library(decontam)
+
+set.seed(1234321)
+```
+
+# Decontamination of concrete metagenomes
+
+Read in metadata and Bracken count data:
+```{}
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/combined_bracken.tsv")
+
+simple_rel.abund <- rel.abund %>% 
+  column_to_rownames()
+  dplyr::select(-c(taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id))
+```
+
+
+```{r}
+
+#Read in metadata
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  mutate(asr = factor(asr, levels = c("#N/A", "?","no","low","moderate","yes","high")),
+         extraction_date = lubridate::mdy(extraction_date))
+
+#Get the negative control samples
+negative_control_samples <- simple_meta %>% 
+  filter(neg_control == TRUE) %>% 
+  pull(sample)
+
+abund_mat <- read_tsv("results/braken_count_table.tsv") %>% dplyr::select(-taxonomy) %>% column_to_rownames("taxonomy_id")
+
+
+taxonomy <- bind_rows(read_tsv("data/reference/gtdb_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy),
+                      read_tsv("data/reference/refseq_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  dplyr::rename(name = "taxonomy", otu = "taxonomy_id")
+```
+
+
+Using the rho metric
+```{r}
+#Read in the table
+table <- abund_mat %>% t()
+
+#Filter very rare taxa (less than 10 counts in all concrete samples)
+keep <- apply(table, 2, function(x) sum(x >= 10) >= 20)
+
+#determine correlations with the rho metric in propr
+props <- propr(table, metric = "rho", p = 999, select = keep)
+
+prop_list_whole_tri <- props@matrix %>% as.data.frame() %>% rownames_to_column("otu_1") %>% 
+  gather(key = "otu_2",value = "prop",-otu_1) %>%
+  filter(!is.na(otu_1), !is.na(otu_2),!is.na(prop)) %>% 
+  filter(prop > 0.65 | prop < -0.5, otu_1 != otu_2)
+
+correlation_table <- prop_list_whole_tri %>%
+  dplyr::rename(cor = "prop")
+
+
+#Make table of OTU relative abundance in negative control samples
+rel_abund_in_glass <- as.data.frame(abund_mat) %>% 
+  dplyr::select(negative_control_samples) %>% 
+  rowSums() %>% 
+  as.data.frame() %>% 
+  mutate(rel_abund = ./sum(.), otu = rownames(abund_mat)) %>% 
+  filter(rel_abund > 0) %>% 
+  dplyr::select(otu, rel_abund) %>% 
+  left_join(taxonomy)
+
+prev_in_glass <- as.data.frame(abund_mat) %>% 
+  dplyr::select(negative_control_samples) %>% 
+  rowwise() %>%
+  mutate(prevalence = sum(c_across() > 0) / ncol(.)) %>% 
+  ungroup() %>% 
+  bind_cols(data.frame(otu = rownames(abund_mat))) %>% 
+  filter(prevalence > 0) %>% 
+  dplyr::select(otu, prevalence) %>% 
+  left_join(taxonomy)
+
+prev_and_abund_in_glass <- prev_in_glass %>% left_join(rel_abund_in_glass)
+
+prev_and_abund_in_glass %>% ggplot(aes(rel_abund,prevalence)) + geom_bin2d() + scale_x_log10()
+
+
+#Get a list of otus found in negative control samples
+neg_control_otus <- prev_and_abund_in_glass %>% 
+  filter(rel_abund > 0 & prevalence > 0.2) %>% 
+  pull("otu")
+
+
+#write_delim(rel_abund_in_glass,"data/processed/otu_rel_abund_in_glass_samples.tsv", delim = "\t")
+
+correlations_within_glass <- correlation_table %>%
+  filter(otu_1 %in% neg_control_otus & otu_2 %in% neg_control_otus & otu_1 != otu_2) %>% #only look at correlations between otus in glass and remove self-correlations
+  #filter(cor >= 0.3 | cor <= -0.3) %>% #only look at stronger correlations (.3 is very common for SPARCC, almost guaranteed that p.value is < 0.05)
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_other_glass = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+correlations_within_glass %>% ggplot(aes(mean_cor_w_other_glass)) + geom_histogram()
+correlations_within_glass %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+(correlations_within_glass %>% ggplot(aes(mean_cor_w_other_glass, num_pos_minus_neg, label = otu)) + geom_point() + geom_vline(xintercept = 0.65) + geom_hline(yintercept = 100)) %>% plotly::ggplotly()
+
+main_glass_contams <- correlations_within_glass %>% filter(num_pos_minus_neg > 100 & mean_cor_w_other_glass > 0.7) %>% .$otu
+
+```
+
+
+# Inverse correlation with DNA concentration (like decontam frequency method)
+Determine robust contaminants to use for starting point of correlation based methods
+(Replaces the "main glass_contams)
+
+```{r}
+library(ALDEx2)
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  column_to_rownames("sample")
+
+#Read abundance
+otu_table <- read_tsv("results/braken_count_table.tsv") %>% 
+  dplyr::select(-taxonomy) %>% 
+  column_to_rownames("taxonomy_id") %>% 
+  .[,rownames(metadata)]
+
+aldex_clr <- ALDEx2::aldex.clr(otu_table)
+
+saveRDS(aldex_clr,"results/aldex_clr.rds")
+
+aldex_clr <- read_rds("results/aldex_clr.rds")
+
+conc_cor <- aldex.cor(aldex_clr,metadata$qubit_conc)
+
+conc_cor2 <- conc_cor %>% 
+  rownames_to_column("otu") %>% left_join(taxonomy)
+
+conc_contams <- conc_cor2 %>% 
+  filter(BH < 0.25 & r < 0)
+
+conc_real <- conc_cor2 %>% 
+  filter(r > 1)
+
+main_glass_contams <- conc_contams$otu
+
+(correlations_within_glass %>% 
+    mutate(aldex_contam = if_else(otu %in% main_glass_contams, TRUE, FALSE)) %>% 
+    ggplot(aes(mean_cor_w_other_glass, num_pos_minus_neg, color = aldex_contam, label = otu, taxonomy = name)) + geom_point() + geom_vline(xintercept = 0.7) + geom_hline(yintercept = 100)) %>% plotly::ggplotly()
+
+```
+
+
+
+
+
+Find other otus that seem to be highly correlated with main glass contams identified
+```{r}
+otus_correlated_w_main_glass_contams <- correlation_table %>%
+  filter(!otu_1 %in% main_glass_contams & otu_2 %in% main_glass_contams & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_glass = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) 
+
+
+otus_correlated_w_main_glass_contams %>% ggplot(aes(mean_cor_w_glass)) + geom_histogram()
+otus_correlated_w_main_glass_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram() + scale_x_log10()
+otus_correlated_w_main_glass_contams %>% ggplot(aes(mean_cor_w_glass, num_pos_minus_neg, color = mean_cor_w_glass)) + geom_point() + geom_vline(xintercept = 0.65) + geom_hline(yintercept = 10)
+
+non_glass_contams <- otus_correlated_w_main_glass_contams %>% filter(num_pos_minus_neg > 10 & mean_cor_w_glass > 0.65) %>% .$otu
+
+#Add to master table
+#contam_ident <- contam_ident %>% mutate(prop_cor_W_main_glass = if_else(otu %in% non_glass_contams, TRUE, FALSE))
+```
+
+
+Final list of reagent-associated contaminants
+```{r}
+
+rel_abund_in_samples <- as.data.frame(abund_mat) %>% 
+  dplyr::select(-negative_control_samples) %>% 
+  rowSums() %>% 
+  as.data.frame() %>% 
+  mutate(rel_abund = ./sum(.), otu = rownames(abund_mat)) %>% 
+  filter(rel_abund > 0)
+
+glass_only <- setdiff(rel_abund_in_glass$otu, rel_abund_in_samples$otu)
+
+reagent_associated_contams <- c(main_glass_contams,non_glass_contams, glass_only)
+```
+
+ASVs associated with known lab contams
+```{r}
+
+human <- c("refseq_9606") ## Human
+rhodoluna <- c("gtdb_214205") ## Rhodoluna
+tenM3C3 <- c("gtdb_2483401") ## Microbacterium sp. 10M-3C3
+e_coli <- c("gtdb_70117", "gtdb_81387", "130876")
+cutibacterium_acnes <- "gtdb_110905"
+
+
+#"334542", "132682" == Rhodococcus qingshengii
+
+
+lab_contam_otus <- c(human, rhodoluna, tenM3C3, e_coli, cutibacterium_acnes)
+
+lab_contaminant_seqs_in_concrete <- data.frame(otu = lab_contam_otus)
+
+lab_contams_w_taxonomy <- left_join(lab_contaminant_seqs_in_concrete,taxonomy)
+
+
+#determine the intercorrelation of the lab contams
+lab_contam_intercorrelation <- correlation_table %>%
+  filter(otu_1 %in% lab_contam_otus & otu_2 %in% lab_contam_otus & otu_1 != otu_2) %>% 
+  filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_lab = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_lab_contams <- correlation_table %>%
+  filter(!otu_1 %in% lab_contam_otus & otu_2 %in% lab_contam_otus & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_lab = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_lab_contams %>% ggplot(aes(mean_cor_w_lab)) + geom_histogram()
+
+otus_correlated_w_lab_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+
+otus_correlated_w_lab_contams %>% ggplot(aes(num_pos_minus_neg, mean_cor_w_lab, color = mean_cor_w_lab)) + geom_point()
+
+lab_correlated_contams <- otus_correlated_w_lab_contams %>% filter(num_pos_minus_neg >= 1) %>% .$otu
+
+lab_correlated_contam_tax <- taxonomy %>% filter(otu %in% lab_correlated_contams)
+```
+
+
+All contaminants identified so far
+```{r}
+all_contaminant_otus <- c(reagent_associated_contams,lab_correlated_contams,lab_contam_otus)
+```
+
+
+Re-check for any otus associated with combined contams
+```{r}
+otus_correlated_w_all_contams <- correlation_table %>%
+  filter(!otu_1 %in% all_contaminant_otus & otu_2 %in% all_contaminant_otus & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_all = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+  dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_all_contams %>% ggplot(aes(mean_cor_w_all)) + geom_histogram()
+otus_correlated_w_all_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+otus_correlated_w_all_contams %>% 
+  filter(mean_cor_w_all >= 0 & num_pos_minus_neg >= 0) %>% 
+  ggplot(aes(mean_cor_w_all, num_pos_minus_neg)) + geom_point() + scale_x_log10() + geom_vline(xintercept = 0.7)
+
+additional_contams <- otus_correlated_w_all_contams %>% filter(mean_cor_w_all > 0.7 & number_pos_cors > 100) %>% .$otu
+
+
+additional_contam_tax <- taxonomy %>% filter(otu %in% additional_contams)
+```
+
+
+Healthy skepticism about any taxa in negative controls that haven't been classified as contaminants yet... 
+Check if they are more correlated with identified contams or other organisims
+```{r}
+all_contams <- c(all_contaminant_otus,additional_contams) %>% unique() 
+
+remaining_neg_orgs <- rel_abund_in_glass %>% 
+  filter(!otu %in% all_contams)
+
+remaining_neg_cor <- correlation_table %>%
+  filter(otu_1 %in% remaining_neg_orgs$otu & !otu_2 %in% remaining_neg_orgs$otu & otu_1 != otu_2) %>% 
+  mutate(otu2_contam = if_else(otu_2 %in% all_contams, "contams", "non_contams")) %>% 
+  group_by(otu_1,otu2_contam) %>%
+  summarise(mean_cor = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+  dplyr::rename(otu = otu_1) %>% 
+  pivot_wider(otu,names_from = "otu2_contam",values_from = c("mean_cor","number_pos_cors","number_neg_cors","num_pos_minus_neg")) %>% 
+  left_join(taxonomy) %>% 
+  left_join(rel_abund_in_glass %>% dplyr::select(otu, rel_abund_in_negs = "rel_abund")) %>% 
+  left_join(rel_abund_in_samples %>% dplyr::select(otu, rel_abund_in_samples = "rel_abund"))
+
+
+(remaining_neg_cor %>% 
+  mutate(contam_cors_to_noncontams = number_pos_cors_contams/number_pos_cors_non_contams,
+         contam_cors_minus_noncontams = number_pos_cors_contams - number_pos_cors_non_contams) %>% 
+  ggplot(aes(mean_cor_non_contams / mean_cor_contams,rel_abund_in_samples / rel_abund_in_negs,label = name, color = log10(rel_abund_in_negs))) + 
+  geom_point() + 
+    scale_y_log10() +
+    scale_x_log10() +
+  #geom_abline(slope = 1)
+    scale_color_viridis_c() +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 1.2)
+  ) %>% plotly::ggplotly()
+
+neg_control_orgs_to_keep <- remaining_neg_cor %>% 
+  filter(mean_cor_non_contams / mean_cor_contams > 1.2 | is.na(mean_cor_contams)) 
+
+more_negs_to_filter <- remaining_neg_cor %>% 
+  filter(!otu %in% neg_control_orgs_to_keep$otu)
+
+```
+
+
+
+
+
+```{r}
+all_contams <- c(all_contaminant_otus,additional_contams,more_negs_to_filter$otu) %>% unique() 
+
+#all_contam_tax <- taxonomy %>% filter(otu %in% all_contams)
+
+data.frame(taxonomy_id = all_contams) %>% write_tsv("results/contaminants.txt")
+
+#Make decontaminated table
+
+read_tsv("results/braken_count_table.tsv") %>% 
+  filter(!taxonomy_id %in% all_contams) %>% 
+  write_tsv("results/decontaminated_bracken_count_table.tsv")
+
+
+#contam_tax <- taxonomy %>% filter(otu %in% all_contams)
+
+```
+
+
+##Percent contamination plots
+```{r}
+
+contaminants <- read_tsv("results/contaminants.txt")
+
+raw_table <- read_tsv("results/braken_count_table.tsv") 
+
+taxonomy <- raw_table %>% 
+  dplyr::select(taxonomy,taxonomy_id)
+
+long_raw_table <- raw_table %>% 
+  pivot_longer(-c("taxonomy_id","taxonomy"),
+               names_to = "sample",
+               values_to = "count") %>% 
+  mutate(contaminant = if_else(taxonomy_id %in% contaminants$taxonomy_id, TRUE, FALSE))
+
+sample_sums <- long_raw_table %>% 
+  group_by(sample) %>% 
+  summarise(count_total = sum(count))
+
+sample_contam_summary <- long_raw_table %>% 
+  filter(contaminant == TRUE) %>% 
+  group_by(sample) %>% 
+  summarise(contaminant_total = sum(count)) %>% 
+  left_join(sample_sums) %>% 
+  mutate(percent_contam = contaminant_total / count_total * 100,
+         sample_wo_replicate = str_remove(sample, "[a-z]"),
+         replicate = str_remove(sample, "[A-Z,0-9]*"))
+
+#Add percent contamination to the metadata file
+read_tsv("data/metadata.tsv") %>% 
+  left_join(sample_contam_summary %>% dplyr::select(sample,percent_contam)) %>% 
+  write_tsv("data/metadata.tsv")
+
+per_contam_summary <- long_raw_table %>% 
+  filter(contaminant == TRUE) %>% 
+  group_by(sample) %>% 
+  mutate(sample_total = sum(count),
+         rel_abund = count / sample_total) %>% 
+  ungroup() %>% 
+  group_by(taxonomy_id) %>% 
+  summarise(abund = sum(rel_abund)) %>% 
+    ungroup() %>% 
+    mutate(rel_abund = abund / sum(abund) * 100) %>% 
+  left_join(taxonomy)
+
+
+per_contam_genus_summary <- per_contam_summary %>% 
+  mutate(taxonomy = str_remove(taxonomy, "; s__.*")) %>% 
+  group_by(taxonomy) %>% 
+  summarise(rel_abund = sum(rel_abund))
+
+(contamination_summary <- sample_contam_summary %>% 
+  filter(!str_detect(sample, "NEG")) %>% 
+  ggplot(aes(reorder(sample_wo_replicate,-percent_contam), 100 - percent_contam, color = replicate)) + 
+  geom_jitter(width = 0.2) + 
+  #coord_flip() +
+  scale_color_manual(values = c("#4349bf","grey60", "#ffcb21")) +
+  labs(x = NULL,
+       y = "Percent non-contaminants") +
+  theme_bw() +   
+  theme(axis.text.x =  element_text(angle = 45, hjust = 1, vjust = 1))
+)
+
+ggsave(plot = contamination_summary, filename = "results/contamination_summary.png", width = 4, height = 1.5, dpi = 600, scale = 1.75)
+ggsave(plot = contamination_summary, filename = "results/contamination_summary.pdf", width = 4, height = 1.5, dpi = 600, scale = 1.75)
+
+```
+
+
+
+K-mer containment vs taxonomic decontamination 
+```{r}
+
+metadata <- read_tsv("data/metadata.tsv")
+
+neg_controls <- metadata %>% filter(neg_control == TRUE) %>% pull("sample")
+
+dist <- read_tsv("code/dashing/dashing/dist_mat.txt") %>% 
+  dplyr::rename(s1 = "##Names") %>% 
+  pivot_longer(-s1,names_to = "s2", values_to = "containment") %>% 
+  mutate(across(c("s1","s2"), ~str_remove(.x,".*files\\/")),
+         across(c("s1","s2"), ~str_remove(.x,"_R1.*")))
+
+dist_negs <- dist %>% 
+  filter(s1 %in% neg_controls,
+         !s2 %in% neg_controls,
+         !str_detect(s1,"NEG"),
+         !str_detect(s2,"NEG"),
+         s1 != s2) %>% 
+  group_by(s2) %>% 
+  arrange(desc(containment)) %>% 
+  mutate(sim_rank = row_number()) %>% 
+  filter(sim_rank == 1) %>% 
+  dplyr::rename(contamination = "containment",
+                most_similar_negative_control = "s1",
+                sample = "s2") %>% 
+  dplyr::select(-sim_rank)
+
+
+
+containment_and_contamination <- sample_contam_summary %>% 
+  left_join(dist_negs)
+
+
+(containment_and_contamination %>% 
+  ggplot(aes(contamination, percent_contam, label = sample)) +
+  geom_point() + scale_x_log10()) %>% plotly::ggplotly()
+
+
+```
+
+
+
+
+
+
+
+
+##MetacodeR plots
+MetacodeR plots for analyzing the effects of decontamination 
+
+
+Pre-decontamination
+```{r}
+
+library(metacoder)
+library(tidyverse)
+
+
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  filter(type == "concrete")
+  
+
+taxonomy <- bind_rows(read_tsv("data/reference/gtdb_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy),
+                      read_tsv("data/reference/refseq_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  dplyr::rename(name = "taxonomy", otu = "taxonomy_id")
+
+samples <- simple_meta$sample
+
+contaminants <- read_tsv("results/contaminants.txt") %>% pull("taxonomy_id")
+
+wide_rel.abund <- abund_mat %>% as.data.frame() %>% 
+  rownames_to_column("otu") %>% 
+  left_join(taxonomy %>% rename(taxonomy = "name")) %>% 
+  pivot_longer(-c("otu", "taxonomy"), names_to = "sample", values_to = "count") %>% 
+  filter(sample %in% simple_meta$sample) %>% 
+  #mutate(rel_abund = count / sum(count)) %>%
+  filter(otu %in% contaminants) %>% 
+  pivot_wider(id_cols = c("otu","taxonomy"),names_from = "sample", values_from = count)
+
+
+rel.abund <- abund_mat %>% as.data.frame() %>% 
+  rownames_to_column("otu") %>% 
+  left_join(taxonomy %>% rename(taxonomy = "name")) %>% 
+  pivot_longer(-c("otu", "taxonomy"), names_to = "sample", values_to = "count") %>% 
+  filter(sample %in% simple_meta$sample) %>% 
+  group_by(sample) %>% 
+  mutate(rel_abund = count / sum(count)) %>%
+  ungroup() %>% 
+  filter(otu %in% contaminants) %>% 
+  group_by(otu, taxonomy) %>% 
+  summarise(rel_abund = mean(rel_abund)) %>% 
+  #filter(str_detect(taxonomy, "Halobacteria")) %>% 
+  column_to_rownames("otu")
+
+obj <- parse_tax_data(rel.abund, class_cols = "taxonomy", class_sep = "; ",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+#converting to relative abundance
+#obj$data$tax_data <- calc_obs_props(obj, "tax_data")
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data")
+
+#obj$data$tax_abund <- obj$data$tax_abund %>% rename(rel_abund = "metag")
+
+#obj2 <- obj %>% metacoder::filter_taxa(taxon_ranks == "g", supertaxa = TRUE, reassign_obs = TRUE, drop_obs = TRUE)
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(tree <- obj %>%
+    metacoder::filter_taxa(rel_abund > 0.01) %>% 
+    heat_tree(node_label = taxon_names,
+          node_size = rel_abund,
+          node_size_range = c(0.00175,0.045),
+          node_label_size_range = c(.015,.025),
+          node_size_axis_label = "OTU count",
+          initial_layout = "reingold-tilford", layout = "davidson-harel",
+          overlap_avoidance = 10,
+          node_label_max = 75,
+          node_color = rel_abund,
+          node_color_range = c("gray","gray","gray"),
+          node_color_axis_label = "Relative abundance")
+)
+ggsave(plot = tree,filename = "results/contaminants.png", width = 6, height = 4.5, dpi = 600)
+ggsave(plot = tree,filename = "results/contaminants.pdf", width = 6, height = 4.5, dpi = 600)
+
+```
+
+Combined metacodeR and contamination summary figure
+```{r}
+library(patchwork)
+
+tree_png <- png::readPNG("results/contaminants.png", native = TRUE) %>% wrap_elements()
+summary_png <- png::readPNG("results/contamination_summary.png", native = TRUE) %>% wrap_elements()
+
+combined_tree_and_contam <- (tree_png / summary_png + plot_annotation(tag_levels = "A") + plot_layout(heights = c(.7,.3)) & theme(plot.tag.position = c(0, 0.98),
+        plot.tag = element_text(size = 16, hjust = 0, vjust = 0)))
+
+ggsave(plot = combined_tree_and_contam,filename = "results/contamination_and_tree.png", height = 4.5, width = 4, dpi = 600, scale = 1.5)
+
+
+```
+
+
+
+
+
+
+
+This is just to prep for some cytoscape plotting
+```{}
+
+total_abundance <- abundance %>% 
+  pivot_longer(-c(name, taxonomy_id),names_to = "sample", values_to = "abund") %>% 
+  group_by(name, taxonomy_id) %>% 
+  summarise(abund = sum(abund))
+
+tax_w_1k_obs <- total_abundance %>% 
+  filter(abund > 1000) %>% 
+  pull(taxonomy_id)
+
+
+abund_props <- correlation_table %>% 
+  filter(otu_1 %in% tax_w_1k_obs & otu_2 %in% tax_w_1k_obs)
+
+
+abund_props %>% write_tsv("~/abund_props.tsv")
+total_abundance %>% filter(taxonomy_id %in% tax_w_1k_obs) %>% write_tsv("~/tax_abund.tsv")
+
+```
+
+
+
+
+
+
+
+#Sparcc
+
+
+Read in metadata and Bracken count data:
+```{}
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/combined_bracken.tsv")
+
+simple_rel.abund <- rel.abund %>% 
+  column_to_rownames()
+  dplyr::select(-c(taxonomy,R,D,P,C,O,F,G,S,rank, NCBI_id))
+```
+
+
+```{r}
+
+#Read in metadata
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  mutate(asr = factor(asr, levels = c("#N/A", "?","no","low","moderate","yes","high")),
+         extraction_date = lubridate::mdy(extraction_date))
+
+#Get the negative control samples
+negative_control_samples <- simple_meta %>% 
+  filter(neg_control == TRUE) %>% 
+  pull(sample)
+
+abund_mat <- read_tsv("results/braken_count_table.tsv") %>% dplyr::select(-taxonomy) %>% column_to_rownames("taxonomy_id")
+
+
+taxonomy <- bind_rows(read_tsv("data/reference/gtdb_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy),
+                      read_tsv("data/reference/refseq_kraken_tax.tsv") %>% dplyr::select(taxonomy_id,taxonomy)) %>% 
+  dplyr::rename(name = "taxonomy", otu = "taxonomy_id")
+```
+
+
+
+```{r}
+
+
+sparcc <- read_tsv("data/sparcc/SPARCC_cor.tsv",num_threads = 4)
+
+sparcc_pval <- read_tsv("data/sparcc/SPARCC_pvalues.tsv",num_threads = 4)
+
+sparcc_pval_long <- sparcc_pval %>% 
+  dplyr::rename(otu_1 = "#OTU ID") %>% 
+  pivot_longer(-otu_1, names_to = "otu_2", values_to = "p.value")
+
+sparcc_long <- sparcc %>% 
+  dplyr::rename(otu_1 = "#OTU ID") %>% 
+  pivot_longer(-otu_1, names_to = "otu_2", values_to = "cor") %>% 
+  left_join(sparcc_pval_long) %>% 
+  mutate(p.FDR = p.adjust(p.value,"fdr")) %>% 
+  filter(p.FDR <= 0.05)
+
+correlation_table <- sparcc_long %>% 
+  filter(otu_1 != otu_2) 
+
+
+#Make table of OTU relative abundance in negative control samples
+rel_abund_in_glass <- as.data.frame(abund_mat) %>% 
+  dplyr::select(negative_control_samples) %>% 
+  rowSums() %>% 
+  as.data.frame() %>% 
+  mutate(rel_abund = ./sum(.), otu = rownames(abund_mat)) %>% 
+  filter(rel_abund > 0) %>% 
+  dplyr::select(otu, rel_abund) %>% 
+  left_join(taxonomy)
+
+prev_in_glass <- as.data.frame(abund_mat) %>% 
+  dplyr::select(negative_control_samples) %>% 
+  rowwise() %>%
+  mutate(prevalence = sum(c_across() > 0) / ncol(.)) %>% 
+  ungroup() %>% 
+  bind_cols(data.frame(otu = rownames(abund_mat))) %>% 
+  filter(prevalence > 0) %>% 
+  dplyr::select(otu, prevalence) %>% 
+  left_join(taxonomy)
+
+prev_and_abund_in_glass <- prev_in_glass %>% left_join(rel_abund_in_glass)
+
+prev_and_abund_in_glass %>% ggplot(aes(rel_abund,prevalence)) + geom_bin2d() + scale_x_log10()
+
+
+#Get a list of otus found in negative control samples
+neg_control_otus <- prev_and_abund_in_glass %>% 
+  filter(rel_abund > 0 & prevalence > 0.2) %>% 
+  pull("otu")
+
+
+#write_delim(rel_abund_in_glass,"data/processed/otu_rel_abund_in_glass_samples.tsv", delim = "\t")
+
+correlations_within_glass <- correlation_table %>%
+  filter(otu_1 %in% neg_control_otus & otu_2 %in% neg_control_otus & otu_1 != otu_2) %>% #only look at correlations between otus in glass and remove self-correlations
+  #filter(cor >= 0.3 | cor <= -0.3) %>% #only look at stronger correlations (.3 is very common for SPARCC, almost guaranteed that p.value is < 0.05)
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_other_glass = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+correlations_within_glass %>% ggplot(aes(mean_cor_w_other_glass)) + geom_histogram()
+correlations_within_glass %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+correlations_within_glass %>% ggplot(aes(mean_cor_w_other_glass, num_pos_minus_neg)) + geom_point() + geom_vline(xintercept = 0.35) + geom_hline(yintercept = 100)
+
+main_glass_contams <- correlations_within_glass %>% filter(num_pos_minus_neg > 100 & mean_cor_w_other_glass > 0.35) %>% .$otu
+
+```
+
+Find other otus that seem to be highly correlated with main glass contams identified
+```{r}
+otus_correlated_w_main_glass_contams <- correlation_table %>%
+  filter(!otu_1 %in% main_glass_contams & otu_2 %in% main_glass_contams & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_glass = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_main_glass_contams %>% ggplot(aes(mean_cor_w_glass)) + geom_histogram()
+otus_correlated_w_main_glass_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram() + scale_x_log10()
+otus_correlated_w_main_glass_contams %>% ggplot(aes(mean_cor_w_glass, num_pos_minus_neg, color = mean_cor_w_glass)) + geom_point() + geom_vline(xintercept = 0.35) + geom_hline(yintercept = 10)
+
+
+otus_correlated_w_main_glass_contams %>% mutate(contam_score = mean_cor_w_glass * num_pos_minus_neg) %>% 
+  filter(num_pos_minus_neg > 0) %>% 
+  ggplot(aes(num_pos_minus_neg,contam_score)) + geom_point() + scale_y_log10() + scale_x_log10() + geom_smooth(method = "lm",se = TRUE, level = 0.5)
+
+
+non_glass_contams <- otus_correlated_w_main_glass_contams %>% filter(num_pos_minus_neg > 100 | mean_cor_w_glass > 0.35) %>% .$otu
+
+#Add to master table
+#contam_ident <- contam_ident %>% mutate(prop_cor_W_main_glass = if_else(otu %in% non_glass_contams, TRUE, FALSE))
+```
+
+
+Final list of reagent-associated contaminants
+```{r}
+
+rel_abund_in_samples <- as.data.frame(abund_mat) %>% 
+  dplyr::select(-negative_control_samples) %>% 
+  rowSums() %>% 
+  as.data.frame() %>% 
+  mutate(rel_abund = ./sum(.), otu = rownames(abund_mat)) %>% 
+  filter(rel_abund > 0)
+
+glass_only <- setdiff(rel_abund_in_glass$otu, rel_abund_in_samples$otu)
+
+reagent_associated_contams <- c(main_glass_contams,non_glass_contams, glass_only)
+```
+
+ASVs associated with known lab contams
+```{r}
+
+human <- c("refseq_9606") ## Human
+rhodoluna <- c("gtdb_214205") ## Rhodoluna
+tenM3C3 <- c("gtdb_2483401") ## Microbacterium sp. 10M-3C3
+e_coli <- c("gtdb_70117", "gtdb_81387", "130876")
+cutibacterium_acnes <- "gtdb_110905"
+acinetobacter_guillouiae <- "gtdb_152786"
+pedobacter <- "gtdb_224738"
+
+#"334542", "132682" == Rhodococcus qingshengii
+
+
+lab_contam_otus <- c(human, rhodoluna, tenM3C3, e_coli, cutibacterium_acnes, acinetobacter_guillouiae, pedobacter)
+
+lab_contaminant_seqs_in_concrete <- data.frame(otu = lab_contam_otus)
+
+lab_contams_w_taxonomy <- left_join(lab_contaminant_seqs_in_concrete,taxonomy)
+
+
+#determine the intercorrelation of the lab contams
+lab_contam_intercorrelation <- correlation_table %>%
+  filter(otu_1 %in% lab_contam_otus & otu_2 %in% lab_contam_otus & otu_1 != otu_2) %>% 
+  filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_lab = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_lab_contams <- correlation_table %>%
+  filter(!otu_1 %in% lab_contam_otus & otu_2 %in% lab_contam_otus & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_lab = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+ dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_lab_contams %>% ggplot(aes(mean_cor_w_lab)) + geom_histogram()
+
+otus_correlated_w_lab_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+
+otus_correlated_w_lab_contams %>% ggplot(aes(num_pos_minus_neg, mean_cor_w_lab, color = mean_cor_w_lab)) + geom_point() + geom_hline(yintercept = 0.45)
+
+lab_correlated_contams <- otus_correlated_w_lab_contams %>% filter(num_pos_minus_neg >= 1 & mean_cor_w_lab > 0.45 ) %>% .$otu
+
+lab_correlated_contam_tax <- taxonomy %>% filter(otu %in% lab_correlated_contams)
+```
+
+
+All contaminants identified so far
+```{r}
+all_contaminant_otus <- c(reagent_associated_contams,lab_correlated_contams,lab_contam_otus)
+```
+
+
+Re-check for any otus associated with combined contams
+```{r}
+otus_correlated_w_all_contams <- correlation_table %>%
+  filter(!otu_1 %in% all_contaminant_otus & otu_2 %in% all_contaminant_otus & otu_1 != otu_2) %>% 
+  #filter(cor >= 0.3 | cor <= -0.3) %>%
+  group_by(otu_1) %>%
+  summarise(mean_cor_w_all = mean(cor), number_pos_cors = sum(cor > 0), number_neg_cors = sum(cor < 0), num_pos_minus_neg = number_pos_cors - number_neg_cors) %>%
+  dplyr::rename(otu = otu_1) %>% 
+  left_join(taxonomy)
+
+
+otus_correlated_w_all_contams %>% ggplot(aes(mean_cor_w_all)) + geom_histogram()
+otus_correlated_w_all_contams %>% ggplot(aes(number_pos_cors)) + geom_histogram()
+otus_correlated_w_all_contams %>% 
+  filter(mean_cor_w_all >= 0 & num_pos_minus_neg >= 0) %>% 
+  ggplot(aes(num_pos_minus_neg,mean_cor_w_all)) + geom_point() + scale_x_log10()
+
+additional_contams <- otus_correlated_w_all_contams %>% filter(mean_cor_w_all > 0.3 | number_pos_cors > 50) %>% .$otu
+
+
+```
+
+```{r}
+sparcc_all_contams <- c(all_contaminant_otus,additional_contams) %>% unique() 
+
+
+non_contams <- setdiff(rownames(abund_mat),all_contams)
+
+#data.frame(taxonomy_id = all_contams) %>% write_tsv("results/contaminants.txt")
+
+
+contam_tax <- taxonomy %>% filter(otu %in% all_contams)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

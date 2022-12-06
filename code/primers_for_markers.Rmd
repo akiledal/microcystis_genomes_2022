@@ -1,0 +1,37 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(DECIPHER)
+
+fas <- "~/bioinformatics/microcystis_genomes_2022/data/marker_genes/identified_variants/pgi_called_variants.fasta"
+
+fas2 <- "~/bioinformatics/microcystis_genomes_2022/data/reference/marker_genes/multiple_refs/pgi.fa"
+
+dbConn <- dbConnect(SQLite(), ":memory:")
+N <- Seqs2DB(fas, "FASTA", dbConn, "",replaceTbl = TRUE)
+N <- Seqs2DB(fas2, "FASTA", dbConn, "",replaceTbl = TRUE)
+
+desc <- dbGetQuery(dbConn, "select description from Seqs")$description
+Add2DB(data.frame(identifier=desc, stringsAsFactors=FALSE), dbConn)
+
+
+# Designing primers for sequencing experiments:
+TYPE <- "sequence"
+MIN_SIZE <- 150 # base pairs
+MAX_SIZE <- 450
+RESOLUTION <- 5 # k-mer signature
+LEVELS <- 5 # max number of each k-mer
+ENZYMES <- NULL # required for sequencing
+
+primers <- DesignSignatures(dbConn,tblName = "Seqs",
+    type=TYPE,
+    minProductSize=MIN_SIZE,
+    maxProductSize=MAX_SIZE,
+    resolution=RESOLUTION,
+    levels=LEVELS,
+    enzymes=ENZYMES)
+```
+

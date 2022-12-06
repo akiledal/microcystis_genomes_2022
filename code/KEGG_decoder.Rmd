@@ -1,0 +1,833 @@
+---
+title: "KEGG Decoder"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+library(tidyverse)
+library(vegan)
+```
+
+
+This notebook processes prodigal annotations of MAGs for input to BLAST/GHOSTkoala, which can subsequently be analyzed with KEGGdecoder.
+
+Protein sequences were annotated for each dereplicated MAG with prodigal. However, the headers for these files are messy and we want to concatenate the multiple files into one for easier submission to BLAST/GHOSTkoala. KEGGdecoder expects headers with the following format: MAG_aaID. It automatically determines groupings based on everything to the left of the first '_'. A concatenated file of genes from all bins, with cleaned headers, is produced by the prepare_MAG_genes_for_ghostKOALA.R script, executed by snakemake.
+
+
+## MAGs annotated
+
+Read in bin info and file mapping KEGGdecoder names to original bin names
+```{r}
+mag_tax <- read_tsv("data/gtdb/gtdbtk.bac120.summary.tsv") %>% 
+  dplyr::select(-red_value) 
+
+drep_bins <- read_csv("data/drep/data_tables/Wdb.csv") %>% pull("genome") %>% str_remove(".fasta")
+
+checkm <- read_csv("data/drep/data_tables/Chdb.csv") %>% 
+  mutate(old_mag_name = str_remove(`Bin Id`, ".fasta")) %>% 
+  select(old_mag_name, Completeness, Contamination, `Genome size (bp)`, `Strain heterogeneity`)
+  
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+mag_map <- read_tsv("data/kegg/mag_name_map.tsv") %>% 
+  left_join(checkm)
+```
+
+
+GhostKOALA results
+```{r}
+GhostKOALA <- read.delim("data/kegg/mag_user_ko.txt",col.names = c("seq","ko"),header = F) %>% 
+  filter(ko != "") %>% 
+  mutate(kegg_decoder_name = str_remove(seq,"_.*")) %>% 
+  left_join(mag_map %>% 
+              dplyr::select(kegg_decoder_name,classification))
+
+unique_ko <- GhostKOALA %>% 
+  dplyr::select(-seq) %>% 
+  group_by(kegg_decoder_name) %>% 
+  distinct()
+
+ko_counts <- GhostKOALA %>% 
+  group_by(kegg_decoder_name,ko) %>% 
+  summarise(count = n())
+
+ko_count_matrix <- ko_counts %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = kegg_decoder_name,values_from = count,values_fill = 0) %>% 
+  column_to_rownames("ko") %>% 
+  write_tsv("data/kegg/bin_ko_counts.tsv")
+```
+
+NMDS for all bins
+```{r}
+bc_dist <- vegan::vegdist(t(ko_count_matrix))
+
+nmds <- vegan::metaMDS(bc_dist,k=2,trymax=1000)
+
+nmds_coords <- nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("kegg_decoder_name") %>% 
+  left_join(mag_map) %>% 
+  mutate(genus = str_remove(classification,";s__.*"))
+
+(nmds_coords %>% ggplot(aes(MDS1,MDS2,color = genus)) +
+  geom_point()) %>% plotly::ggplotly()
+```
+
+
+NMDS for drep'd bins
+```{r}
+drep_ko_counts <- ko_count_matrix %>% 
+  select(any_of(mag_map %>% 
+           filter(old_mag_name %in% drep_bins) %>%
+           pull("kegg_decoder_name"))
+         )
+
+drep_bc_dist <- vegan::vegdist(t(drep_ko_counts))
+
+drep_nmds <- vegan::metaMDS(drep_bc_dist,k=2,trymax=1000)
+
+drep_nmds_coords <- drep_nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("kegg_decoder_name") %>% 
+  left_join(mag_map) %>% 
+  mutate(genus = str_remove(classification,";s__.*"),
+         sequencingID = str_remove(old_mag_name,"_bin.*")) %>% 
+  left_join(read_tsv("data/strain_to_seq_sample_map.tsv"))
+
+(drep_nmds_coords %>% ggplot(aes(MDS1,MDS2,color = genus, strain = strainID, bin = old_mag_name)) +
+  geom_point()) %>% plotly::ggplotly()
+```
+
+
+NMDS for drep'd heterotroph bins
+```{r}
+drep_ko_counts <- ko_count_matrix %>% 
+  select(any_of(mag_map %>% 
+           filter(old_mag_name %in% drep_bins,
+                  !str_detect(classification,"Cyanobacteria")) %>% 
+           pull("kegg_decoder_name"))
+         ) %>% t()
+
+drep_nmds <- vegan::metaMDS(drep_ko_counts,k=2,trymax=1000)
+
+drep_nmds_coords <- drep_nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("kegg_decoder_name") %>% 
+  left_join(mag_map) %>% 
+  mutate(genus = str_remove(classification,";s__.*"),
+         sequencingID = str_remove(old_mag_name,"_bin.*")) %>% 
+  left_join(read_tsv("data/strain_to_seq_sample_map.tsv"))
+
+(drep_nmds_coords %>% ggplot(aes(MDS1,MDS2,color = genus, strain = strainID, bin = old_mag_name)) +
+  geom_point()) %>% plotly::ggplotly()
+
+mag_map_w_sample <- mag_map %>% 
+  mutate(sample = str_remove_all(old_mag_name,"_bin.*"))
+
+
+env_data <- read_tsv("data/env_data/merged_env_data.tsv") %>% 
+  filter(`Sample Depth (category)` == "Surface")
+
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+samples_to_use <- read_tsv("data/samples_to_use.tsv")
+
+strain_collection_info <- read_tsv("data/strain_collection_information.txt") %>% 
+  dplyr::rename(Date = "Collection Date",
+         Site = "Isolation Location") %>% 
+  dplyr::mutate(Date = lubridate::mdy(Date),
+         Site = if_else(str_detect(Site, "WE8-[1-2]"),"WE8",Site),
+         Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  left_join(seqID_to_strainID %>% 
+              dplyr::rename(Culture = "strainDB")) %>% 
+  filter(sequencingID %in% samples_to_use$samples_to_use)
+
+strain_env_data <- strain_collection_info %>% 
+  left_join(env_data)
+
+metadata_for_envfit <- strain_env_data %>% 
+  dplyr::select(sequencingID, `Station Depth (m)`, Day_of_year,`Secchi Depth (m)`,`CTD Temperature (°C)`,`Dissolved Microcystin (µg/L)`,`Particulate Microcystin (µg/L)`,`CTD Tramission (%)`,`Extracted Phycocyanin (µg/L)`,`Extracted Chlorophyll a (µg/L)`) %>% 
+  filter(!is.na(`Dissolved Microcystin (µg/L)`),
+          !is.na(`Extracted Phycocyanin (µg/L)`)) %>% 
+  column_to_rownames("sequencingID") %>%
+  scale()
+
+het_bins_w_env_data <- drep_ko_counts %>% 
+  as.data.frame() %>% 
+  rownames_to_column("kegg_decoder_name") %>% 
+  select(kegg_decoder_name) %>% 
+  left_join(mag_map_w_sample) %>% 
+  left_join(metadata_for_envfit %>%
+              as.data.frame() %>% 
+              rownames_to_column("sample")) %>% 
+  filter(!is.na(Day_of_year))
+
+filt_het_ko_counts <- drep_ko_counts[het_bins_w_env_data$kegg_decoder_name,]
+
+drep_nmds <- vegan::metaMDS(filt_het_ko_counts,k=2,trymax=1000)
+
+env_data_het_bins <- het_bins_w_env_data %>% 
+  select(-sample,-classification,-old_mag_name,-mag_fp) %>% 
+  column_to_rownames("kegg_decoder_name") %>% 
+  scale()
+
+en <- vegan::envfit(drep_nmds, env_data_het_bins, permutations = 999)
+
+spp.pval <- en$vectors$pvals %>% data.frame(p.value = .)
+spp.scrs <- as.data.frame(scores(en, display = "vectors")) 
+spp.scrs <- cbind(spp.scrs, Species = rownames(spp.scrs)) %>% 
+  cbind(spp.pval) %>% 
+  filter(p.value < 0.5)
+
+scrs <- as.data.frame(scores(drep_nmds, display = "sites"))  %>% 
+  rownames_to_column("kegg_decoder_name") %>% 
+  left_join(mag_map) %>% 
+  mutate(genus = str_remove(classification,";s__.*"),
+         sequencingID = str_remove(old_mag_name,"_bin.*")) %>% 
+  left_join(read_tsv("data/strain_to_seq_sample_map.tsv"))
+
+loadings <- as.data.frame(scores(drep_nmds, display = "species")) %>% rownames_to_column("ko")
+
+(nmds_heterotroph_ko_with_env <- ggplot(scrs) +
+  coord_fixed() + ## need aspect ratio of 1!
+  geom_segment(data = spp.scrs,
+               aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2),
+               arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  ggrepel::geom_label_repel(data = spp.scrs, aes(x = NMDS1, y = NMDS2, label = Species),
+            size = 2, 
+            alpha =0.6) +
+  geom_point(mapping = aes(x = NMDS1, y = NMDS2, genus = genus)) +
+  ggrepel::geom_label_repel(mapping = aes(x = NMDS1, y = NMDS2, label = genus),
+                            color = "red",
+                            size = 1, alpha = 0.7) +
+  labs(x = "NMDS1", y = "NMDS2") +
+  #geom_point(data = loadings, aes(x = NMDS1, y = NMDS2, ko = ko),size = 0.1, alpha = 0.4) +
+  annotate(geom = 'text', label = paste0("Stress: ", round(drep_nmds$stress,2)), x = -Inf, y = -Inf, hjust = -0.3, vjust = -0.6) +
+  theme_bw() ) 
+
+plotly::ggplotly(nmds_heterotroph_ko_with_env)
+
+ggsave(plot = nmds_heterotroph_ko_with_env,
+       file = "results/nmds_heterotroph_ko_with_env.png",
+       dpi = 300,
+       width = 6, 
+       height = 4,
+       scale = 2)
+
+```
+
+
+
+NMDS for Microcystis ko abundance with environmental parameters fit
+```{r}
+cyano_ko_counts <- ko_count_matrix %>% 
+  select(any_of(mag_map %>% 
+           filter(str_detect(classification,"Microcystis "),
+                  Completeness > 75) %>%
+           pull("kegg_decoder_name"))
+         )
+
+cyano_bin_sample <- mag_map %>% 
+  mutate(sequencingID = str_remove_all(old_mag_name,"_.*")) %>% 
+  filter(kegg_decoder_name %in% colnames(cyano_ko_counts)) %>% 
+  left_join(seqID_to_strainID)
+
+
+cyano_ko_counts_long <- cyano_ko_counts %>% 
+  rownames_to_column("ko") %>% 
+  pivot_longer(-ko, values_to = "abund", names_to = "kegg_decoder_name") %>% 
+  left_join(cyano_bin_sample %>% dplyr::select(kegg_decoder_name,sequencingID)) %>% 
+  select(-kegg_decoder_name) %>% 
+  group_by(ko,sequencingID) %>% 
+  summarise(abund = sum(abund)) %>% 
+  pivot_wider(values_from = abund, names_from = sequencingID) %>% 
+  ungroup() %>% 
+  column_to_rownames("ko")
+
+env_microcystis_abund <- metadata_for_envfit %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  filter(sample %in% colnames(cyano_ko_counts_long)) %>% 
+  column_to_rownames("sample")
+
+filtered_ko_matrix <- cyano_ko_counts_long[,rownames(env_microcystis_abund)] %>% 
+  filter(rowSums(.) != 0) %>% 
+  select(-any_of(c("ND-96","ND-88"))) %>%
+  t()
+
+nmds <- vegan::metaMDS(filtered_ko_matrix,
+                       k=2,trymax=1000)
+
+nmds_coords <- nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("assembly")
+
+en <- vegan::envfit(nmds, env_microcystis_abund[rownames(filtered_ko_matrix),], permutations = 999)
+
+(test <- nmds_coords %>% 
+    left_join(strain_collection_info %>% dplyr::rename(assembly = "sequencingID")) %>% 
+    ggplot(aes(MDS1,MDS2, sample = assembly, label = strainID)) +
+  geom_text()) %>% plotly::ggplotly()
+
+
+scrs <- as.data.frame(scores(nmds, display = "sites")) %>% 
+  rownames_to_column("sample") %>% 
+  left_join(seqID_to_strainID %>% rename(sample = "sequencingID"))
+
+loadings <- as.data.frame(scores(nmds, display = "species")) %>% rownames_to_column("ko")
+
+
+spp.pval <- en$vectors$pvals %>% data.frame(p.value = .)
+spp.scrs <- as.data.frame(scores(en, display = "vectors")) * 0.12
+spp.scrs <- cbind(spp.scrs, Species = rownames(spp.scrs)) %>% 
+  cbind(spp.pval) %>% 
+  filter(p.value < 0.5)
+
+(nmds_microcystis_env <- ggplot(scrs) +
+  coord_fixed() + ## need aspect ratio of 1!
+  geom_segment(data = spp.scrs,
+               aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2),
+               arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  ggrepel::geom_label_repel(data = spp.scrs, aes(x = NMDS1, y = NMDS2, label = Species),
+            size = 2) +
+  geom_point(mapping = aes(x = NMDS1, y = NMDS2), color = "red") +
+  ggrepel::geom_text_repel(mapping = aes(x = NMDS1, y = NMDS2, label = strainID), color = "red", 
+                            size = 2) +
+  #geom_point(data = loadings, aes(x = NMDS1, y = NMDS2, ko = ko),size = 0.1, alpha = 0.4) + 
+  theme_bw() +
+  annotate(geom = 'text', label = paste0("Stress: ", round(nmds$stress,2)), x = -Inf, y = -Inf, hjust = -0.3, vjust = -0.6) +
+  labs(x = "NMDS1", y = "NMDS2", title = "NMDS of KEGG KO abundance", subtitle = "With correlation of enivronmental data"))
+
+ggsave(plot = nmds_microcystis_env, 
+       file = "results/nmds_microcystis_env.png",
+       width = 6, height = 6,
+       scale = 1.5, 
+       dpi = 300)
+
+ggsave(plot = nmds_microcystis_env, 
+       file = "results/nmds_microcystis_env.pdf",
+       width = 6, height = 6,
+       scale = 1.5, 
+       dpi = 300)
+
+```
+
+
+NMDS of microcystis KO abundance, fit with heterotroph presence
+```{r}
+heterotroph_presence <- read_tsv("results/percent_abundance_bracken_genera.tsv") %>% 
+  select(genus, any_of(strain_collection_info$strainID)) %>% 
+  filter(!str_detect(genus,"Microcystis")) %>% 
+  column_to_rownames("genus") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("strainID") %>% 
+  left_join(seqID_to_strainID) %>% 
+  select(sequencingID,everything(),-strainID,-strainDB) %>% 
+  replace(is.na(.), 0) %>% 
+  column_to_rownames("sequencingID") %>% 
+  filter(rowSums(.) > 0) %>% 
+  rownames_to_column("sequencingID")
+
+en <- vegan::envfit(nmds, heterotroph_presence %>% filter(sequencingID %in% rownames(filtered_ko_matrix)), permutations = 999)
+
+(test <- nmds_coords %>% 
+    left_join(strain_collection_info %>% dplyr::rename(assembly = "sequencingID")) %>% 
+    ggplot(aes(MDS1,MDS2, sample = assembly, label = strainID)) +
+  geom_text()) %>% plotly::ggplotly()
+
+scrs <- as.data.frame(scores(nmds, display = "sites"))  %>% 
+  rownames_to_column("sample") %>% 
+  left_join(seqID_to_strainID %>% rename(sample = "sequencingID"))
+
+loadings <- as.data.frame(scores(nmds, display = "species")) %>% rownames_to_column("ko")
+
+spp.pval <- en$vectors$pvals %>% data.frame(p.value = .)
+spp.scrs <- as.data.frame(scores(en, display = "vectors")) * 0.15
+spp.scrs <- cbind(spp.scrs, Species = rownames(spp.scrs)) %>% 
+  cbind(spp.pval) %>% 
+  filter(p.value < 0.2)
+
+
+(nmds_microcystis_het <- ggplot(scrs) +
+  coord_fixed() + ## need aspect ratio of 1!
+  geom_segment(data = spp.scrs,
+               aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2),
+               arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  ggrepel::geom_label_repel(data = spp.scrs, aes(x = NMDS1, y = NMDS2, label = Species),
+            size = 2, 
+            alpha =0.6) +
+  geom_point(mapping = aes(x = NMDS1, y = NMDS2), color = "red") +
+  annotate(geom = 'text', label = paste0("Stress: ", signif(nmds$stress,3)), x = -Inf, y = -Inf, hjust = -0.3, vjust = -0.6) +
+  ggrepel::geom_label_repel(mapping = aes(x = NMDS1, y = NMDS2, label = strainID), 
+                            color = "red", 
+                            size = 2, alpha = 0.7) +
+  labs(x = "NMDS1", y = "NMDS2") +
+  #geom_point(data = loadings, aes(x = NMDS1, y = NMDS2, ko = ko),size = 0.1, alpha = 0.4) +
+  theme_bw() ) 
+
+
+ggsave(plot = nmds_microcystis_het,
+       file = "results/nmds_microcystis_het.png",
+       width = 4, height = 4,
+       scale = 1.5, 
+       dpi = 300)
+
+ggsave(plot = nmds_microcystis_het,
+       file = "results/nmds_microcystis_het.pdf",
+       width = 4, height = 4,
+       scale = 1.5, 
+       dpi = 300)
+
+```
+
+
+NMDS of microcystis heterotroph presence fit with environmental parameters
+```{r}
+heterotroph_presence <- read_tsv("results/percent_abundance_bracken_genera.tsv") %>% 
+  select(genus, any_of(strain_collection_info$strainID)) %>% 
+  filter(!str_detect(genus,"Microcystis")) %>% 
+  column_to_rownames("genus") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("strainID") %>% 
+  left_join(seqID_to_strainID) %>% 
+  select(sequencingID,everything(),-strainID,-strainDB) %>% 
+  replace(is.na(.), 0) %>% 
+  column_to_rownames("sequencingID") %>% 
+  filter(rowSums(.) > 0) 
+
+
+env_2 <- metadata_for_envfit %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sequencingID") %>% 
+  filter(sequencingID %in% 
+           rownames(heterotroph_presence))
+
+heterotrph_pres_filtered <- heterotroph_presence[env_2$sequencingID,]
+
+nmds_from_heterotroph_presence <- metaMDS(heterotrph_pres_filtered)
+
+en <- vegan::envfit(nmds_from_heterotroph_presence, scale(env_2 %>% select(-sequencingID)), permutations = 999)
+
+spp.pval <- en$vectors$pvals %>% data.frame(p.value = .)
+spp.scrs <- as.data.frame(scores(en, display = "vectors")) 
+spp.scrs <- cbind(spp.scrs, Species = rownames(spp.scrs)) %>% 
+  cbind(spp.pval) %>% 
+  filter(p.value < 0.5)
+
+scrs <- as.data.frame(scores(nmds_from_heterotroph_presence, display = "sites"))  %>% 
+  rownames_to_column("sample") %>% 
+  left_join(seqID_to_strainID %>% rename(sample = "sequencingID"))
+
+loadings <- as.data.frame(scores(nmds_from_heterotroph_presence, display = "species")) %>% rownames_to_column("ko")
+
+(nmds_microcystis_het <- ggplot(scrs) +
+  coord_fixed() + ## need aspect ratio of 1!
+  geom_segment(data = spp.scrs,
+               aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2),
+               arrow = arrow(length = unit(0.25, "cm")), colour = "grey") +
+  ggrepel::geom_label_repel(data = spp.scrs, aes(x = NMDS1, y = NMDS2, label = Species),
+            size = 2, 
+            alpha =0.6) +
+  geom_point(mapping = aes(x = NMDS1, y = NMDS2), color = "red") +
+  ggrepel::geom_label_repel(mapping = aes(x = NMDS1, y = NMDS2, label = strainID), 
+                            color = "red", 
+                            size = 2, alpha = 0.7) +
+  labs(x = "NMDS1", y = "NMDS2") +
+  #geom_point(data = loadings, aes(x = NMDS1, y = NMDS2, ko = ko),size = 0.1, alpha = 0.4) +
+  annotate(geom = 'text', label = paste0("Stress: ", signif(nmds_from_heterotroph_presence$stress,3)), x = -Inf, y = -Inf, hjust = -0.3, vjust = -0.6) +
+  theme_bw() ) 
+
+ggsave(plot = nmds_microcystis_het,
+       file = "results/nmds_from_heterotroph_abundance.png",
+       dpi = 300,
+       width = 4, 
+       height =4,
+       scale = 1.5)
+```
+
+PCA of environmental data associated with each Microcystis strain
+```{r}
+metadata_for_nmds <- metadata_for_envfit %>% 
+  as.data.frame() %>% rownames_to_column("sequencingID") %>% 
+  left_join(seqID_to_strainID) %>% 
+  select(strainID, everything(), -sequencingID, -strainDB) %>% 
+  column_to_rownames("strainID") %>% 
+  scale()
+
+pca_from_env_data <- rda(metadata_for_nmds)
+
+biplot(pca_from_env_data)
+
+smry <- summary(pca_from_env_data)
+df1  <- data.frame(smry$sites[,1:2])       # PC1 and PC2
+df2  <- data.frame(smry$species[,1:2])     # loadings for PC1 and PC2
+
+var_explained <- pca_from_env_data$CA$eig %>% 
+  data.frame(var_explained = .)
+
+(rda.plot <- ggplot(df1, aes(x=PC1, y=PC2)) + 
+  ggrepel::geom_text_repel(aes(label=rownames(df1)),size=4) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  geom_segment(data=df2, aes(x=0, xend=PC1, y=0, yend=PC2), 
+               color="red", arrow=arrow(length=unit(0.01,"npc"))) +
+  geom_text(data=df2, 
+            aes(x=PC1,y=PC2,label=rownames(df2),
+                hjust=0.5*(1-sign(PC1)),vjust=0.5*(1-sign(PC2))), 
+            color="red", size=4) +
+  labs(x = glue::glue("PC1 ({round(var_explained['PC1',],2)}% of variance explained)"),
+       y = glue::glue("PC2 ({round(var_explained['PC2',],2)}% of variance explained)")) +
+  theme_bw() +
+  coord_fixed(ratio = (var_explained['PC2',]/var_explained['PC1',])) 
+
+)
+
+ggsave("results/pca_environmental_data.png",width = 5, height = 3, dpi = 300, scale = 2)
+
+```
+
+
+Correlation of functional differences in cyanobacteria and heterotrophs by sample
+```{r}
+
+bin_presence_long <- read_tsv("results/percent_abundance_of_all_bins_with_50_percent_covered_bases.tsv") %>% 
+  pivot_longer(-c(bin,gtdb_classification),names_to = "strainID", values_to = "percent_abund") %>% 
+  filter(percent_abund > 0) %>% 
+  left_join(mag_map %>% rename(bin = "old_mag_name")) %>% 
+  left_join(seqID_to_strainID)
+
+cyano_ko_counts <- ko_count_matrix %>% 
+  rownames_to_column("ko") %>% 
+  pivot_longer(-ko,names_to = "kegg_decoder_name", values_to = "ko_abund") %>% 
+  filter(ko_abund > 0) %>% 
+  left_join(bin_presence_long) %>% 
+  filter(str_detect(gtdb_classification,"Cyanobacteria")) %>% 
+  mutate(scaled_ko_abund = ko_abund * percent_abund) %>% 
+  group_by(sequencingID, ko) %>% 
+  summarise(scaled_ko_abund = sum(scaled_ko_abund)) %>% 
+  pivot_wider(names_from = sequencingID, values_from = scaled_ko_abund,values_fill = 0) %>% 
+  column_to_rownames("ko") 
+
+heterotrophs_ko_counts <- ko_count_matrix %>% 
+  rownames_to_column("ko") %>% 
+  pivot_longer(-ko,names_to = "kegg_decoder_name", values_to = "ko_abund") %>% 
+  filter(ko_abund > 0) %>% 
+  left_join(bin_presence_long) %>% 
+  filter(!str_detect(gtdb_classification,"Cyanobacteria")) %>% 
+  mutate(scaled_ko_abund = ko_abund * percent_abund) %>% 
+  group_by(sequencingID, ko) %>% 
+  summarise(scaled_ko_abund = sum(scaled_ko_abund)) %>% 
+  pivot_wider(names_from = sequencingID, values_from = scaled_ko_abund,values_fill = 0) %>% 
+  column_to_rownames("ko") %>% 
+  select(any_of(colnames(cyano_ko_counts))) 
+
+cyano_ko_counts <- cyano_ko_counts %>% 
+  select(any_of(colnames(heterotrophs_ko_counts))) %>% 
+  relocate(colnames(heterotrophs_ko_counts))
+
+
+hetero_bc <- vegdist(t(heterotrophs_ko_counts))
+cyano_bc <- vegdist(t(cyano_ko_counts))
+
+(mantel_res <- mantel(hetero_bc,cyano_bc,parallel = 8,permutations = 10000,method = "spearman"))
+```
+
+
+
+## Assemblies annotated
+
+For assemblies: read in amino acid fasta files and update header
+```{r}
+amino_acid_fastas <- list.files("data/prodigal_assembly",pattern = "*.faa",full.names = TRUE)
+
+mag_map <- data.frame(mag_fp = amino_acid_fastas) %>% 
+  mutate(assembly = str_remove(mag_fp,"data/prodigal_assembly/") %>% str_remove(".faa"))
+```
+
+
+GhostKOALA results
+```{r}
+GhostKOALA <- read.delim("data/kegg/assembly_user_ko.txt",col.names = c("seq","ko"),header = F) %>% 
+  filter(ko != "") %>% 
+  mutate(assembly = str_remove(seq,"_.*"))
+
+unique_ko <- GhostKOALA %>% 
+  dplyr::select(-seq) %>% 
+  group_by(assembly) %>% 
+  distinct()
+
+ko_counts <- GhostKOALA %>% 
+  group_by(assembly,ko) %>% 
+  dplyr::summarise(count = n())
+
+ko_count_matrix <- ko_counts %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = assembly,values_from = count,values_fill = 0) %>% 
+  column_to_rownames("ko") %>% 
+  write_tsv("data/kegg/assembly_ko_counts.tsv")
+```
+
+NMDS for all bins
+```{r}
+bc_dist <- vegan::vegdist(t(ko_count_matrix))
+
+nmds <- vegan::metaMDS(bc_dist,k=2,trymax=1000)
+
+nmds_coords <- nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("assembly")
+
+(nmds_coords %>% ggplot(aes(MDS1,MDS2, sample = assembly)) +
+  geom_point()) %>% plotly::ggplotly()
+```
+
+
+
+NMDS of KO abundance per sample
+```{r}
+
+env_data <- read_tsv("data/env_data/merged_env_data.tsv") %>% 
+  filter(`Sample Depth (category)` == "Surface")
+
+seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+strain_collection_info <- read_tsv("data/strain_collection_information.txt") 
+
+strain_collection_info <- strain_collection_info %>% 
+  dplyr::rename(Date = "Collection Date",
+         Site = "Isolation Location") %>% 
+  dplyr::mutate(Date = lubridate::mdy(Date),
+         Site = if_else(str_detect(Site, "WE8-[1-2]"),"WE8",Site),
+         Year = lubridate::year(Date),
+         Day_of_year = lubridate::yday(Date)) %>% 
+  left_join(seqID_to_strainID %>% 
+              dplyr::rename(Culture = "strainDB"))
+
+strain_env_data <- strain_collection_info %>% 
+  left_join(env_data)
+
+
+no_missing <- strain_env_data %>% 
+  filter(!is.na(sequencingID))
+
+metadata_for_envfit <- no_missing %>% 
+  dplyr::select(sequencingID, `Station Depth (m)`,Year, Day_of_year,`Secchi Depth (m)`,`CTD Temperature (°C)`,`Dissolved Microcystin (µg/L)`,`Particulate Microcystin (µg/L)`,`CTD Tramission (%)`,`Extracted Phycocyanin (µg/L)`,`Extracted Chlorophyll a (µg/L)`) %>% 
+  filter(!is.na(`Dissolved Microcystin (µg/L)`),
+         !is.na(`Extracted Phycocyanin (µg/L)`)) %>% 
+  column_to_rownames("sequencingID") %>% 
+  scale()
+
+no_missing <- no_missing %>% 
+  filter(sequencingID %in% rownames(metadata_for_envfit))
+
+filtered_ko_matrix <- ko_count_matrix[,rownames(metadata_for_envfit)] %>% 
+  filter(rowSums(.) != 0) %>% 
+  t()
+
+nmds <- vegan::metaMDS(filtered_ko_matrix,
+                       k=2,trymax=1000)
+
+nmds_coords <- nmds$points %>% 
+  as.data.frame() %>% 
+  rownames_to_column("assembly")
+
+en <- vegan::envfit(nmds, metadata_for_envfit, permutations = 999)
+
+(test <- nmds_coords %>% 
+    left_join(strain_collection_info %>% dplyr::rename(assembly = "sequencingID")) %>% 
+    ggplot(aes(MDS1,MDS2, sample = assembly, label = strainID)) +
+  geom_text()) %>% plotly::ggplotly()
+
+
+scrs <- as.data.frame(scores(nmds, display = "sites")) %>% 
+  rownames_to_column("sample") %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(sample = "sequencingID"))
+
+loadings <- as.data.frame(scores(nmds, display = "species")) %>% rownames_to_column("ko")
+
+spp.pval <- en$vectors$pvals %>% data.frame(p.value = .)
+spp.scrs <- as.data.frame(scores(en, display = "vectors")) 
+spp.scrs <- cbind(spp.scrs, Species = rownames(spp.scrs)) %>% 
+  cbind(spp.pval) %>% 
+  filter(p.value < 0.5)
+
+(plot_nmds_sample_ko_abund <- ggplot(scrs) +
+  coord_fixed() + ## need aspect ratio of 1!
+  geom_segment(data = spp.scrs,
+               aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2),
+               arrow = arrow(length = unit(0.25, "cm")), colour = "grey", alpha = 0.7) +
+  geom_text(data = spp.scrs, aes(x = NMDS1, y = NMDS2, label = Species),
+            size = 3, alpha = 0.7) +
+  geom_point(mapping = aes(x = NMDS1, y = NMDS2)) +
+  ggrepel::geom_label_repel(mapping = aes(x = NMDS1, y = NMDS2, label = strainID), color = "red", size = 2, alpha = 0.7) +
+  labs(x = "NMDS1", y = "NMDS2") +
+  #geom_point(data = loadings, aes(x = NMDS1, y = NMDS2, ko = ko),size = 0.1, alpha = 0.4) +
+  annotate(geom = 'text', label = paste0("Stress: ", signif(nmds$stress,3)), x = -Inf, y = -Inf, hjust = -0.3, vjust = -0.6) +
+  theme_bw() ) 
+
+ggsave(plot = plot_nmds_sample_ko_abund,
+       filename = "results/nmds_sample_ko_abund.png",
+       dpi = 300,
+       width = 4,
+       height = 4,
+       scale = 1.5)
+
+ggsave(plot = plot_nmds_sample_ko_abund,
+       filename = "results/nmds_sample_ko_abund.pdf",
+       dpi = 300,
+       width = 4,
+       height = 4,
+       scale = 1.5)
+
+plotly::ggplotly(plot_nmds_sample_ko_abund)
+
+plot(nmds)
+plot(en,p.max = 0.1)
+```
+
+
+
+
+
+
+## ANI information
+
+Columns: query genome, reference genome, ANI value, count of bidirectional fragment mappings, and total query fragments. Alignment fraction (wrt. the query genome) is simply the ratio of mappings and total fragments
+
+
+```{r}
+ani_cols <- c("query_genome","reference_genome","ANI","frag_maps_bidirectional","query_fragments")
+bin_ani <- read_tsv("data/fastANI/ani.txt",col_names = ani_cols) %>% 
+  mutate(percent_aligned = (frag_maps_bidirectional / query_fragments)*100)
+  
+ani_matrix <- bin_ani %>% 
+  mutate(query_genome = str_remove(query_genome,".*/") %>% str_remove(".fasta"),
+         reference_genome = str_remove(reference_genome,".*/") %>% str_remove(".fasta"),
+         dist = 100- ANI) %>% 
+  select(query_genome,reference_genome, dist) %>% 
+  pivot_wider(names_from = reference_genome, values_from = dist, values_fill = 0) %>% 
+  column_to_rownames("query_genome") %>% 
+  as.matrix() %>% 
+  dist()
+
+ani_tree <- hclust(ani_matrix,method = "average")
+
+phylo <- ape::as.phylo(ani_tree)
+
+ape::write.tree(phylo,"data/bin_ani_tree.nwk")
+
+rel_abund <- read_tsv("data/bin_rel_abund.tsv")
+
+rel_abund_tree_filtered <- rel_abund[phylo$tip.label,]
+
+rel_abund_biom <- biomformat::make_biom(data = rel_abund_tree_filtered) %>% 
+  biomformat::write_biom("data/bin_abund.biom")
+
+plot(ani_tree)
+```
+
+
+```{r}
+
+unifrac_weighted <- read_tsv("data/weighted_unifrac.dst") %>% 
+  column_to_rownames("...1") %>% 
+  as.dist() %>% 
+  usedist::dist_subset(labels(hetero_bc))
+  
+
+(wunifrac_mantel <- mantel(unifrac_weighted,cyano_bc,parallel = 8,permutations = 10000,method = "spearman"))
+
+unweighted_unifrac <- read_tsv("data/unweighted_unifrac.dst") %>% 
+  column_to_rownames("...1") %>% 
+  as.dist() %>% 
+  usedist::dist_subset(labels(hetero_bc))
+
+(unifrac_mantel <- mantel(unweighted_unifrac,cyano_bc,parallel = 8,permutations = 10000,method = "spearman"))
+
+
+```
+
+
+
+
+
+
+
+Nicer KEGGdecoder figure
+```{}
+library(patchwork)
+
+
+kegg_decoder_data <- read_tsv("data/kegg/kegg_decoder_list.tsv") %>% 
+  rename(kegg_decoder_name = "Function") %>% 
+  left_join(mag_map %>% dplyr::select(kegg_decoder_name, bin_num, gtdb_classification,contam_bin)) %>% 
+  filter(contam_bin == FALSE) %>% dplyr::select(-contam_bin) %>% 
+  relocate(kegg_decoder_name, bin_num, gtdb_classification) %>% 
+  arrange(as.numeric(bin_num))
+  
+kegg_decoder_data %>% write_tsv("data/kegg_decoder/kegg_decoder_list_w_taxonomy.tsv")
+
+groupings <- read_tsv("data/kegg_decoder/groupings.txt")
+
+kegg_decoder_long <- kegg_decoder_data %>% 
+  pivot_longer(-c("kegg_decoder_name","bin_num","gtdb_classification"),names_to = "term",values_to = "completion") %>% 
+  left_join(groupings) %>% 
+  filter(!is.na(group))
+
+colors <- pals::cols25()
+
+group_bar_left <- kegg_decoder_long %>% ggplot(aes(0,reorder(term,-group_order),fill=factor(group,levels = unique(groupings$group), ordered = TRUE))) + 
+  geom_tile(color = "black",show.legend = FALSE) +
+  scale_fill_manual(values = colors) +
+  scale_x_discrete(expand = c(0,0)) +
+  theme_void() 
+  #theme(legend.position = "none") 
+
+group_bar_right <- kegg_decoder_long %>% ggplot(aes(0,reorder(term,-group_order),fill=factor(group,levels = unique(groupings$group), ordered = TRUE))) + 
+  geom_tile(color = "black") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  scale_y_discrete(position = "right", expand = c(0,0)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = colors) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "") 
+
+heatmap <- kegg_decoder_long %>% ggplot(aes(bin_num,reorder(term,-group_order),fill=completion, label = bin_num)) + 
+  geom_tile(color = "grey50") +
+  geom_text(alpha = 0.6, size = 2.25,color = "white") +
+  scale_fill_gradient(low = "white",high = "darkblue")+
+  theme_bw() +
+  #scale_y_discrete(position = "right") +
+  labs(x = NULL, 
+       y= NULL,
+       fill = "Completeness") +
+  #theme_void() +
+  #cowplot::theme_nothing() +
+  theme(axis.text.x = element_text(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  scale_x_continuous(expand=c(0,0),breaks = scales::pretty_breaks(n = nrow(kegg_decoder_data))) 
+
+(combined <- guide_area() + group_bar_left + heatmap + group_bar_right + plot_layout(widths = c(0.4,0.01,0.98,0.01),guides = "collect") & theme(plot.margin = unit(c(0, 0, 0, 0), "null"),panel.spacing = unit(c(0, 0, 0, 0), "null"), legend.position = "left"))
+ggsave(plot = combined,"results/MAG_kegg.png", width = 6, height = 7, dpi = 600, scale = 2)
+
+
+
+```
+
+
+
+
+
+
+

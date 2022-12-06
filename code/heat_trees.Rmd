@@ -1,0 +1,237 @@
+---
+title: "Heat trees"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r}
+library(metacoder)
+library(tidyverse)
+```
+
+
+
+Heat tree matrix by type
+```{r}
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  mutate(asr = factor(asr, levels = c("#N/A", "?","no","low","moderate","yes","high")),
+         extraction_date = lubridate::mdy(extraction_date))
+
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/combined_bracken.tsv")
+
+#Summarize at the genus level
+genus_rel <- rel.abund %>% 
+  group_by(R,D,P,C,O,F,G) %>% 
+  summarise(across(simple_meta$sample,~sum(.x))) %>% 
+  mutate(taxonomy = paste(R,D,P,C,O,F,G,sep = "|"),
+         taxonomy = str_remove_all(taxonomy,"\\|NA")) %>% 
+  ungroup() %>% 
+  select(-c(R,D,P,C,O,F,G))
+
+group_col <- quo(type)
+
+comparison_cols <- simple_meta %>% pull(!!group_col) %>% unique()
+
+grouped_table <- genus_rel %>% 
+  pivot_longer(cols = simple_meta$sample, 
+               names_to = "sample",
+               values_to = "rel.abund") %>% 
+  left_join(simple_meta %>% select(sample, !!group_col)) %>% 
+  group_by(!!group_col) %>% 
+  mutate(type_total = sum(rel.abund)) %>% 
+  group_by(taxonomy, !!group_col) %>% 
+  mutate(rel.abund = sum(rel.abund) / type_total) %>% 
+  select(type,rel.abund,taxonomy) %>% 
+  distinct() %>% 
+  pivot_wider(names_from = "type", values_from = "rel.abund")
+
+all <- data.frame(all = ungroup(grouped_table) %>% 
+                    select(where(is.numeric)) %>% 
+                    rowSums() / (ncol(grouped_table) - 1) ) %>% 
+  bind_cols(grouped_table) %>% 
+  filter(all > 0)
+
+
+obj <- parse_tax_data(all, class_cols = "taxonomy", class_sep = "|",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data") 
+
+thresh <- 0.001 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- taxa::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+
+#filter(reagent > thresh | lab > thresh | secondary > thresh | decontam > thresh | dist > thresh)
+
+#obj$data$tax_occ <- calc_n_samples(obj, "tax_abund", groups = c("reagent","lab","secondary","decontam","dist"))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = comparison_cols,
+                                      groups = comparison_cols)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(heat_tree <- obj %>%
+heat_tree_matrix(data = "diff_table",
+                 key_size = 0.7,
+                 node_size = all,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 node_color_range = viridis::viridis(7,begin = 0.1,end =0.9), 
+                 row_label_color = viridis::viridis(1,begin = 0.9),
+                 col_label_color = viridis::viridis(1,begin = 0.1),
+                 node_color_trans = "linear",
+                 node_color_interval = c(-3, 3),
+                 edge_color_interval = c(-3, 3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.002,0.04),
+                 node_label_size_range = c(.015,.025),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 10) +
+  ggsave("results/type_heat_tree_matrix.pdf", device = cairo_pdf, width = 6.85, height = 6.8)
+)
+
+```
+
+
+Heat tree matrix comparing negative control samples
+```{r}
+simple_meta <- read_tsv("data/metadata.tsv") %>% 
+  mutate(asr = factor(asr, levels = c("#N/A", "?","no","low","moderate","yes","high")),
+         extraction_date = lubridate::mdy(extraction_date))
+
+neg_controls <- simple_meta %>% 
+  filter(neg_control == TRUE) %>% 
+  pull(sample)
+
+#read in relative abundance data
+rel.abund <- read_tsv("results/combined_bracken.tsv") %>% 
+  select(R,D,P,C,O,F,G, taxonomy, one_of(neg_controls))
+
+#Summarize at the genus level
+genus_rel <- rel.abund %>% 
+  group_by(R,D,P,C,O,F,G) %>% 
+  summarise(across(neg_controls,~sum(.x))) %>% 
+  mutate(taxonomy = paste(R,D,P,C,O,F,G,sep = "|"),
+         taxonomy = str_remove_all(taxonomy,"\\|NA")) %>% 
+  ungroup() %>% 
+  select(-c(R,D,P,C,O,F,G))
+
+group_col <- quo(sample)
+
+comparison_cols <- neg_controls
+
+grouped_table <- genus_rel %>% 
+  pivot_longer(cols = comparison_cols, 
+               names_to = "sample",
+               values_to = "rel.abund") %>% 
+  left_join(simple_meta %>% select(sample, !!group_col)) %>% 
+  group_by(!!group_col) %>% 
+  mutate(type_total = sum(rel.abund)) %>% 
+  group_by(taxonomy, !!group_col) %>% 
+  mutate(rel.abund = sum(rel.abund) / type_total) %>% 
+  select(sample,rel.abund,taxonomy) %>% 
+  distinct() %>% 
+  pivot_wider(names_from = "sample", values_from = "rel.abund")
+
+all <- data.frame(all = ungroup(grouped_table) %>% 
+                    select(where(is.numeric)) %>% 
+                    rowSums() / (ncol(grouped_table) - 1) ) %>% 
+  bind_cols(grouped_table) %>% 
+  filter(all > 0)
+
+
+#How much do the negative controls correlate?
+neg_cor <- all %>% 
+  select(neg_controls) %>% 
+  cor(method = "spearman")
+
+obj <- parse_tax_data(all, class_cols = "taxonomy", class_sep = "|",
+                      class_key = c(tax_rank = "taxon_rank", tax_name = "taxon_name"),
+                      class_regex = "^(.+)__(.*)$")
+
+
+#summing per-taxon counts
+obj$data$tax_abund <- calc_taxon_abund(obj, "tax_data") 
+
+thresh <- 0.001 #Rel.abund threshold to filter for plottting
+tab <- obj$data$tax_abund %>% select(-taxon_id) %>% rowSums() > thresh
+
+obj <- filter_obs(obj,"tax_abund",tab)
+
+
+keep <- obj$data$tax_data$taxon_id %in% obj$data$tax_abund$taxon_id
+obj <- filter_obs(obj,"tax_data", keep)
+
+obj <- taxa::filter_taxa(obj,unique(obj$data$tax_abund$taxon_id))
+
+
+#filter(reagent > thresh | lab > thresh | secondary > thresh | decontam > thresh | dist > thresh)
+
+#obj$data$tax_occ <- calc_n_samples(obj, "tax_abund", groups = c("reagent","lab","secondary","decontam","dist"))
+
+#adds comparison data about type to the data
+obj$data$diff_table <- compare_groups(obj, data = "tax_abund",
+                                      cols = comparison_cols,
+                                      groups = comparison_cols)
+
+
+obj$data$tax_data <- NULL #otherwise plot gets confused looking for concrete (rel.abund)
+
+(heat_tree <- obj %>%
+heat_tree_matrix(data = "diff_table",
+                 key_size = 0.7,
+                 node_size = all,
+                 node_label = taxon_names,
+                 node_color = log2_median_ratio,
+                 node_color_range = viridis::viridis(7,begin = 0.1,end =0.9), 
+                 row_label_color = viridis::viridis(1,begin = 0.9),
+                 col_label_color = viridis::viridis(1,begin = 0.1),
+                 node_color_trans = "linear",
+                 node_color_interval = c(-3, 3),
+                 edge_color_interval = c(-3, 3),
+                 node_size_axis_label = "Relative abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 node_size_range = c(0.002,0.04),
+                 node_label_size_range = c(.015,.025),
+                 node_label_max = 80,
+                 initial_layout = "reingold-tilford", layout = "davidson-harel",
+                 overlap_avoidance = 10) +
+  ggsave("results/neg_controls_heat_tree_matrix.pdf", device = cairo_pdf, width = 6.85, height = 6.8)
+)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,271 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+library(tidyverse)
+library(furrr)
+```
+
+
+
+```{r}
+#####
+# Tidy the marker gene variants determined by variant calling from mapped reads
+#####
+
+samples_to_use <- read_tsv("data/samples_to_use.tsv") %>% pull("samples_to_use")
+
+microcystis_marker_genes_pre_16S_regions <- list.files("data/marker_genes", "_consensus.fasta",full.names = TRUE, recursive = T) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = str_remove(path,".*/") %>% str_remove_all("_.*"),
+         sample = str_remove(path,"_consensus.fasta") %>% str_remove(glue::glue(".*/{gene}_")),
+         seq = Biostrings::readDNAStringSet(path) %>% as.character()) %>% 
+  filter(sample %in% samples_to_use)
+
+regions_16S <- microcystis_marker_genes_pre_16S_regions %>% 
+  filter(gene == "16S") %>% 
+  mutate(V2_16S = str_remove(seq,".*AGAGTTTGATCCTGGCTCAG") %>% str_remove("AGACTCCTACGGGAGGCAGCAGT.*"),
+         V4_16S = str_remove(seq,".*GTGCCAGCAGCCGCGGTAA") %>% str_remove("ATTAGATACCCCTGTAGTCC.*")) %>% 
+  select(-seq,-gene) %>% 
+  pivot_longer(c(V4_16S,V2_16S),names_to="gene",values_to="seq")
+
+microcystis_marker_genes <- bind_rows(microcystis_marker_genes,regions_16S)
+
+genes <- microcystis_marker_genes %>% 
+  select(gene) %>% 
+  distinct() %>% 
+  pull("gene")
+
+write_fastas <- function(gene_name){
+  to_export <- microcystis_marker_genes %>% 
+    filter(gene == gene_name) %>% 
+    mutate(sample = paste0(gene,"_",sample,"_consensus")) %>% 
+    select(sample, seq)
+  
+  microcystis_biostrings <- Biostrings::DNAStringSet(to_export$seq)
+  names(microcystis_biostrings) <- to_export$sample
+  
+  dir.create("data/marker_genes/identified_variants")
+  Biostrings::writeXStringSet(microcystis_biostrings,glue::glue("data/marker_genes/identified_variants/{gene_name}_called_variants.fasta"))
+  
+}
+
+sapply(genes,write_fastas)
+
+
+#####
+# Tidy the marker gene variants determined by assembling marker genes with reads mapping to reference sequences
+#####
+
+assembled_microcystis_marker_genes <- list.files("data/marker_genes", "_assembly.fasta",full.names = TRUE, recursive = T) %>% 
+  data.frame(path = .)
+
+fasta_df <- function(path){
+  Biostrings::readDNAStringSet(path) %>% 
+    data.frame(seq = .) %>% 
+    mutate(gene = str_remove(path,".*/") %>% str_remove_all("_assembly.fasta"),
+           sample = str_remove(path, "data/marker_genes/") %>% str_remove("/.*")) %>% 
+    rownames_to_column("header")
+}
+
+pre_16S_regions_assembled_markers <- map_df(assembled_microcystis_marker_genes$path,fasta_df) %>% 
+  group_by(gene, sample) %>% 
+  mutate(row_number = row_number(),
+         new_header = glue::glue("{gene}_{sample}_assembled_{row_number}")) %>% 
+  ungroup()
+
+
+assembled_regions_16S <- pre_16S_regions_assembled_markers %>% 
+  filter(gene == "16S") %>% 
+  mutate(V2_16S = str_remove(seq,".*AGAGTTTGATCCTGGCTCAG") %>% str_remove("AGACTCCTACGGGAGGCAGCAGT.*"),
+         V4_16S = str_remove(seq,".*GTGCCAGCAGCCGCGGTAA") %>% str_remove("ATTAGATACCCCTGTAGTCC.*")) %>% 
+  select(-seq,-gene) %>% 
+  pivot_longer(c(V4_16S,V2_16S),names_to="gene",values_to="seq")
+
+assembled_markers <- bind_rows(pre_16S_regions_assembled_markers,assembled_regions_16S)
+
+genes <- assembled_markers %>% 
+  select(gene) %>% 
+  distinct() %>% 
+  pull("gene")
+
+write_fastas <- function(gene_name){
+  to_export <- assembled_markers %>% 
+    filter(gene == gene_name) %>% 
+    select(new_header, seq)
+  
+  microcystis_biostrings <- Biostrings::DNAStringSet(to_export$seq)
+  names(microcystis_biostrings) <- to_export$new_header
+  
+  dir.create("data/marker_genes/identified_variants")
+  Biostrings::writeXStringSet(microcystis_biostrings,glue::glue("data/marker_genes/identified_variants/{gene_name}_assembled.fasta"))
+  
+}
+
+sapply(genes,write_fastas)
+```
+
+
+
+
+```{r}
+
+mag_tax <- read_tsv("data/gtdb/classify/gtdbtk.bac120.summary.tsv") %>% 
+  filter(str_detect(classification,"Microcystis"),
+         user_genome != "ND-90_bin_6")
+
+ani <- read_tsv("data/fastANI/ani.txt", col_names = c("query", "reference", "ANI", "bidirec_frag_maps", "total_query_frags")) %>% 
+  mutate(query = str_remove(query,".fasta") %>% str_remove(".*/"),
+         reference = str_remove(reference,".fasta") %>% str_remove(".*/")) %>% 
+  filter(query %in% mag_tax$user_genome & reference %in% mag_tax$user_genome) %>% 
+  mutate(across(c(reference,query), ~str_remove(.x,"_bin.*"))) %>% 
+  filter(query %in% samples_to_use & reference %in% samples_to_use)
+
+ani_dist <- ani %>% 
+  mutate(dist = 1 - (ANI*.01)) %>% 
+  select(reference, query, dist) %>% 
+  pivot_wider(names_from = reference, values_from = dist) %>% 
+  column_to_rownames("query")
+
+dist_order <- colnames(ani_dist)
+
+ani_dist <- ani_dist[dist_order, dist_order]
+
+
+recA_dist <- Biostrings::readDNAStringSet("data/marker_genes/identified_variants/recA_called_variants.fasta") %>% DECIPHER::AlignSeqs() %>% DECIPHER::DistanceMatrix(type = "matrix",includeTerminalGaps = FALSE)
+
+colnames(recA_dist) <- colnames(recA_dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+rownames(recA_dist) <- rownames(recA_dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+recA_dist <- recA_dist[dist_order,dist_order]
+
+(recA_mantel <- vegan::mantel(ani_dist,recA_dist, method = "spearman"))
+
+
+mantel_w_ANI <- function(gene){
+  
+  dist <- Biostrings::readDNAStringSet(paste0("data/marker_genes/identified_variants/",gene,"_called_variants.fasta")) %>% DECIPHER::AlignSeqs() %>% DECIPHER::DistanceMatrix(type = "matrix",includeTerminalGaps = FALSE)
+  
+  colnames(dist) <- colnames(dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+  rownames(dist) <- rownames(dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+  dist <- dist[dist_order,dist_order]
+  
+  mantel <- vegan::mantel(ani_dist,dist)
+  
+  results <- data.frame(gene_name = gene,
+             cor_w_ANI = mantel$statistic,
+             p.value = mantel$signif)
+  
+  return(results)
+}
+
+
+mantel_results <- suppressMessages(map_df(genes,mantel_w_ANI))
+```
+
+```{r}
+ani_long <- ani_dist %>% rownames_to_column("genome1") %>% 
+    pivot_longer(-genome1,names_to = "genome2",values_to = "ani_dist")
+
+long_dist <- function(gene){
+  dist <- Biostrings::readDNAStringSet(paste0("data/marker_genes/identified_variants/",gene,"_called_variants.fasta")) %>% DECIPHER::AlignSeqs() %>% DECIPHER::DistanceMatrix(type = "matrix",includeTerminalGaps = FALSE) 
+  
+  colnames(dist) <- colnames(dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+  rownames(dist) <- rownames(dist) %>% str_remove("_consensus") %>% str_remove(".*_")
+  dist <- dist[dist_order,dist_order]
+  
+  dist %>% 
+    as.data.frame() %>% 
+    rownames_to_column("genome1") %>% 
+    pivot_longer(-genome1,names_to = "genome2",values_to = "dist") %>% 
+    mutate(gene_name = gene)
+  
+}
+
+dists <- map_df(genes, long_dist) %>% 
+  left_join(ani_long)
+
+
+dists_for_lm <- dists %>% 
+  filter(genome1 != genome2) %>% 
+  group_by(gene_name) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  mutate(id = as.character(row_number()))
+
+do_lm <- function(df) {
+  model <- lm(ani_dist ~ dist, data = df)
+  
+  model_tidy_df <- broom::tidy(model)
+  model_tidy_df <- bind_cols(model_tidy_df,R2 = summary(model)$r.squared)
+
+  return(model_tidy_df)  
+}
+
+test <- lm(ani_dist ~ dist, data = dists_for_lm$data[[1]])
+
+
+lm_results <- future_map_dfr(dists_for_lm$data, do_lm,.id = "id") %>% 
+  left_join(dists_for_lm %>% select(-data)) 
+
+lm_results_wide <- lm_results %>% 
+  pivot_wider(names_from = term, values_from = estimate:R2) %>% 
+  mutate(lm_formula = glue::glue("y = {round(estimate_dist,2)}x + {round(`estimate_(Intercept)`,2)}; R2 = {round(R2_dist,2)}"))
+
+
+(maker_dist_vs_ani <- dists %>% 
+  filter(genome1 != genome2,
+         genome1 %in% samples_to_use,
+         genome2 %in% samples_to_use) %>% 
+  left_join(lm_results_wide %>% select(gene_name,lm_formula)) %>% 
+  ggplot(aes(dist, ani_dist)) +
+  geom_abline(slope = 1, color = "grey40", linetype = "dashed") +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  geom_text(aes(x = -Inf, y = Inf, label = lm_formula), hjust = -0.4, vjust = 2, size = 3) +
+  #coord_fixed() +
+  labs(x = "Gene distance", y = "ANI distance") +
+  facet_wrap(~gene_name) +
+  theme_bw())
+
+ggsave(plot = maker_dist_vs_ani, "results/marker_genes_vs_ani.png", dpi = 300, width = 6, height = 4, scale = 2)
+
+uniques <- dists %>% 
+  group_by(gene_name) %>%
+  filter(genome1 != genome2, 
+         dist > 0) %>% 
+  summarise(n_unique = n())
+  
+
+unique_marker_seq_count <- microcystis_marker_genes %>% 
+  filter(sample %in% samples_to_use) %>% 
+  select(gene,seq) %>% 
+  distinct() %>% 
+  group_by(gene) %>% 
+  summarise(n_unique = n(),
+            seq_length = mean(str_length(seq))) %>% 
+  mutate(n_unique_per_bp = n_unique / seq_length)
+
+unique_marker_seq_count %>% 
+  ggplot(aes(reorder(gene,n_unique),n_unique/22*100)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "% unique") +
+  theme_bw() +
+  coord_flip()
+
+ggsave("results/marker_genes_n_unique.png", dpi = 300, width = 3, height = 3, scale = 2)
+
+unique_marker_seq_count %>% 
+  ggplot(aes(reorder(gene,-n_unique_per_bp),n_unique_per_bp)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL) +
+  theme_bw()
+
+```
+
+
+
+
+

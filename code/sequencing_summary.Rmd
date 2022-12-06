@@ -1,0 +1,232 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(glue)
+```
+
+
+
+# Sequence QC & processing stats
+
+Import multiqc summary files
+```{r}
+
+multiqc <- read_tsv("results/sequence_quality/multiqc_data/multiqc_general_stats.txt")
+
+
+cleaned_multiqc <- multiqc %>% 
+  mutate(sample_state = if_else(str_detect(Sample,"qc_sequence_files "), "qcd", "raw"),
+         Sample = str_remove(Sample, ".*\\|"),
+         read_dir = if_else(str_detect(Sample, "_R1"),"f","r"),
+         Sample = str_remove(Sample, "_R[1-2]"),
+         replicate = str_extract(Sample,"[a-z]"),
+         sample_no_replicate = str_remove(Sample,"[a-z]")) %>% 
+  rename(sample = "Sample",
+         num_seqs = "FastQC_mqc-generalstats-fastqc-total_sequences",
+         percent_duplicate_seqs = "FastQC_mqc-generalstats-fastqc-percent_duplicates",
+         percent_gc = "FastQC_mqc-generalstats-fastqc-percent_gc",
+         mean_seq_length = "FastQC_mqc-generalstats-fastqc-avg_sequence_length",
+         fastqc_percent_fails = "FastQC_mqc-generalstats-fastqc-percent_fails"
+         )
+```
+
+
+Overall summary
+```{r}
+overall_summary <- cleaned_multiqc %>% 
+  group_by(sample_state) %>% 
+  summarise(num_seqs = sum(num_seqs),
+            mean_seq_length = mean(mean_seq_length),
+            percent_gc = mean(percent_gc),
+            percent_duplicate_seqs = mean(percent_duplicate_seqs))
+
+DT::datatable(overall_summary)
+
+
+```
+
+Percent of sequences lost during QC
+```{r}
+
+seqs <- cleaned_multiqc %>% 
+  dplyr::select(sample, sample_state, num_seqs) %>% 
+  distinct() %>% 
+  pivot_wider(sample, names_from = "sample_state", values_from = "num_seqs") %>% 
+  mutate(percent_passing_qc = qcd/raw * 100)
+
+num_raw_reads <- seqs %>% summarise(sum(raw))
+num_qc_reads <- seqs %>% summarise(sum(qcd))
+
+
+glue("{num_qc_reads} out of {num_raw_reads} total reads ({(num_qc_reads / num_raw_reads * 100) %>% round(2)}%) passed quality control")
+
+```
+
+
+
+
+
+Kraken classification
+```{r}
+
+gtdb_kraken <- list.files("slurm/logs",pattern = "kraken2_gtdb_sample",full.names = TRUE)
+
+detect_fun <- function(fp){
+  !str_detect(fp,"NEG")
+}
+
+gtdb_kraken <- Filter(detect_fun,gtdb_kraken)
+
+
+kraken_summary <- data.frame(database = character(),
+                             sample = character(),
+                             n_Reads = numeric(),
+                             n_unclassified = numeric())
+
+colnames(kraken_summary) <- c("database","sample","n_reads", "n_unclassified")
+
+database <- "gtdb"
+
+for (file in gtdb_kraken) {
+  
+
+  bracken_log <- read_lines(file) %>% data.frame(line = .)
+  
+  sample <- bracken_log %>% 
+    filter(str_detect(line, "wildcards: sample=*")) %>% 
+    pull("line") %>% str_remove(".*wildcards: sample=")
+  
+  n_reads <- bracken_log %>% 
+    filter(str_detect(line, ">>> Total reads in sample:")) %>% 
+    pull("line") %>% str_remove(".*>>> Total reads in sample: ") %>% as.numeric()
+  
+  n_unclassified <- bracken_log %>% 
+    filter(str_detect(line, ">> Unclassified reads:")) %>% 
+    pull("line") %>% str_remove(".*>> Unclassified reads: ") %>% as.numeric()
+ 
+  new_row <- data.frame(database,sample,n_reads,n_unclassified)
+  
+  kraken_summary <- bind_rows(kraken_summary,new_row)
+   
+}
+
+
+refseq_kraken <- list.files("slurm/logs",pattern = "kraken2_refseq_sample",full.names = TRUE)
+
+detect_fun <- function(fp){
+  !str_detect(fp,"NEG")
+}
+
+refseq_kraken <- Filter(detect_fun,refseq_kraken)
+
+database <- "refseq"
+
+for (file in refseq_kraken) {
+  
+
+  bracken_log <- read_lines(file) %>% data.frame(line = .)
+  
+  sample <- bracken_log %>% 
+    filter(str_detect(line, "wildcards: sample=*")) %>% 
+    pull("line") %>% str_remove(".*wildcards: sample=")
+  
+  n_reads <- bracken_log %>% 
+    filter(str_detect(line, ">>> Total reads in sample:")) %>% 
+    pull("line") %>% str_remove(".*>>> Total reads in sample: ") %>% as.numeric()
+  
+  n_unclassified <- bracken_log %>% 
+    filter(str_detect(line, ">> Unclassified reads:")) %>% 
+    pull("line") %>% str_remove(".*>> Unclassified reads: ") %>% as.numeric()
+ 
+  new_row <- data.frame(database,sample,n_reads,n_unclassified)
+  
+  kraken_summary <- bind_rows(kraken_summary,new_row)
+   
+}
+
+
+kraken_summary2 <- kraken_summary %>% 
+  pivot_wider(id_cols = c("sample"),
+              names_from = "database",
+              values_from = c("n_reads","n_unclassified")) %>% 
+  mutate(percent_gtdb_classified = (n_reads_gtdb - n_unclassified_gtdb) / n_reads_gtdb * 100,
+          percent_refseq_classified =  (n_reads_refseq - n_unclassified_refseq) / n_reads_gtdb * 100,
+          percent_unclassified = n_unclassified_refseq / n_reads_gtdb * 100,
+          sample_wo_replicate = str_remove(sample, "[a-z]"),
+          replicate = str_remove(sample, "[A-Z,0-9]*"))
+
+(kraken_reads_plot <- kraken_summary2 %>% 
+  ggplot(aes(reorder(sample_wo_replicate,percent_unclassified), 100 - percent_unclassified, color = replicate)) + 
+  geom_jitter(width = 0.2) + 
+  #coord_flip() +
+  scale_color_manual(values = c("#4349bf","grey60", "#ffcb21")) +
+  labs(x = NULL,
+       y = "Percent of reads classified by Kraken2") +
+  theme_bw() +
+    theme(axis.text.x =  element_text(angle = 45, hjust = 1, vjust = 1))
+  )
+
+ggsave(plot = kraken_reads_plot, filename = "results/kraken_reads.png", width = 4, height = 2, dpi = 600, scale = 1.75)
+ggsave(plot = kraken_reads_plot, filename = "results/kraken_reads.pdf", width = 4, height = 2, dpi = 600, scale = 1.75)
+
+```
+
+
+
+```{r}
+
+metadata <- read_tsv("data/metadata.tsv") %>% 
+  mutate(sample_wo_replicate = str_remove(sample, "[a-z]"),
+         replicate = str_remove(sample, "[A-Z,0-9]*"))
+
+
+(dna_extraction_yield <- metadata %>% 
+  filter(!str_detect(sample, "NEG")) %>% 
+  ggplot(aes(reorder(sample_wo_replicate,-ng_yield), ng_yield, color = replicate)) + 
+  geom_jitter(width = 0.2) + 
+  #coord_flip() +
+  scale_color_manual(values = c("#4349bf","grey60", "#ffcb21")) +
+  labs(x = NULL,
+       y = "DNA extraction yield (ng)") +
+  theme_bw() +   
+  theme(axis.text.x =  element_text(angle = 45, hjust = 1, vjust = 1)) + scale_y_log10()
+)
+
+ggsave(plot = dna_extraction_yield, filename = "results/dna_extraction_yield.png", width = 4, height = 2, dpi = 600, scale = 1.75)
+ggsave(plot = dna_extraction_yield, filename = "results/dna_extraction_yield.pdf", width = 4, height = 2, dpi = 600, scale = 1.75)
+```
+
+
+
+
+Plot relationship between percent of reads classified and dna extraction yield
+  -actually fairly interesting, and the cluster of (likely) more contaminated samples is pretty apparent
+  -interesting to see that despite seemingly low yields from NJ8 (S3 Fallen) it tends to buck the general trend towards higher classification at lower yields [i.e. there is still a real signal there]
+  
+
+```{r}
+merged <- kraken_summary2 %>% 
+  left_join(metadata)
+
+(merged %>% ggplot(aes(ng_yield, 100 - percent_unclassified, label = sample)) + 
+    geom_point() + 
+    scale_x_log10() + 
+    theme_bw()) %>% plotly::ggplotly()
+```
+
+
+
+
+
+
+
+
+
+
+

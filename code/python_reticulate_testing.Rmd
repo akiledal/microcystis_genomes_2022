@@ -1,0 +1,52 @@
+---
+title: "Reticulate practice"
+output: html_notebook
+---
+
+
+Testing some python for snakemake
+
+
+```{r}
+library(reticulate)
+```
+
+
+
+```{r}
+reticulate::use_python(python = "~/miniconda3/envs/snakemake/bin/python")
+
+
+"~/miniconda3/envs/"
+
+use_condaenv(condaenv = "snakemake",conda = "~/miniconda3/bin/conda")
+py_config()
+
+
+py_run_string('import snakemake')
+```
+
+```{python}
+import snakemake
+
+
+book=glob_wildcards('./books/{book}.txt').book
+
+test=snakemake.io.glob_wildcards("data/bins/{short_sample}/{assembler}/DASTool/_DASTool_bins/{bin}.fa").bin
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
