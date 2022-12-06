@@ -5,7 +5,7 @@
 benchmarks/**
 logs/**
 slurm/**
-.Rhistory
+*.Rhistory
 .stignore
 *.html
 results/**
@@ -14,3 +14,4 @@ code/OligoArrayAux/**
 code/sync_conflicts/**
 code/results/**
 code/fastspar_bin/**
+concrete_Snakefile
