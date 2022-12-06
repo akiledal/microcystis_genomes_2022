@@ -10,3 +10,7 @@ slurm/**
 *.html
 results/**
 data/**
+code/OligoArrayAux/**
+code/sync_conflicts/**
+code/results/**
+code/fastspar_bin/**

@@ -1,0 +1,16 @@
+jobs: 100
+#local-cores: 1
+#For some steps, it might be usefule to --exclude=biomix22 , because the /scratch directory is full on this node, also was --exclude=biomix26 for a while, don't remember why
+# --parsable is required for cluster-status to parse jobIDs and function properly
+#cluster: "sbatch --parsable --time={resources.time_min} --mem={resources.mem_mb} -c {resources.cpus} -o slurm/logs/{rule}_{wildcards} -e slurm/logs/{rule}_{wildcards} --mail-type=ALL --mail-user=akiledal@udel.edu --exclude=biomix26"
+use-conda: true
+conda-frontend: mamba
+use-singularity: true
+default-resources: [cpus=1, mem_mb=16000, time_min=120]
+resources: [cpus=94, mem_mb=180000]
+latency-wait: 60
+#cluster-status: "slurm-status.py"
+#max-status-checks-per-second: 1
+#singularity-args: "--home /home/akiledal:/home/akiledal --bind /work/akiledal:/home/akiledal/work,/mnt/maximus/data1/jmaresca:/home/akiledal/lab_space"
+#singularity-args: "--home /home/akiledal:/home/akiledal --bind /work/akiledal:/work/akiledal,/work/akiledal:/home/akiledal/work,/mnt/maximus/data1/jmaresca:/mnt/maximus/data1/jmaresca"
+singularity-args: "--home /home/akiledal:/home/akiledal --bind /geomicro:/geomicro"
