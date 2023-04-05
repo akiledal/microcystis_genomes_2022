@@ -971,6 +971,46 @@ rule phylomark_400:
             -p {resources.cpus}
         """
 
+
+rule phylomark_400_jacob_genomes:
+    input:
+        ref = "data/reference/jacob_reference_genomes/microcystis_genomes_only/Microcystis_aeruginosa_PCC_7806SL.fa",
+        genomes = "data/reference/jacob_reference_genomes/microcystis_genomes_only",
+        tree = "data/jacob_tree2.nwk",
+        phylomark = rules.get_phylomark.output.phylomark
+    output:
+        dir = directory("data/phylomark/400bp_jacobRefs"),
+        results =  "data/phylomark/400bp_jacobRefs/results.txt",
+        trees = "data/phylomark/400bp_jacobRefs/all_trees.txt"
+    #conda: "code/phylomark.yaml"
+    conda: "phylomark_updated"
+    log: "logs/phylomark/400bp_jacobRefs.log"
+    benchmark: "benchmarks/phylomark/400bp_jacobRefs.txt"
+    params: frag_len = 400
+    resources: cpus=80
+    shell:
+        """
+        export PYTHONPATH=$PWD/code/Phyomark
+        
+        PROJ_DIR=$PWD
+        #PM=$PWD/code/Phylomark/phylomark.py
+        PM=$HOME/scripts/Phylomark/phylomark.py 
+
+        cd $PWD/{output.dir}
+        $PM \
+            -d $PROJ_DIR/{input.genomes} \
+            -t $PROJ_DIR/{input.tree} \
+            -r $PROJ_DIR/{input.ref} \
+            -p {resources.cpus} \
+            -l {params.frag_len}
+
+
+        python ../phylomark.py  -p 64 -l 40
+
+        """
+
+
+
 rule phylomark_marker_genes:
     input:
         ref = "data/reference/reference_genomes/GCF_002095975.1_ASM209597v1_genomic.fasta",
@@ -1264,6 +1304,102 @@ rule run_laura_BLASTS:
     input: expand("data/BLAST/laura_markers/{gene}__{genome}.blastn", gene = glob_wildcards("data/reference/marker_genes/multiple_refs/{gene}.fa").gene, genome = glob_wildcards("data/reference/laura_ref_genomes/{genome}.fna").genome)
 
 
+# Extract the marker genes from reference genomes from Jacob
+rule make_nuc_blastdb_markers_jacob:
+    input: 
+        genome = "data/reference/jacob_reference_genomes/{genome}.fa"
+    output:
+        db_index = "data/reference/jacob_reference_genomes/{genome}.fa.nin"
+    log:
+        "logs/BLAST/jacob_genomes_nuc_makeblastdb_{genome}.log"
+    resources: cpus=1, mem_mb=5000, time_min=120
+    shell:
+        """
+        makeblastdb -in {input.genome} -dbtype nucl -logfile logs/BLAST/jacob_genomes_db_nuc_{wildcards.genome}.dblog
+        """
+
+rule blast_nuc_jacob:
+    input:
+        blast_db = rules.make_nuc_blastdb_markers_jacob.input.genome,
+        blast_db_index = rules.make_nuc_blastdb_markers_jacob.output.db_index,
+        gene = "data/reference/marker_genes/multiple_refs/{gene}.fa"
+    output:
+        blast_res = "data/BLAST/markers_from_jacob_genomes/{gene}__{genome}.blastn"
+        #post_blast_res = "data/BLAST/{blast_name}_nuc/{MAG}.pb"
+    log:
+        "logs/BLAST/markers_from_jacob_genomes/{gene}__{genome}.log"
+    resources: cpus=8, mem_mb=5000, time_min=120
+    shell:
+        """
+        blastn -query {input.gene} \
+            -db {input.blast_db} \
+            -out {output.blast_res} \
+            -outfmt '6 std qcovs stitle qseq sseq' \
+            -num_threads {resources.cpus}
+
+        # removed additional output columns: -outfmt '6 std qcovs stitle' \
+        # also removed database size standardization: -dbsize 1000000 \
+        """
+
+rule run_jacob_BLASTS:
+    input: expand("data/BLAST/markers_from_jacob_genomes/{gene}__{genome}.blastn", gene = glob_wildcards("data/reference/marker_genes/multiple_refs/{gene}.fa").gene, genome = glob_wildcards("data/reference/jacob_reference_genomes/{genome,[^/]+}.fa").genome)
+
+rule align_markers_from_jacob_refs:
+    input: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.fasta"
+    output: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.afa"
+    log: "logs/align_markers_from_jacob_refs/{gene_name}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule calc_gene_tress_from_jacob_refs:
+    input: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.afa"
+    output: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.tre"
+    log: "logs/fasttree_jacob_genes/{gene_name}_fasttree.log"
+    conda: "code/fasttree.yaml"
+    shell:
+        """
+        FastTree -gtr -nt {input} > {output}
+        """
+
+rule build_gene_trees_all_refs:
+    input:
+        expand("data/marker_genes_extracted_from_jacob_genomes/{gene_name}.tre",gene_name = glob_wildcards("data/reference/marker_genes/multiple_refs/{gene}.fa").gene)
+
+
+## Align and build trees from PCR products of primers under evaluation
+
+# rule align_markers_from_jacob_refs:
+#     input: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.fasta"
+#     output: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.afa"
+#     log: "logs/align_markers_from_jacob_refs/{gene_name}_muscle.log"
+#     conda: "code/muscle.yaml"
+#     resources: cpus=16
+#     shell:
+#         """
+#         export OMP_NUM_THREADS={resources.cpus}
+#         muscle -align {input} -threads {resources.cpus} -output {output} > log
+#         """
+
+# rule calc_gene_tress_from_jacob_refs:
+#     input: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.afa"
+#     output: "data/marker_genes_extracted_from_jacob_genomes/{gene_name}.tre"
+#     log: "logs/fasttree_jacob_genes/{gene_name}_fasttree.log"
+#     conda: "code/fasttree.yaml"
+#     shell:
+#         """
+#         FastTree -gtr -nt {input} > {output}
+#         """
+
+
+rule build_PCRprod_trees:
+    input:
+        expand("data/marker_genes_extracted_from_jacob_genomes/{gene_name}.tre",gene_name = glob_wildcards("data/marker_genes_extracted_from_jacob_genomes/{gene}.fasta").gene)
+
 
 
 rule mlr_hmm:
@@ -1426,3 +1562,481 @@ rule map_reads_to_genes2:
 rule run_map_reads_to_genes_BWA:
     input: expand("data/gene_PA_read_mapping_BWA/{sample}/{genePA}_mapped.bam", sample = samples, genePA = ["mergedRefs"])
 
+
+rule map_reads_to_strain_markers:
+    input:
+        f_reads = "data/qcd_reads/{sample}_R1_deduped_trimmed_screened.fq",
+        r_reads = "data/qcd_reads/{sample}_R2_deduped_trimmed_screened.fq",
+        ref = "data/markers_for_strain_mapping.fasta"
+    output:
+        temp_bam = temp("data/strain_mapping/{sample}_mapped_temp.bam"),
+        sam = temp("data/strain_mapping/{sample}_mapped.sam"),
+        bam = "data/strain_mapping/{sample}_mapped.bam",
+        unsorted_bam = temp("data/strain_mapping/{sample}_mapped_unsorted.bam")
+    conda: "code/bwa.yaml"
+    log: "logs/strain_mapping/{sample}__BWA.log"
+    resources: cpus=8
+    shell:
+        """
+        bwa-mem2 index {input.ref}
+        
+        bwa-mem2 mem \
+            -t {resources.cpus} \
+            {input.ref} \
+            {input.f_reads} {input.r_reads} > {output.sam}
+
+        samtools view -bS {output.sam} > {output.temp_bam}
+        
+        filterBam \
+            --in {output.temp_bam} \
+            --out {output.unsorted_bam} \
+            --minCover 50 \
+            --minId 80
+        
+        samtools sort -o {output.bam} -@ {resources.cpus} {output.unsorted_bam}
+        samtools index -@ {resources.cpus} {output.bam}
+        """
+
+rule run_strain_mapping:
+    input: expand("data/strain_mapping/{sample}_mapped.bam", sample = samples)
+
+
+rule map_reads_to_PCC7806:
+    input:
+        f_reads = "data/qcd_reads/{sample}_R1_deduped_trimmed_screened.fq",
+        r_reads = "data/qcd_reads/{sample}_R2_deduped_trimmed_screened.fq",
+        ref = "data/reference/jacob_reference_genomes/Microcystis_aeruginosa_PCC_7806SL.fa"
+    output:
+        temp_bam = temp("data/strain_mapping/{sample}_PCC7806_mapped_temp.bam"),
+        sam = temp("data/strain_mapping/{sample}_PCC7806_mapped.sam"),
+        bam = "data/strain_mapping/{sample}_PCC7806_mapped.bam",
+        unsorted_bam = temp("data/strain_mapping/{sample}_PCC7806_mapped_unsorted.bam")
+    conda: "code/bwa.yaml"
+    log: "logs/strain_mapping/{sample}__PCC7806_BWA.log"
+    resources: cpus=8
+    shell:
+        """
+        bwa-mem2 index {input.ref}
+        
+        bwa-mem2 mem \
+            -t {resources.cpus} \
+            {input.ref} \
+            {input.f_reads} {input.r_reads} > {output.sam}
+
+        samtools view -bS {output.sam} > {output.temp_bam}
+        
+        filterBam \
+            --in {output.temp_bam} \
+            --out {output.unsorted_bam} \
+            --minCover 50 \
+            --minId 99.99
+        
+        samtools sort -o {output.bam} -@ {resources.cpus} {output.unsorted_bam}
+        samtools index -@ {resources.cpus} {output.bam}
+        """
+
+
+
+rule map_reads_to_lgt:
+    input:
+        f_reads = "data/qcd_reads/{sample}_R1_deduped_trimmed_screened.fq",
+        r_reads = "data/qcd_reads/{sample}_R2_deduped_trimmed_screened.fq",
+        ref = "data/panaroo/exported_marker_genes/best_amplicons/lgt__516.afa"
+    output:
+        temp_bam = temp("data/strain_mapping_lgt/{sample}_mapped_temp.bam"),
+        sam = temp("data/strain_mapping_lgt/{sample}_mapped.sam"),
+        bam = "data/strain_mapping_lgt/{sample}_mapped.bam",
+        unsorted_bam = temp("data/strain_mapping_lgt/{sample}_mapped_unsorted.bam")
+    conda: "code/bwa.yaml"
+    log: "logs/strain_mapping_lgt/{sample}__BWA.log"
+    resources: cpus=8
+    shell:
+        """
+        minimap2 \
+            -ax sr \
+            -t {resources.cpus} \
+            --secondary=no \
+            --sam-hit-only \
+            {input.ref} \
+            {input.f_reads} {input.r_reads} > {output.sam}
+
+        samtools view -bS {output.sam} > {output.temp_bam}
+        
+        filterBam \
+            --in {output.temp_bam} \
+            --out {output.unsorted_bam} \
+            --minCover 50 \
+            --minId 80
+        
+        samtools sort -o {output.bam} -@ {resources.cpus} {output.unsorted_bam}
+        samtools index -@ {resources.cpus} {output.bam}
+        """
+
+rule run_strain_mapping_lgt:
+    input: expand("data/strain_mapping_lgt/{sample}_mapped.bam", sample = samples)
+
+# Annotate genomes with Bakta--originally done primarily as input to pangenome tools
+
+rule bakta:
+    input:
+        genome = "data/reference/jacob_reference_genomes/{genome}.fa"
+    output:
+        dir = directory("data/bakta/{genome}")
+    params:
+        db = "/geomicro/data2/kiledal/references/bakta/db"
+    conda: "code/bakta.yaml"
+    log: "logs/bakta/{genome}.tsv"
+    benchmark: "benchmarks/bakta/{genome}.tsv"
+    resources: cpus=8, mem_mb=10000, time_min=5000, 
+    shell:
+        """
+        bakta --db {params.db} \
+            --output {output.dir} \
+            --threads {resources.cpus} \
+            {input.genome} | tee {log}
+        """
+
+rule run_bakta:
+    input:
+        expand("data/bakta/{genome}", genome = glob_wildcards("data/reference/jacob_reference_genomes/{genome}.fa").genome)
+
+
+rule panaroo:
+    input: expand("data/bakta/{genome}/{genome}.gff3", genome = glob_wildcards("data/reference/jacob_reference_genomes/{genome}.fa").genome)
+    output:
+        dir = directory("data/panaroo")
+    params:
+    conda: "code/panaroo.yaml"
+    log: "logs/panaroo/benchkark.tsv"
+    benchmark: "benchmarks/panaroo/panaroo.tsv"
+    resources: cpus=64, mem_mb=10000, time_min=5000, 
+    shell:
+        """
+        panaroo \
+            -i {input} \
+            -o {output.dir} \
+            --clean-mode moderate \
+            -a core \
+            --core_threshold 0.9 \
+            -t {resources.cpus} | tee {log}
+        """
+
+rule panaroo_98:
+    input: expand("data/bakta/{genome}/{genome}.gff3", genome = glob_wildcards("data/reference/jacob_reference_genomes/{genome}.fa").genome)
+    output:
+        dir = directory("data/panaroo_98")
+    params:
+    conda: "code/panaroo.yaml"
+    log: "logs/panaroo_98/benchkark.tsv"
+    benchmark: "benchmarks/panaroo_98/panaroo.tsv"
+    resources: cpus=24, mem_mb=100000, time_min=5000, 
+    shell:
+        """
+        panaroo \
+            -i {input} \
+            -o {output.dir} \
+            --clean-mode moderate \
+            -a core \
+            --core_threshold 0.98 \
+            -t {resources.cpus} | tee {log}
+        """
+
+rule muscle_align_pararoo_core_genes:
+    input: "data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas"
+    output: "data/panaroo/aligned_gene_sequences/{gene_name}.muscle.afa"
+    log: "logs/muscle_align_panaroo_core_genes/{gene_name}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule calc_panaroo_indiv_core_gene_trees:
+    input: "data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas"
+    output: "data/panaroo/aligned_gene_sequences/gene_trees/{gene_name}.tre"
+    log: "logs/fasttree_panaroo/{gene_name}_fasttree.log"
+    #conda: "code/fasttree.yaml"
+    shell:
+        """
+        FastTree -gtr -nt {input} > {output}
+        """
+
+rule calc_panaroo_indiv_core_gene_IQtrees:
+    input: "data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas"
+    output: "data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas.treefile"
+    log: "logs/iqtree_panaroo/{gene_name}_fasttree.log"
+    conda: "code/iqtree.yaml"
+    shell:
+        """
+        iqtree -s {input}
+        """
+
+rule calc_panaroo_indiv_core_gene_IQtrees_from_muscle_alignments:
+    input: "data/panaroo/aligned_gene_sequences/{gene_name}.muscle.afa"
+    output: "data/panaroo/aligned_gene_sequences/{gene_name}.muscle.afa.treefile"
+    log: "logs/iqtree_muscle_panaroo/{gene_name}_fasttree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=2
+    shell:
+        """
+        iqtree -s {input} -T {resources.cpus} -ntmax {resources.cpus}
+        """
+
+rule calc_panaroo_indiv_core_gene_IQtrees_from_filtered_muscle_alignments:
+    input: "data/panaroo/aligned_gene_sequences/{gene_name}.muscle.filtered.afa"
+    output: "data/panaroo/aligned_gene_sequences/{gene_name}.muscle.filtered.afa.treefile"
+    log: "logs/iqtree_muscle_panaroo/{gene_name}_fasttree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=4
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -m GTR+I+G
+        """
+
+
+rule calc_panaroo_concat_core_gene_tree:
+    input: "data/panaroo/core_gene_alignment_filtered.aln"
+    output: "data/panaroo/core_gene_alignment_filtered.tre"
+    log: "logs/fasttree_panaroo/core_gene_alignment_fasttree.log"
+    conda: "code/fasttree.yaml"
+    shell:
+        """
+        FastTree -gamma -gtr -nt {input} > {output}
+        """
+
+rule calc_panaroo_concat_core_gene_IQtrees:
+    input: "data/panaroo/core_gene_alignment_filtered.aln"
+    output: "data/panaroo/core_gene_alignment_filtered.aln.treefile"
+    log: "logs/iqtree_panaroo/core_gene_alignment_iqtree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=64
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -m GTR+I+G | tee {log}
+        """
+
+rule run_panaroo_trees:
+    input: 
+        #expand("data/panaroo/aligned_gene_sequences/gene_trees/{gene_name}.tre", gene_name = glob_wildcards("data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas").gene_name),
+        expand("data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas.treefile", gene_name = glob_wildcards("data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas").gene_name),
+        #"data/panaroo/core_gene_alignment_filtered.tre",
+        #"data/panaroo/core_gene_alignment_filtered.aln.treefile",
+        expand("data/panaroo/aligned_gene_sequences/{gene_name}.muscle.afa.treefile", gene_name = glob_wildcards("data/panaroo/aligned_gene_sequences/{gene_name}.aln.fas").gene_name),
+        expand("data/panaroo/aligned_gene_sequences/{gene_name}.muscle.filtered.afa.treefile", gene_name = glob_wildcards("data/panaroo/aligned_gene_sequences/{gene_name}.muscle.filtered.afa").gene_name),
+
+
+rule align_pararoo_core_marker_amplicons:
+    input: "data/panaroo/core_gene_primer_products/{amplicon}.fasta"
+    output: "data/panaroo/core_gene_primer_products/{amplicon}.afa"
+    log: "logs/core_gene_primer_products/{amplicon}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule calc_pararoo_core_marker_amplicons_IQtrees:
+    input: "data/panaroo/core_gene_primer_products/{amplicon}.afa"
+    output: "data/panaroo/core_gene_primer_products/{amplicon}.afa.treefile"
+    log: "logs/core_gene_primer_products/{amplicon}_iqtree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=4
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -m GTR+I+G | tee {log}
+        """
+
+rule run_panaroo_coreGene_amplicon_trees:
+    input: 
+        expand("data/panaroo/core_gene_primer_products/{amplicon}.afa.treefile", amplicon = glob_wildcards("data/panaroo/core_gene_primer_products/{amplicon}.fasta").amplicon)
+
+
+# rule muscle_align_pararoo98_core_genes:
+#     input: "data/panaroo_98/core_gene_alignment_filtered.aln"
+#     output: "data/panaroo_98/core_gene_alignment_filtered.muscle.afa"
+#     log: "logs/muscle_align_panaroo98_concact_coregenes.log"
+#     conda: "code/muscle.yaml"
+#     resources: cpus=16
+#     shell:
+#         """
+#         export OMP_NUM_THREADS={resources.cpus}
+#         muscle -align {input} -threads {resources.cpus} -output {output} > log
+#         """
+
+
+rule calc_panaroo98_concat_core_gene_IQtree:
+    input: "data/panaroo_98/core_gene_alignment_filtered.aln"
+    output: "data/panaroo_98/core_gene_alignment_filtered.aln.treefile"
+    log: "logs/iqtree_panaroo98_concact_coregenes.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=64
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -m GTR+I+G | tee {log}
+        """
+
+
+rule align_hist_markers_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/historic/{gene}_curated.fasta"
+    output: "data/panaroo/exported_marker_genes/historic/{gene}_curated.afa"
+    log: "logs/align_hist_markers_from_panaroo/{gene}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule iqtree_hist_markers_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/historic/{gene}_curated.afa"
+    output: "data/panaroo/exported_marker_genes/historic/{gene}_curated.afa.treefile"
+    log: "logs/iqtree_hist_markers_from_panaroo/{gene}_iqtree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=4
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -m GTR+I+G | tee {log}
+        """
+
+rule run_hist_markers_from_panaroo_trees:
+    input: 
+        expand("data/panaroo/exported_marker_genes/historic/{gene}_curated.afa.treefile", gene = glob_wildcards("data/panaroo/exported_marker_genes/historic/{gene}_curated.fasta").gene)
+
+
+
+
+rule align_cai23_markers_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/cai_2023/{gene}.fasta"
+    output: "data/panaroo/exported_marker_genes/cai_2023/{gene}.afa"
+    log: "logs/align_cai23_markers_from_panaroo/{gene}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule iqtree_cai23_markers_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/cai_2023/{gene}.afa"
+    output: "data/panaroo/exported_marker_genes/cai_2023/{gene}.afa.treefile"
+    log: "logs/iqtree_cai23_markers_from_panaroo/{gene}_iqtree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=4
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -redo -m GTR+I+G | tee {log}
+        """
+
+rule align_cai23_amplicons_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.fasta"
+    output: "data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.afa"
+    log: "logs/align_cai23_markers_from_panaroo/{gene}_muscle.log"
+    conda: "code/muscle.yaml"
+    resources: cpus=16
+    shell:
+        """
+        export OMP_NUM_THREADS={resources.cpus}
+        muscle -align {input} -threads {resources.cpus} -output {output} > log
+        """
+
+rule iqtree_cai23_amplicons_from_panaroo:
+    input: "data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.afa"
+    output: "data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.afa.treefile"
+    log: "logs/iqtree_cai23_markers_from_panaroo/{gene}_iqtree.log"
+    conda: "code/iqtree.yaml"
+    resources: cpus=4
+    shell:
+        """
+        iqtree -s {input} -ntmax {resources.cpus} -T {resources.cpus} -redo -m GTR+I+G | tee {log}
+        """
+
+
+rule run_cai23_markers_from_panaroo_trees:
+    input: 
+        expand("data/panaroo/exported_marker_genes/cai_2023/{gene}.afa.treefile", gene = glob_wildcards("data/panaroo/exported_marker_genes/cai_2023/{gene}.fasta").gene),
+        expand("data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.afa.treefile", gene = glob_wildcards("data/panaroo/exported_marker_genes/cai_2023_amplicons/{gene}.fasta").gene)
+
+
+
+rule map_metag_reads_to_lgt:
+    input:
+        f_reads = "/geomicro/data2/kiledal/GLAMR/data/projects/set_17/metagenomes/{sample}/reads/decon_fwd_reads_fastp.fastq.gz",
+        r_reads = "/geomicro/data2/kiledal/GLAMR/data/projects/set_17/metagenomes/{sample}/reads/decon_rev_reads_fastp.fastq.gz",
+        ref = "data/panaroo/exported_marker_genes/best_amplicons/lgt__516.afa"
+    output:
+        temp_bam = temp("data/strain_mapping_lgt_metag/{sample}_mapped_temp.bam"),
+        sam = temp("data/strain_mapping_lgt_metag/{sample}_mapped.sam"),
+        bam = "data/strain_mapping_lgt_metag/{sample}_mapped.bam",
+        unsorted_bam = temp("data/strain_mapping_lgt_metag/{sample}_mapped_unsorted.bam")
+    conda: "code/bwa.yaml"
+    log: "logs/strain_mapping_lgt_metag/{sample}__BWA.log"
+    resources: cpus=8
+    shell:
+        """
+        minimap2 \
+            -ax sr \
+            -t {resources.cpus} \
+            --secondary=no \
+            --sam-hit-only \
+            {input.ref} \
+            {input.f_reads} {input.r_reads} > {output.sam}
+
+        samtools view -bS {output.sam} > {output.temp_bam}
+        
+        filterBam \
+            --in {output.temp_bam} \
+            --out {output.unsorted_bam} \
+            --minCover 25 \
+            --minId 90
+        
+        samtools sort -o {output.bam} -@ {resources.cpus} {output.unsorted_bam}
+        samtools index -@ {resources.cpus} {output.bam}
+        """
+
+rule run_metag_strain_mapping_lgt:
+    input: expand("data/strain_mapping_lgt_metag/{sample}_mapped.bam", sample = glob_wildcards("/geomicro/data2/kiledal/GLAMR/data/projects/set_17/metagenomes/{sample}/reads/decon_fwd_reads_fastp.fastq.gz", followlinks=True).sample)
+
+# sample = os.popen("ls ~/GLAMR/data/projects/set_17/metagenomes/").read().splitlines()
+
+# rule map_to_concat_orig_assembly_and_pangenome:
+#     input: 
+#         original_assembly = "data/WLECC_reassembly/{genome}/original_assembly.fa",
+#         pangenome = "data/panaroo/pan_genome_reference.fa"
+#     output: 
+#         concat_pangenome_and_genome = temp("data/WLECC_reassembly/{genome}/concat_ref.fa"),
+#         sam = temp("data/WLECC_reassembly/{genome}/mapped.sam"),
+#         mapped_reads_f = "data/WLECC_reassembly/{genome}/genes_mapped_to_pangenome_and_orig_fwd.fa",
+#         mapped_reads_r = "data/WLECC_reassembly/{genome}/genes_mapped_to_pangenome_and_orig_rev.fa"
+#     conda: "code/bwa.yaml"
+#     resources: cpus = 32, mem_mb = 150000, time_min = 10000
+#     shell:
+#         """
+#         cat {input.original_assembly} {input.pangenome} > {output.concat_pangenome_and_genome}
+
+#         minimap2 \
+#             -ax sr \
+#             -t {resources.cpus} \
+#             --sam-hit-only \
+#             {output.concat_pangenome_and_genome} \
+#             {input.f_reads} {input.r_reads} > {output.sam}
+
+#         samtools fastq -1 {output.mapped_reads_f} -2 {output.mapped_reads_r} -0 /dev/null -s /dev/null -n {output.sam}
+#         """
+
+# rule assemble_spades:
+#     input: 
+#         mapped_reads_f = "data/WLECC_reassembly/{genome}/genes_mapped_to_pangenome_and_orig_fwd.fa",
+#         mapped_reads_r = "data/WLECC_reassembly/{genome}/genes_mapped_to_pangenome_and_orig_rev.fa"
+#     output:
+#         spades_dir = directory("data/WLECC_reassembly/{genome}/spades")
+#     conda:
+#     resources:
+#     shell:
+#         """
+#         """
