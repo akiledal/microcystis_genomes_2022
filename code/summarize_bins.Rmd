@@ -9,7 +9,7 @@ knitr::opts_knit$set(root.dir = here::here())
 # Load required packages
 library(tidyverse)
 library(Biostrings)
-library(heatmaply)
+#library(heatmaply)
 ```
 
 ## Bin summary metrics
@@ -197,11 +197,11 @@ coverm_tidy <- read_tsv("results/bin_coverage.tsv") %>%
       metric == "Variance" ~ "variance",
       metric == "Length" ~ "length")
     ) %>% 
-  rename(bin = "Genome")
+  dplyr::rename(bin = "Genome")
   
 coverm_tidy_wide <- coverm_tidy %>% 
   pivot_wider(names_from = metric, values_from = value ) %>% 
-  left_join(simple_bin_summary %>% dplyr::select(bin, length)) %>% 
+  left_join(simple_bin_summary %>% dplyr::select(bin, length, gtdb_classification, checkM_Completeness, checkM_Contamination)) %>% 
   mutate(percent_bin_bases_covered = covered_bases/length*100) %>% 
   left_join(seqID_to_strainID %>% dplyr::rename(sample_reads = "sequencingID"))
 

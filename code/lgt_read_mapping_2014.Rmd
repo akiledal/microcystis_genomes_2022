@@ -1,0 +1,179 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here("~/projects/microcystis_genomes_2022/"))
+
+library(tidyverse)
+library(Rsamtools)
+```
+
+Get sample metadata
+```{r}
+googledrive::as_id("https://docs.google.com/spreadsheets/d/1z2IajV0Ay1lRjH9d0ibNBuf8PY0IbtEz/edit#gid=349037648") %>% 
+  googledrive::drive_download("data/Great_Lakes_Omics_Datasets.xlsx",overwrite = TRUE)
+
+# Read in sample and study tables
+samples <- readxl::read_excel("data/Great_Lakes_Omics_Datasets.xlsx",sheet = "samples",guess_max = 3000) %>% 
+  mutate(date = lubridate::ymd_hms(collection_date),
+         date = if_else(is.na(date),lubridate::ymd(collection_date),date),
+         date_same_year = lubridate::`year<-`(date,2014)) %>% 
+  select(SampleID, date, lat, lon, NOAA_Site , starts_with("size_frac"))
+
+```
+
+
+
+```{r}
+bam_stats_w_nuc_info <- function(bam_path){
+
+  bam <- Rsamtools::BamFile(file = bam_path,
+                            index = paste0(bam_path,".bai"))
+  
+  # number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  out <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    mutate(sample_total_bases_mapped = sum(count)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           per_ref_total_mapped_bases = sum(count),
+           ref_rel_abund = per_ref_total_mapped_bases / sample_total_bases_mapped) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+    arrange(seqnames, pos, desc(count)) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count),
+             nuc_rank = row_number(),
+             depth = sum(count),
+             rel_abund = count/depth,
+             prop_non_primary_base = sum(non_primary_base_count) / depth,
+             ratio_to_primary = count / max(count),
+             percent_covered_bases = (max(depth) > 0) / seq_length * 100) %>%
+    #left_join(. %>% group_by(seq_length,.drop = FALSE) %>% summarise(percent_covered_bases = sum(min(depth) > 0) / seq_length * 100))
+    group_by(seqnames) %>% 
+      mutate(prop_non_primary_seq = sum(non_primary_base_count) / per_ref_total_mapped_bases,
+             #percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary_seq * 100,
+             bam_path = bam_path) %>% 
+    left_join(reads_pile)
+}
+```
+
+
+
+
+```{r}
+bam_files <- system("ls data/strain_mapping_lgt_metag/*.bam", intern = TRUE)
+
+all_bam_stats_w_seqs_bam <- map_df(bam_files, bam_stats_w_nuc_info) 
+
+mae_order <- c("Mae1", "Mae2_(HL/LG)", "Mae2_(LL/LG)", "Mae3_1", "Mae3_2", "Mae3_3", "Mae4", "Mae5", "Mae6", "Mae7", "Mae8", "Mae9", "Mae10", "Mfl_ae1", "Mfl_ae2", "Mfl_ae3", "Mfl_ae4", "Mfl_ae5", "Mn", "Mpa", "Mvi", "Mwe", "Other")
+
+ordered_color_map <- color_map %>% 
+  mutate(group = case_when(is.na(group) ~ "Other",
+                           .default = group),
+         hex_col = case_when(group == "Other" ~ "#9C0000",
+                           .default = hex_col),
+         group = factor(group, mae_order, ordered = TRUE)) %>% 
+  arrange(group) %>% 
+  mutate(hex_col = factor(hex_col, levels = unique(.$hex_col), ordered = TRUE))
+
+
+all_bam_stats_w_seqs <- all_bam_stats_w_seqs_bam %>% 
+  mutate(SampleID = bam_path %>% basename() %>% str_remove("_mapped.*"),
+         genome = str_remove(seqnames, ";.*")) %>% 
+  left_join(samples) %>% 
+  left_join(ordered_color_map %>% select(genome = "tip.label", group, hex_col, WLECC)) %>% 
+  mutate(group = case_when(is.na(group) ~ "Other",
+                           .default = group),
+         hex_col = case_when(group == "Other" ~ "#9C0000",
+                           .default = hex_col),
+         group = factor(group, levels = mae_order, ordered = TRUE))
+  
+
+test <- all_bam_stats_w_seqs_bam %>% 
+  group_by(bam_path,seqnames) %>% 
+  summarise(rel_abund_total = sum(ref_rel_abund))
+
+
+all_bam_stats_w_seqs %>% 
+  group_by(seqnames) %>% 
+  mutate(mean_depth = mean(depth),
+         size_frac_up = case_when(as.numeric(size_frac_up) == 0.22 ~ "> 0.22 μm fraction",
+                                  as.numeric(size_frac_up) == 100.0 ~ "> 100 μm fraction")) %>% 
+  select(group, date, NOAA_Site, size_frac_up, hex_col, ref_rel_abund) %>% 
+  distinct() %>% 
+  group_by(group, date, NOAA_Site, size_frac_up, hex_col) %>% 
+  summarise(rel_abund = sum(ref_rel_abund)) %>% 
+  #filter(mean_depth >10 ) %>% 
+  ggplot(aes(date, rel_abund, fill = factor(hex_col, levels = unique(ordered_color_map$hex_col), ordered = TRUE))) +
+  geom_bar(stat = "identity", color = "black", size = 0.2, width = as.numeric(days(3))) +
+  scale_fill_identity(breaks = ordered_color_map$hex_col, labels = ordered_color_map$group,guide = "legend") + 
+  facet_grid(NOAA_Site~size_frac_up) +
+  labs(fill = "Group", y = "Relative abundance", x = "Date") +
+  theme_bw()
+
+ggsave("results/2014_strain_comp_by_lgt_marker_gene.png", width = 4, height =2, scale = 2, dpi= 300)
+```
+
+
+
+
+
+
+```{r}
+all_bam_stats_w_seqs <- map_df(bam_files, bam_stats_w_nuc_info)
+
+plot_data <- all_bam_stats_w_seqs %>% 
+  mutate(sample = bam_path %>% str_remove(".*gene_PA_read_mapping_BWA/") %>% str_remove("/.*")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  left_join(id_map) %>% 
+  filter(!is.na(pubID))
+
+katG <- plot_data %>% 
+  filter(seqnames =="katG",
+         pubID == "LE19-131.1")
+
+path <- bam_files %>% 
+  data.frame(path = .) %>% 
+  filter(str_detect(path, "ND-89")) %>% pull(path)
+
+katG_seq <- Rsamtools::pileup(path,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+  filter(seqnames =="katG") %>% 
+  group_by(pos) %>% 
+  slice_max(count,n=1) %>% 
+  pull(nucleotide) %>% 
+  paste0(collapse = "")
+
+sample_genotype_summary <- plot_data %>% 
+  select(pubID, seqnames, percent_covered_bases, mean_depth,percent_id_to_consensus,depth_var) %>% 
+  distinct() %>% 
+  group_by(pubID) %>% 
+  mutate(n_genes = sum(percent_covered_bases > 50)) %>% 
+  arrange(desc(n_genes), desc(mean_depth))
+
+sample_order <- sample_genotype_summary %>% pull(pubID) %>% unique()
+mcy_order <- paste0("mcy", LETTERS[seq( from = 1, to = 10 )])
+```
+
+
+
+
+
+
+
+
+
+

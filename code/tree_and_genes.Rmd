@@ -51,17 +51,31 @@ full_data_for_plot_long <- data_for_plot %>%
   group_by(strainID, gene_type,gene, gene_group) %>%
   summarise(pres_abs = sum(pres_abs)) %>% 
   left_join(seqID_to_strainID) %>% 
-  left_join(sample_genotype_summary %>% 
+  left_join(sample_genotype_summary %>%
+              mutate(seqnames = case_when(
+                          seqnames == "alkp-like" ~ "MAE_16640",
+                          #seqnames == "ccmM"~"cccmM",
+                          seqnames == "sip"~ "MAE_47020",
+                          seqnames == "pstB_1"~ "pstB2",
+                          TRUE ~ as.character(seqnames)),
+                    seqnames = str_remove(seqnames, "_[0-9]$")) %>% 
               filter(percent_covered_bases > 50,
                      mean_depth > 1) %>% 
             select(gene = "seqnames", pubID) %>%
               mutate(read_mapping = 0.5), by = c("gene", "pubID")) %>%
+  mutate(read_mapping = if_else(pres_abs ==1 & is.na(read_mapping), 0.25, read_mapping)) %>% 
   filter(strainID %in% tree_strains$strain,
          !is.na(pubID)) %>% 
   group_by(gene) %>%
   mutate(pres_abs = if_else(pres_abs == FALSE, read_mapping, 1),
+         pres_abs = if_else(read_mapping == 0.25, 0, pres_abs), # Remove BLAST positives not supported by read mapping (likely due to inconsistency in BLAST filtering by various people looking at different gene classes)
          pres_abs = if_else(is.na(pres_abs), 0, pres_abs),
+         pres_abs = if_else(pubID == "LE19-196.1" & gene == "sbtB", 1, pres_abs), # Override one edge case where read mapping too sensitive
          percent_present = length(pres_abs[pres_abs > 0]) / n())
+
+read_mapping_and_blast_discrepancies <- full_data_for_plot_long %>% 
+  filter()
+
 
 # data_for_Reagan <- full_data_for_plot_long %>% 
 #   left_join(collection_dates) %>% 
@@ -183,8 +197,8 @@ collection_dates <- strain_collection_info %>%
 # Get strain heterogeneity information
 
 strain_het_checkm <- read_tsv(strain_het_checkm_fp) %>% 
-  select(-strainID) %>% 
-  left_join(seqID_to_strainID %>% select(sequencingID, pubID), by = "sequencingID") %>% 
+  dplyr::select(-strainID) %>% 
+  left_join(seqID_to_strainID %>% select(sequencingID, pubID), by = c("sequencingID", "pubID")) %>% 
   full_join(data.frame(pubID = equiv_names$pubID),by = "pubID") %>% # import but also make sure all strains are represented, even if no strain het information is available
   mutate(method = "checkM") %>% 
   dplyr::rename(strain_het ="Strain heterogeneity")
@@ -316,7 +330,7 @@ ggsave(plot = full_combined_plot_genes, "results/microcystis_gene_tree_FULL.pdf"
 (strain_gene_plot2 <- simp_plot_data %>%
     filter(!is.na(gene_group)) %>% # remove genes not part of any group
     group_by(gene_group,pubID, gene_type) %>% 
-    summarise(group_completion = sum(pres_abs) / n()) %>% 
+    summarise(group_completion = sum(pres_abs > 0) / n()) %>% 
   ggplot(aes(gene_group, factor(pubID,levels = tip_order$label, ordered = TRUE), fill = group_completion)) +
   geom_tile(color = "black") + 
   #scale_fill_manual(values = c("white", "black")) +

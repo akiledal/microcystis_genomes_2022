@@ -1,73 +1,237 @@
 ---
 title: "R Notebook"
 output: html_notebook
+editor_options: 
+  chunk_output_type: inline
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_knit$set(root.dir = here::here())
 
-# library(tidyverse)
-# library(vegan)
-# library(ape)
-# library(Biostrings)
-# library(TreeDist)
+library(DECIPHER)
+library(tidyverse)
+library(vegan)
+library(ape)
+library(Biostrings)
+library(TreeDist)
+library(future)
+library(ggtree)
+library(MonoPhy)
+library(furrr)
+library(phytools)
+library(patchwork)
+
+set.seed(2022)
 ```
 
 
+## Read in reference information
 ```{r}
-
-seq_16S <- Biostrings::readDNAStringSet("data/marker_genes/identified_variants/16S_called_variants.fasta")
-
-V4_primers <- Biostrings::DNAStringSet(c("GTGYCAGCMGCCGCGGTAA","GGACTACNVGGGTWTCTAAT"))
-
-V4_16S <- DECIPHER::AmplifyDNA(V4_primers,seq_16S,annealingTemp=55, P=4e-7, maxProductSize=500)
-
-```
-
-
-
-
-
-```{r}
+# Mapping between sequencing core IDs and our strain identifiers
 seqID_to_strainID <- read_tsv("data/strain_to_seq_sample_map.tsv") %>% 
   mutate(straindID_underscores = str_replace_all(strainID, "-", "_"))
 
+# Which samples / strains should be considered
 samples_to_use <- read_tsv("data/samples_to_use.tsv")
 
+# Genome ID mapping file from initial work done by Jacob
+jacob_mapping <- read_csv("data/reference/jacob_reference_genomes/jacob_short_names_map2.csv",col_names = c("long", "short"))
+
+# Concatenated core gene produced in initial work with Jacob & used in the WLECC culture collection paper
+jacob_tree <- read.tree("data/jacob_tree2.nwk")
+
+# Bin tax IDs
 gtdb <- read_tsv("data/gtdb/gtdbtk.bac120.summary.tsv") %>% 
   filter(str_detect(classification,"Microcystis")) %>% 
   mutate(bin = user_genome)
 
+# Bin checkM results
 checkM <- read_tsv("data/drep/data/checkM/checkM_outdir/results.tsv") %>% 
   mutate(bin = str_remove(`Bin Id`, ".fasta")) %>% 
   filter(bin %in% gtdb$bin)
 
-strain_het <- checkM %>% 
-  mutate(sample = str_remove(bin,"_.*"),
-         strain_contam = Contamination * (`Strain heterogeneity` / 100)) %>% 
-  filter(sample %in% samples_to_use$samples_to_use) %>% 
-  select(sample, bin, Completeness, Contamination, `Strain heterogeneity`, strain_contam) %>% 
-  group_by(sample) %>% top_n(1,Completeness) %>% 
-  mutate(sequencingID = sample) %>% 
+gtotree <- read.tree("data/gtotree/gtotree.tre")
+
+our_strains <- gtotree$tip.label[str_detect(gtotree$tip.label,"LE")]
+
+our_strains_df <- our_strains %>% 
+  data.frame(straindID_underscores = .) %>% 
   left_join(seqID_to_strainID) %>% 
-  write_tsv("results/strain_het_from_checkm.tsv")
+  filter(!is.na(strainID))
 
-hq_tree <- read.tree("data/gtotree/gtotree.tre")
-#hq_tree <- read.tree("data/jacob_tree2.nwk")
+our_strains <- our_strains_df$straindID_underscores
 
-our_strains <- hq_tree$tip.label[str_detect(hq_tree$tip.label,"LE")]
-
-hq_tree_ours_only <- ape::keep.tip(hq_tree,tip = our_strains)
+gtotree_ours_only <- ape::keep.tip(gtotree,tip = our_strains)
 
 ani_tree <- read.tree("data/bin_ani_tree.nwk")
-ani_tree_ours_only <- ape::keep.tip(ani_tree,tip = our_strains)
+ani_tree_ours_only <- ape::keep.tip(ani_tree,tip = our_strains %>% str_replace_all("-", "_"))
 
-TreeDist::RobinsonFoulds(ani_tree,hq_tree)
 
-ape::comparePhylo(ani_tree, hq_tree, plot = TRUE)
-ape::comparePhylo(ani_tree_ours_only, hq_tree_ours_only, plot = TRUE)
+# Color information for plotting
+test <- read_rds("data/joined_map.rds") %>% 
+  dplyr::rename(tip.label = "short_name") %>% 
+  dplyr::select("tip.label", "group", "hex_col") %>% 
+  mutate(WLECC = if_else(str_detect(tip.label, "^LE"), TRUE, FALSE))
 
-variant_tree_files <- list.files("data/marker_genes/identified_variants",pattern = ".tre",full.names = TRUE)
+
+mae_colors <- test %>% 
+  dplyr::select(group, hex_col) %>% 
+  distinct() %>% 
+  mutate(color = set_names(hex_col, group)) %>% 
+  pull(color)
+
+jacob_mapping <- read_csv("data/reference/jacob_reference_genomes/jacob_short_names_map3.csv",col_names = c("old", "short", "long"))
+
+color_map <- jacob_mapping %>% 
+  left_join(test %>% dplyr::rename(short = "tip.label")) %>% 
+  dplyr::rename(short_name = "short") %>% 
+  dplyr::rename(tip.label = "long") %>% 
+  mutate(group = case_when(tip.label == "Microcystis_wesenbergii_LE013-01" ~ "Mae8",
+                           tip.label == "Microcystis_aeruginosa_LE3" ~ "Mae1",
+                           tip.label == "Microcystis_aeruginosa_LE13-04" ~ "Mae2_(LL/LG)",
+                           TRUE ~ as.character(group)),
+         hex_col = case_when(tip.label == "Microcystis_wesenbergii_LE013-01" ~ "#803C00",
+                           tip.label == "Microcystis_aeruginosa_LE3" ~ "#806000",
+                           tip.label == "Microcystis_aeruginosa_LE13-04" ~ "#7030CD",
+                           TRUE ~ as.character(hex_col)),
+         WLECC = case_when(tip.label == "Microcystis_wesenbergii_LE013-01" ~ "FALSE",
+                           tip.label == "Microcystis_aeruginosa_LE3" ~ "FALSE",
+                           tip.label == "Microcystis_aeruginosa_LE13-04" ~ "FALSE",
+                           TRUE ~ as.character(WLECC))) %>% 
+  write_tsv("data/reference/color_map.tsv")
+  #select(tip.label, group)
+
+
+```
+
+
+
+# Phylomark
+Read in results from phylomark analysis of Microcystis genomes. Phylomark used a 500-bp sliding window to look through the microcystis genomes and identify the region that best recapitulated the HQ tree. 
+
+Uses tree distances metrics from the TreeDist package:
+Smith (2020) scores matchings based on the amount of information that one partition contains about the other. The Mutual Phylogenetic Information assigns zero similarity to split pairs that cannot both exist on a single tree; The Mutual Clustering Information metric is more forgiving, and exhibits more desirable behaviour; it is the recommended metric for tree comparison. (Its complement, ClusteringInfoDistance(), returns a tree distance). We also used 
+
+```{r}
+phylomark_results <- read_tsv("data/phylomark/400bp/results.txt")
+
+phylomark_top100 <- phylomark_results %>% 
+  top_n(100,-RF)
+
+subset_tree <- function(tree){
+  trimmed_tree <- ape::keep.tip(tree,tip = our_strains)
+  return(trimmed_tree)
+}
+
+dist_to_hq_tree <- function(tree){
+  dist_to_multigene_tree <- TreeDist::RobinsonFoulds(tree,hq_tree_ours_only, normalize = TRUE)
+  return(dist_to_multigene_tree)
+}
+
+full_phylomark_trees <- read_tsv("data/phylomark/400bp/all_trees.txt", col_names = c("sequence", "tree")) %>% 
+  filter(sequence %in% phylomark_top100$sequence) %>% 
+  left_join(phylomark_top100) %>% 
+  rowwise() %>% 
+  mutate(tree_formatted = list(ape::read.tree(text = tree)),
+         phylomark_RF = TreeDist::RobinsonFoulds(tree_formatted,gtotree, normalize = TRUE), # without normalizing this matches what was reported by phylomark
+         phylomark_clustInfo_dist = TreeDist::ClusteringInfoDistance(tree_formatted,gtotree,normalize = TRUE),
+         phylomark_phyloInfo_dist = TreeDist::PhylogeneticInfoDistance(tree_formatted,gtotree, normalize = TRUE),
+         type = "phylomark") %>% 
+  ungroup() %>% 
+  mutate(rounded_seq = plyr::round_any(sequence,100)) %>% # Group sequences that are close to each other and pick the best
+  group_by(rounded_seq) %>% 
+  arrange(RF) %>% 
+  mutate(order = row_number(),
+         mean_dist = (phylomark_RF + phylomark_clustInfo_dist + phylomark_phyloInfo_dist) / 3) %>% 
+  filter(order == 1) %>% 
+  ungroup() %>% 
+  arrange(mean_dist) %>%
+  mutate(order = row_number()) #%>%
+  # filter(order == 1)
+
+phylomark_trees_our_strains <- read_tsv("data/phylomark/400bp/all_trees.txt", col_names = c("sequence", "tree")) %>% 
+  filter(sequence %in% phylomark_top100$sequence) %>% 
+  left_join(phylomark_top100) %>% 
+  rowwise() %>% 
+  mutate(tree_formatted = list(ape::read.tree(text = tree)),
+         phylomark_RF = TreeDist::RobinsonFoulds(tree_formatted,gtotree, normalize = TRUE),
+         phylomark_our_strains = list(subset_tree(tree_formatted)),
+         phylomark_RF_our_strains = dist_to_hq_tree(phylomark_our_strains),
+         type = "phylomark") %>% 
+  ungroup() %>% 
+  mutate(rounded_seq = plyr::round_any(sequence,100)) %>% 
+  group_by(rounded_seq) %>% 
+  arrange(RF) %>% 
+  mutate(order = row_number()) %>% 
+  filter(order == 1) %>% 
+  arrange(phylomark_RF_our_strains) %>% 
+  mutate(order = row_number()) %>% 
+  filter(order == 1)
+
+phylomark_seqs <- Biostrings::readDNAStringSet("data/phylomark/400bp/query_sequences.fasta") %>% 
+  data.frame(seq = ., header = names(.))
+  
+
+phylomark_trees_our_strains %>% 
+  ggplot(aes(phylomark_RF, phylomark_RF_our_strains, color = `#polymorphisms`, label = sequence)) +
+  geom_point() +
+  geom_label() +
+  theme_bw() +
+  labs(x = "RF distance to multi-gene tree for all microcystis",
+       y = "RF distance to multi-gene tree for WLE strains") +
+  scale_color_viridis_c()
+```
+
+
+# Targeted marker gene analysis
+```{r}
+gene_trees <- system("ls data/marker_genes_extracted_from_jacob_genomes/*.tre", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = basename(path) %>% str_remove(".tre"))
+
+gene_tree_list <- gene_trees$path
+names(gene_tree_list) <- gene_trees$gene
+
+path = "data/marker_genes_extracted_from_jacob_genomes/pgi.tre"
+
+compare_to_hq <- function(path){
+
+#gene = names(path)
+
+gene_tree <- read.tree(path)
+
+branch_names <- gene_tree$tip.label %>% 
+  data.frame(long = .) %>% 
+  mutate(long = str_replace_all(long, "-","_")) %>% 
+  left_join(jacob_mapping) %>% 
+  mutate(short = if_else(is.na(short), long, short)) %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(short = "jacob_name")) %>% 
+  mutate(short = if_else(!is.na(strainID), strainID, short))
+  
+gene_tree$tip.label <- branch_names$short
+
+shared_tips <- intersect(gene_tree$tip.label, hq_tree$tip.label)
+
+gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+
+out <- data.frame(RF = TreeDist::RobinsonFoulds(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                  clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                  phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+             path = path)
+
+return(out)
+}
+
+
+prelim_gene_dists <- map_df(gene_trees$path, compare_to_hq) %>% 
+  left_join(gene_trees)
+
+```
+
+Deprecated, think this was from testing some preliminary analysis
+```{}
+#ape::comparePhylo(gene_tree_subset, hq_tree_subset, plot = TRUE)
 
 variant_trees <- lapply(variant_tree_files,read.tree)
 
@@ -105,8 +269,8 @@ assoc <- cbind(t1$tip.label, t1$tip.label)
 
 
 dndlist <- dendextend::dendlist(t1, t2)
-dendextend::tanglegram(dndlist, fast = TRUE, margin_inner = 1.8, lab.cex = 0.3, lwd = 
-0.5, edge.lwd = 0.5, type = "r",)
+#dendextend::tanglegram(dndlist, fast = TRUE, margin_inner = 1.8, lab.cex = 0.3, lwd = 
+#0.5, edge.lwd = 0.5, type = "r",)
 
 
 compare_to_hq_tree <- function(tree){
@@ -121,70 +285,24 @@ tree_distances <- sapply(variant_trees, compare_to_hq_tree) %>%
 ```
 
 
+# Compare phylomark results and gene results
 
-Phylomark results
 ```{r}
-phylomark_results <- read_tsv("data/phylomark/400bp/results.txt") 
-
-phylomark_top100 <- phylomark_results %>% 
-  top_n(100,-RF)
-
-subset_tree <- function(tree){
-  trimmed_tree <- ape::keep.tip(tree,tip = our_strains)
-  return(trimmed_tree)
-}
-
-dist_to_hq_tree <- function(tree){
-  dist_to_multigene_tree <- TreeDist::RobinsonFoulds(tree,hq_tree_ours_only)
-  return(dist_to_multigene_tree)
-}
-
-
-phylomark_trees <- read_tsv("data/phylomark/400bp/all_trees.txt", col_names = c("sequence", "tree")) %>% 
-  filter(sequence %in% phylomark_top100$sequence) %>% 
-  left_join(phylomark_top100) %>% 
-  rowwise() %>% 
-  mutate(tree_formatted = list(ape::read.tree(text = tree)),
-         phylomark_our_strains = list(subset_tree(tree_formatted)),
-         phylomark_RF_our_strains = dist_to_hq_tree(phylomark_our_strains),
-         type = "phylomark") %>% 
-  ungroup() %>% 
-  mutate(rounded_seq = plyr::round_any(sequence,100)) %>% 
-  group_by(rounded_seq) %>% 
-  arrange(RF) %>% 
-  mutate(order = row_number()) %>% 
-  filter(order == 1) %>% 
-  arrange(phylomark_RF_our_strains) %>% 
-  mutate(order = row_number()) %>% 
-  filter(order == 1)
-
-phylomark_seqs <- Biostrings::readDNAStringSet("data/phylomark/400bp/query_sequences.fasta") %>% 
-  data.frame(seq = ., header = names(.))
-  
-
-phylomark_trees %>% 
-  ggplot(aes(RF, phylomark_RF_our_strains, color = `#polymorphisms`, label = sequence)) +
-  geom_point() +
-  geom_label() +
-  theme_bw() +
-  labs(x = "RF distance to multi-gene tree for all microcystis",
-       y = "RF distance to multi-gene tree for WLE strains") +
-  scale_color_viridis_c()
-
-phylomark_and_genes <- phylomark_trees %>% 
+# For all Microcystis
+phylomark_and_genes_full <- full_phylomark_trees %>% 
   mutate(marker = as.character(sequence)) %>% 
-  select(all_microcystis_RF = "RF", dist_to_hq_tree = "phylomark_RF_our_strains", marker, type) %>% 
-  full_join(tree_distances %>% 
+  select(all_microcystis_RF = "RF", dist_to_hq_tree = "phylomark_clustInfo_dist", marker, type) %>% 
+  full_join(prelim_gene_dists %>% 
               mutate(type = "existing_marker") %>% 
-              dplyr::rename(marker = "gene"))
+              dplyr::rename(marker = "gene", dist_to_hq_tree = "clust_info_dist"))
 
 
-phylomark_genes <- data.frame(marker = c("570950", "35920", "660160", "670124", "264397"),
-                              gene = c("accD", "GspE/PulE", "nrdR", "rpoC2", "Rne/Rng"))
+phylomark_genes <- data.frame(marker = c("570950", "570919", "35920", "660160", "670124", "264397", "212750"),
+                              gene = c("accD","accD" , "GspE/PulE", "nrdR", "rpoC2", "Rne/Rng", "PilT"))
 
 original_genes <- c("16S", "16SV2", "16SV4", "pgi", "recA", "glnA", "itsC")
 
-phylomark_and_genes %>% 
+(plot <- phylomark_and_genes_full %>% 
   left_join(phylomark_genes) %>% 
   mutate(marker = if_else(!is.na(gene), paste0(gene,"_",marker),marker)) %>% 
   mutate(type = if_else(marker == "ani", "ANI", type)) %>% 
@@ -192,15 +310,2347 @@ phylomark_and_genes %>%
   geom_bar(stat = "identity") +
   scale_fill_viridis_d(alpha = 0.8) +
   theme_bw() +
-  labs(y = "Marker / gene", "RF distance to multi-gene Microcystis tree") 
-ggsave("results/phylo_markers.png", height = 3, width = 3, dpi = 600, scale = 2)
+  labs(y = "Marker / gene", x = "") )
+ggsave("results/phylo_markers_allREFS.png", height = 3, width = 3, dpi = 600, scale = 2)
+
+
+```
+
+
+## Make primers for initial gene list from Laura & phylomark results
+```{r}
+library(DECIPHER)
+library(tidyverse)
+
+fas <- system("ls data/marker_genes_extracted_from_jacob_genomes/*.fasta", intern = TRUE)
+
+make_primers <- function(fasta){
+
+gene = basename(fasta) %>% str_remove(".fasta")
+  
+dbConn <- dbConnect(SQLite(), ":memory:")
+N <- Seqs2DB(fasta, "FASTA", dbConn, "")
+
+desc <- dbGetQuery(dbConn, "select description from Seqs")$description
+Add2DB(data.frame(identifier=desc, stringsAsFactors=FALSE), dbConn)
+
+
+# Designing primers for sequencing experiments:
+TYPE <- "sequence"
+MIN_SIZE <- 275 # base pairs
+MAX_SIZE <- 450
+RESOLUTION <- 5 # k-mer signature
+LEVELS <- 5 # max number of each k-mer
+ENZYMES <- NULL # required for sequencing
+
+primers <- DesignSignatures(dbConn,tblName = "Seqs",
+    type=TYPE,
+    minProductSize=MIN_SIZE,
+    maxProductSize=MAX_SIZE,
+    resolution=RESOLUTION,
+    levels=LEVELS,
+    enzymes=ENZYMES) %>% 
+  mutate(gene = gene)
+
+return(primers)
+}
+
+all_litGene_primers <- map_df(fas, make_primers) %>% 
+  write_tsv("data/all_primer_candidates.tsv")
+
 
 ```
 
 
 
-Check for heterogeneity in read mappings
 ```{r}
+all_litGene_primers <- read_tsv("data/all_primer_candidates.tsv")
+
+
+(all_litGene_primers %>% 
+  ggplot(aes(score, coverage, color = gene)) +
+  geom_point() ) %>% plotly::ggplotly()
+```
+
+
+```{r}
+
+all_litGene_primers_W_ranks <- all_litGene_primers %>% 
+  group_by(gene) %>% 
+  arrange(desc(score)) %>% 
+  mutate(score_rank = row_number()) %>% 
+  group_by(gene) %>% 
+  arrange(desc(coverage)) %>% 
+  mutate(coverage_rank = row_number()) %>% 
+  filter(coverage_rank == 1 | score_rank == 1)
+
+ all_litGene_primers_W_ranks %>% 
+   ggplot(aes(-score_rank, -coverage_rank, color = gene, label = gene)) +
+  geom_jitter() 
+   #ggrepel::geom_label_repel()
+```
+
+
+### Test primers
+#### Write out amplicons from primers for alignment & tree construction 
+```{r}
+
+best_litGene_primers <- all_primers %>% 
+  ungroup() %>% 
+  left_join(prelim_gene_dists %>% select(gene, clust_info_dist)) %>% 
+  mutate(scaled_score = scale(score),
+         scaled_coverage = scale(coverage),
+         scaled_num_prod = scale(products),
+         scaled_tree_dist = scale(1 - clust_info_dist),
+         combined_score = scaled_score + scaled_coverage + scaled_tree_dist + scaled_num_prod) %>% 
+  group_by(gene) %>% 
+  slice_max(combined_score, n = 2) %>% 
+  arrange(desc(combined_score)) %>% 
+  ungroup() %>% 
+  mutate(primer_pair = row_number(),
+         primer_pair_name = str_glue("{gene}__{primer_pair}")) %>% 
+  relocate(primer_pair_name) 
+
+best_litGene_primers %>% 
+  group_by(gene) %>% slice_max(combined_score) %>% 
+  ggplot(aes(combined_score, clust_info_dist, label = gene)) +
+  geom_text()
+
+primers_to_order <- best_primers %>% 
+  filter(primer_pair_name %in% c("glnA__1", "ftsZ__3", "PilT212750__13", "pgi__7"))
+
+primer_num = 1
+
+function(primer_num)
+
+litGene_PCR_prod <- best_litGene_primers %>% 
+  #filter(primer_pair == primer_num) %>% 
+  group_by(primer_pair) %>% 
+  rowwise() %>% 
+  mutate(primers = list(Biostrings::DNAStringSet(c(forward_primer, reverse_primer))),
+         seqs = list(Biostrings::readDNAStringSet(str_glue("data/marker_genes_extracted_from_jacob_genomes/{gene}.fasta"))),
+         pcr_products = list(DECIPHER::AmplifyDNA(primers = primers, myDNAStringSet = seqs, maxProductSize = 500,annealingTemp = 65,P = 4e-7)),
+         pcr_prod_df = list(data.frame(name = names(pcr_products), seq = as.character(pcr_products)) %>% 
+                              mutate(efficiency = str_remove(name , "%.*"),
+                                     genome = str_remove(name, ".*\\) "),
+                                     type = str_remove(name, ".*\\(") %>% str_remove("\\).*")
+                                     )
+                            )
+         )
+
+test_primers <- litGene_PCR_prod$primers[[1]]
+test_seqs <- litGene_PCR_prod$seqs[[1]]
+
+pcr_products <- litGene_PCR_prod %>% 
+  unnest(pcr_prod_df) %>% 
+  group_by(genome,gene) %>% 
+  slice_max(efficiency, n = 1,with_ties = FALSE) %>%
+  group_by(gene) %>% 
+  mutate(seq = set_names(seq, genome),
+         string_set = list(Biostrings::DNAStringSet(seq,use.names = TRUE)),
+         ) %>% 
+  rowwise() %>% 
+  mutate(string_set %>% Biostrings::writeXStringSet(filepath = str_glue("data/marker_genes_extracted_from_jacob_genomes/eval_primer_products/{gene}__{primer_pair}.fasta")))
+
+```
+
+
+#### Compare amplicon trees to HQ tree
+```{r}
+litGene_primer_trees <- system("ls data/marker_genes_extracted_from_jacob_genomes/eval_primer_products/*.tre", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = basename(path) %>% str_remove(".tre"))
+
+primer_tree_list <- litGene_primer_trees$path
+names(primer_tree_list) <- litGene_primer_trees$gene
+
+#path = "data/marker_genes_extracted_from_jacob_genomes/pgi.tre"
+
+compare_to_hq <- function(path){
+
+#gene = names(path)
+
+gene_tree <- read.tree(path)
+
+branch_names <- gene_tree$tip.label %>% 
+  data.frame(long = .) %>% 
+  mutate(long = str_replace_all(long, "-","_")) %>% 
+  left_join(jacob_mapping) %>% 
+  mutate(short = if_else(is.na(short), long, short)) %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(short = "jacob_name")) %>% 
+  mutate(short = if_else(!is.na(strainID), strainID, short))
+  
+gene_tree$tip.label <- branch_names$short
+
+shared_tips <- intersect(gene_tree$tip.label, hq_tree$tip.label)
+
+gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+
+out <- data.frame(RF = TreeDist::RobinsonFoulds(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                  clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                  phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+             path = path)
+
+return(out)
+}
+
+
+litGene_amplicon_dists <- map_df(primer_trees$path, compare_to_hq) %>% 
+  left_join(primer_trees) %>% 
+  mutate(gene_name = str_remove(gene, "__.*"))
+
+dist_metric = sym("clust_info_dist")
+
+prelim_gene_dists %>% 
+  mutate(type = "full_gene") %>% 
+  bind_rows(litGene_amplicon_dists %>% mutate(type = "amplicon")) %>% 
+  ggplot(aes(!!dist_metric, reorder(gene,-!!dist_metric), fill = type)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  labs(y = "primer", 
+       fill = NULL,
+       title = "Common marker genes: full length & amplicon tree distance \n to high-quality concatenated core gene tree")
+
+prelim_gene_dists %>% 
+  mutate(type = "full_gene") %>% 
+  bind_rows(litGene_amplicon_dists %>% mutate(type = "amplicon") %>% group_by(gene_name) %>% slice_min(clust_info_dist,with_ties = FALSE)) %>% 
+  mutate(gene = str_remove(gene, "__.*")) %>% 
+  {ggplot(.,aes(factor(type, levels = c("full_gene", "amplicon"), ordered = TRUE), !!dist_metric, color = reorder(gene,-!!dist_metric), group = gene)) +
+  #geom_bar(stat = "identity") +
+  geom_point() +
+  geom_path() +
+  ggrepel::geom_label_repel(data = . %>% filter(type == "amplicon"), aes(label = gene)) +
+  theme_bw() +
+  labs(y = "Distance to high-quality tree", 
+       x = NULL,
+       fill = NULL,
+       title = "Common marker genes: full length & amplicon tree distance \n to high-quality concatenated core gene tree")
+  }
+```
+
+#### Plot amplicon trees
+```{r}
+primer_to_plot = "glnA__1"
+primer_to_plot = primer_trees$gene[2] %>% as.character()
+
+for (primer_to_plot in primer_trees$gene){
+
+primer_tree <- primer_trees %>% 
+  filter(gene == primer_to_plot) %>% 
+  pull("path") %>% 
+  read.tree() %>% 
+  ape::drop.tip(c("ATCC29413", "PCC_6803"))
+
+branch_names <- primer_tree$tip.label %>% 
+  data.frame(long = .) %>% 
+  mutate(long = str_replace_all(long, "-","_")) %>% 
+  left_join(jacob_mapping) %>% 
+  mutate(short = if_else(is.na(short), long, short)) %>% 
+  left_join(seqID_to_strainID %>% dplyr::rename(short = "jacob_name")) %>% 
+  mutate(short = if_else(!is.na(strainID), strainID, short))
+  
+primer_tree$tip.label <- branch_names$short
+
+shared_tips <- intersect(primer_tree$tip.label, hq_tree$tip.label)
+
+primer_tree_tree_subset <- keep.tip(primer_tree, shared_tips) %>% write.tree %>%  textConnection() %>%   ReadDendrogram(convertBlanks = TRUE,internalLabels = FALSE,keepRoot = TRUE) 
+hq_tree_subset <- keep.tip(hq_tree, shared_tips) %>% write.tree %>%  textConnection() %>%   ReadDendrogram(convertBlanks = TRUE,internalLabels = FALSE,keepRoot = TRUE) 
+
+pdf(str_glue("results/amplicon_trees/tangle-{primer_to_plot}.pdf")) 
+dndlist <- dendextend::dendlist(hq_tree_subset, primer_tree_tree_subset)
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+#my_cophylo <- phytools::cophylo(hq_tree_subset, primer_tree_tree_subset)
+# plot(my_cophylo)
+# phytools::tiplabels.cophylo(pch=21,frame="none",bg="grey",cex=1.5)
+# phytools::tiplabels.cophylo(pch=21,frame="none",bg="grey",which="right",cex=1.5)
+
+
+#ggsave(str_glue("results/amplicon_trees/tangle-{primer_to_plot}.pdf"))
+
+(primer_prod_tree <- ggtree(primer_tree,layout = "dendrogram") %<+% test + 
+  geom_tippoint(aes(color = hex_col)) +
+  scale_color_identity(guide = "legend",labels = test$group, breaks = test$hex_col) +
+  labs(color = "MAE group",
+       title = primer_to_plot)
+)
+
+ggsave(str_glue("results/amplicon_trees/{primer_to_plot}.pdf"))
+ggsave(str_glue("results/amplicon_trees/{primer_to_plot}.png"))
+
+
+}
+```
+
+##### Also plot Jacob's core gene concatenated tree
+```{r}
+hq_tree_tbl <- as.tibble(hq_tree)
+
+subset_hqtree <- ape::drop.tip(hq_tree,c("ATCC29413", "PCC_6803"))
+
+(primer_prod_tree <- ggtree(subset_hqtree,layout = "circular") %<+% test + 
+  geom_tippoint(aes(color = hex_col, shape = WLECC)) +
+  geom_rootedge() +
+  scale_color_identity(guide = "legend",labels = test$group, breaks = test$hex_col) +
+  labs(color = "MAE group",
+       title = "Jacob's concatenated core gene tree")
+)
+
+ggsave("results/hq_ggtree.pdf", width = 6, height = 6, dpi = 600, scale = 2)
+```
+
+
+
+## Panaroo pangenome informed gene search
+
+### Filter panaroo core alignments to remove abnormally short or long sequences
+This should really be moved to a separate script and integrated into the snakemake workflow...
+```{}
+alignments <- system("ls data/panaroo/aligned_gene_sequences/*.muscle.afa", intern = TRUE)
+
+path <- alignments[1]
+
+filter_alignment <- function(path){
+  gene <- path %>% str_remove(".*/") %>% str_remove(".muscle.afa")
+  aln <- Biostrings::readDNAMultipleAlignment(path) %>% 
+    as.character() %>% 
+    data.frame(seq = .) %>% 
+    mutate(gene = gene,
+           len = str_count(seq,"[ATGC]"),
+           median_length = median(len),
+           percent_of_median_len = (len / median_length) * 100)
+}
+
+all_alignments <- map_df(alignments, filter_alignment,.progress = TRUE)
+
+all_alignments %>% 
+  ggplot(aes(percent_of_median_len)) + 
+  geom_histogram() + 
+  #scale_x_log10() +
+  #scale_y_log10() +
+  geom_vline(xintercept = 75) +
+  geom_vline(xintercept = 125)
+
+filtered_alignments <- all_alignments %>% 
+  filter(percent_of_median_len > 75 & percent_of_median_len < 125)
+
+gene_list <- filtered_alignments$gene %>% 
+  unique() %>% 
+  data.frame(gene = .)
+
+#gene_name <- gene_list[1]
+
+write_filtered_alignment <- function(gene_name){
+  gene_df <- filtered_alignments %>% 
+    rownames_to_column("header") %>% 
+    filter(gene == gene_name)
+  
+  gene_aln <- gene_df %>% 
+    pull(seq)
+  
+  names(gene_aln) <- gene_df %>% 
+    pull(header)
+  
+  gene_aln_bs <- Biostrings::DNAStringSet(gene_aln, use.names = TRUE)
+  
+  Biostrings::writeXStringSet(gene_aln_bs, filepath = str_glue("data/panaroo/aligned_gene_sequences/{gene_name}.muscle.filtered.afa"))
+}
+
+
+map(gene_list$gene, write_filtered_alignment,.progress = TRUE)
+```
+
+
+### Gene presence / absence 
+```{r}
+gene_pres_abs <- read_csv("data/panaroo/gene_presence_absence.csv")
+gene_pres_abs_roary <- read_csv("data/panaroo/gene_presence_absence_roary.csv")
+
+gene_info <- read_csv("data/panaroo/gene_data.csv")
+
+pa_simp <- gene_pres_abs %>% 
+  column_to_rownames("Gene") %>% 
+  select(-`Non-unique Gene name`, -Annotation, -c("PCC_6803","ATCC29413"))
+
+pa_binary <- !is.na(pa_simp)
+
+# 100% prev. core genes
+n_completely_present_core_genes <- sum(rowSums(pa_binary) == 181)
+
+gene_prevalence <- bind_cols(gene = rownames(pa_binary),prevalence = (rowSums(pa_binary) / 181)) %>% 
+  left_join(gene_pres_abs_roary %>% dplyr::select(gene = "Gene", avg_copy_num = `Avg sequences per isolate`))
+
+prev_99percent <- gene_prevalence %>% filter(prevalence >0.99)
+
+gene_prevalence %>% ggplot(aes(prevalence)) + geom_density()
+
+(gene_prevalence %>% filter(prevalence > 0.9) %>% ggplot(aes(prevalence, avg_copy_num, name = gene)) + geom_point()) %>% plotly::ggplotly()
+
+pa_euc_dist <- vegan::vegdist(t(pa_binary), method = "jaccard") 
+
+nmds <- vegan::monoMDS(pa_euc_dist)
+
+mae_order <- c("Mae1", "Mae2_(HL/LG)", "Mae2_(LL/LG)", "Mae3_1", "Mae3_2", "Mae3_3", "Mae4", "Mae5", "Mae6", "Mae7", "Mae8", "Mae9", "Mae10", "Mfl_ae1", "Mfl_ae2", "Mfl_ae3", "Mfl_ae4", "Mfl_ae5", "Mn", "Mpa", "Mvi", "Mwe", "Other")
+
+ordered_color_map <- color_map %>% 
+  mutate(group = case_when(is.na(group) ~ "Other",
+                           .default = group),
+         hex_col = case_when(group == "Other" ~ "#9C0000",
+                           .default = hex_col),
+         group = factor(group, mae_order, ordered = TRUE)) %>% 
+  arrange(group) %>% 
+  mutate(hex_col = factor(hex_col, levels = unique(.$hex_col), ordered = TRUE))
+
+(nmds$points %>% 
+    as.data.frame() %>% 
+    rownames_to_column("genome") %>% 
+    left_join(ordered_color_map %>% dplyr::rename(genome = "tip.label")) %>% 
+    ggplot(aes(MDS1, MDS2, label = genome, color = hex_col, mae_group = group)) + 
+    scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    geom_point()) %>% 
+  plotly::ggplotly()
+
+
+umap_res <- umap::umap(t(pa_binary))
+
+umap_plot_data <- umap_res$layout %>% 
+    as.data.frame() %>% 
+    rownames_to_column("genome") %>% 
+    left_join(ordered_color_map %>% dplyr::rename(genome = "tip.label"))
+
+( umap_plot_data %>% 
+    ggplot(aes(V1, V2, label = genome, color = hex_col)) + 
+    scale_color_identity(guide = "legend", labels = ordered_color_map$group, breaks = ordered_color_map$hex_col) +
+    geom_point() +
+    theme_bw()+
+    labs(title = "UMAP of Microcystis shared gene content",
+         color = "Clades from Pérez-Carrascal\net al. 2019") +
+    theme(legend.title.align = 0.5)
+  ) #%>% 
+  plotly::ggplotly()
+
+ggsave("results/UMAP_shared_gene_content.png",width = 5, height = 3, dpi = 300, scale = 1.5)
+
+```
+#### Gene PA tree
+```{r}
+pa_euc_dist_df <- pa_euc_dist %>% 
+  as.matrix() %>% 
+  as.data.frame()
+
+pa_euc_dist_long <- pa_euc_dist_df %>% 
+  rownames_to_column("genome1") %>% 
+  pivot_longer(-genome1, names_to = "genome2",values_to = "dist") %>% 
+  filter(dist != 0)
+
+mean_dists <- pa_euc_dist_long %>% 
+  group_by(genome1) %>% 
+  summarise(mean_dist = mean(dist))
+
+gene_pa_tree <- hclust(pa_euc_dist,method = "average") %>% 
+  as.phylo() %>% 
+  write_rds("data/panaroo/gene_PA_tree.rds")
+
+plot(gene_pa_tree)
+
+hq_tree <- read.tree("data/panaroo/core_gene_alignment_filtered.aln.treefile")
+
+shared_tips <- intersect(hq_tree$tip.label, gene_pa_tree$tip.label)
+
+hq_tree_subset <- ape::keep.tip(hq_tree, shared_tips) %>% drop.tip(c("PCC_6803","ATCC29413"))
+gene_pa_tree_subset <- ape::keep.tip(gene_pa_tree, shared_tips) %>% drop.tip(c("PCC_6803","ATCC29413"))
+
+TreeDist::ClusteringInfoDistance(hq_tree_subset,gene_pa_tree_subset,normalize = TRUE)
+
+
+# How monophyletic is the gene PA tree based on perez-carrascal groups?
+filt_table <- colormap2 %>% 
+  dplyr::select(tip.label, group) %>% 
+    filter(tip.label %in% shared_tips) %>% 
+    filter(!duplicated(tip.label)) %>% 
+    mutate(group = str_replace_all(group, "_", "-")) %>% 
+    as.data.frame()
+
+gene_monophy <- AssessMonophyly(keep.tip(gene_pa_tree,shared_tips),filt_table)
+  
+monophy_summary <- GetSummaryMonophyly(gene_monophy)$group %>% 
+    rownames_to_column("type") 
+```
+
+##### Tanglegram
+```{r}
+pdf(str_glue("results/tanglegrams/taglegram_HQtree_vs_genePA.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(gene_pa_tree_subset))), ReadDendrogram(textConnection(write.tree(hq_tree_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+
+trees_to_compare <- cophylo(hq_tree_subset, gene_pa_tree_subset,rotate = TRUE)
+
+#plot(trees_to_compare)
+
+palette <- randomcoloR::distinctColorPalette(length(hq_tree$tip.label))
+
+pdf(file = "results/cophylo/HQtree_vs_genePA.pdf", width = 8, height = 12, pointsize = 4)
+
+par(lend=3)
+plot(trees_to_compare,link.col=palette,link.lwd=4,link.type="curved", link.lty="solid",fsize=c(0.8,0.8))
+
+dev.off()
+```
+
+
+
+
+### Full length gene tree distances to concatenated core gene tree
+```{r}
+
+
+# Get gene lengths
+
+gene_fastas <- system("ls data/panaroo/aligned_gene_sequences/*.muscle.filtered.afa", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = basename(path) %>% str_remove(".muscle.filtered.afa"))
+
+path = gene_fastas$path[1]
+gene_name = gene_fastas$gene[1]
+
+get_gene_lengths <- function(path, gene_name){
+  
+  seqs <- Biostrings::readDNAStringSet(path) %>% 
+    as.character() %>% 
+    str_remove_all("-") %>% 
+    data.frame(seq = .) %>% 
+    rownames_to_column("genome") %>% select(-genome) %>% 
+    mutate(max_len = max(nchar(seq)),
+           min_len = min(nchar(seq)),
+           mean_len = mean(nchar(seq)),
+           median_len = median(nchar(seq)),
+           len_sd = sd(nchar(seq)),
+           n_prods = n()) %>% 
+    select(-seq) %>% 
+    distinct() %>% 
+    mutate(gene = gene_name)
+}
+
+
+gene_lengths <- map2_df(gene_fastas$path, gene_fastas$gene, get_gene_lengths)
+
+# list gene trees
+core_gene_trees <- system("ls data/panaroo/aligned_gene_sequences/*.muscle.filtered.afa.treefile", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = basename(path) %>% str_remove(".muscle.filtered.afa.treefile"),
+         alignment_path = str_remove(path, ".treefile"))
+
+# Fast concatenated tree
+hq_tree <- read.tree("data/panaroo/core_gene_alignment_filtered.aln.treefile")
+
+# IQtree concatenated gene tree
+iqtree <- ape::read.tree("data/panaroo/core_gene_alignment_filtered.aln.treefile") %>% 
+  root.phylo(resolve.root = TRUE,outgroup = "PCC_6803")
+  
+# Change length of root branch
+iqtree$edge.length[which(iqtree$edge.length == max(iqtree$edge.length))] <- mean(iqtree$edge.length)
+
+
+shared_tips <- intersect(hq_tree$tip.label, iqtree$tip.label) %>% .[! . == "PCC_6803"]
+
+iqtree_subset <- keep.tip(iqtree, shared_tips)
+hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+
+pdf(str_glue("results/taglegram_IQtree_vs_fasttree.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(hq_tree_subset))), ReadDendrogram(textConnection(write.tree(iqtree_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+group_colors_ok <- data.frame(label = iqtree$tip.label, ok = iqtree$tip.label %in% color_map$tip.label)
+
+colormap2 <- color_map %>% 
+  mutate(tip.label = if_else(is.na(tip.label), X4, tip.label)) %>% 
+  select(tip.label, group, hex_col, WLECC, short_name)
+
+(IQtree_core_genes_gg <- ggtree(iqtree,layout = "circular") %<+% colormap2 + 
+  geom_rootedge() +
+  geom_tippoint(aes(color = hex_col, size = WLECC)) +
+  geom_tiplab(aes(label = short_name)) +
+  scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+  labs(color = "MAE group",
+       title = "Microcystis concatenated core gene tree",
+       subtitle = "GTR+I+G calculated with IQtree") +
+    expand_limits(y = 2)
+)
+
+ggsave("results/iqtree.pdf", width = 6, height = 4, scale = 6)
+
+
+# Plot tree from WLECC paper in the same way, rename branches first to match genome
+jacob_tree <- read.tree("data/jacob_tree2.nwk")
+
+jacob_tree_branches <- jacob_tree$tip.label %>% 
+  data.frame(short_name = .) %>% 
+  left_join(colormap2)
+
+jacob_tree$tip.label <- jacob_tree_branches$tip.label
+
+(jacob_tree_gg <- ggtree(jacob_tree %>% drop.tip(c("ATCC29413","PCC_6803")) ,layout = "circular") %<+% colormap2 + 
+  geom_rootedge() +
+  geom_tippoint(aes(color = hex_col)) +
+  geom_tiplab(aes(label = short_name)) +
+  scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+  labs(color = "MAE group",
+       title = "Microcystis concatenated core gene tree",
+       subtitle = "Tree from WLECC manuscript") +
+    expand_limits(y = 2)
+)
+
+ggsave("results/jacob_tree.pdf", width = 6, height = 4, scale = 4)
+
+
+# Tanglegram of IQtree and Jacob tree
+shared_tips <- intersect(jacob_tree$tip.label, iqtree$tip.label) %>% .[! . == "PCC_6803"]
+
+iqtree_subset <- keep.tip(iqtree, shared_tips)
+jacob_tree_subset <- keep.tip(jacob_tree, shared_tips)
+
+pdf(str_glue("results/taglegram_IQtree_vs_jacobTree.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(jacob_tree_subset))), ReadDendrogram(textConnection(write.tree(iqtree_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+
+
+
+core_gene_tree_list <- core_gene_trees$path
+names(core_gene_tree_list) <- core_gene_trees$gene
+
+path = core_gene_trees$path[1]
+
+compare_to_hq <- function(path){
+  gene_tree <- read.tree(path)
+  gene <- path %>% basename() %>% str_remove("\\.muscle.*")
+  gene_tree$tip.label <- gene_tree$tip.label %>% 
+    str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% 
+    str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, hq_tree$tip.label)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+  
+  out <- data.frame(gene = gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+               path = path)
+return(out)
+}
+
+
+panoo_gene_dists <- map_df(core_gene_trees$path, compare_to_hq) %>% 
+  left_join(core_gene_trees) %>% 
+  left_join(gene_pres_abs_roary %>% dplyr::rename(gene = "Gene") %>% select(1:14)) %>% 
+  arrange(clust_info_dist) %>% 
+  write_rds("results/panoo_gene_dists.rds")
+
+dist_metric <- sym("clust_info_dist")
+
+panoo_gene_dists %>% 
+  mutate(type = "full_gene") %>% 
+  #bind_rows(amplicon_dists %>% mutate(type = "amplicon")) %>% 
+  ggplot(aes(!!dist_metric, reorder(gene,!!dist_metric), fill = type)) +
+  geom_bar(stat = "identity")
+
+panoo_gene_dists %>% 
+  mutate(type = "full_gene") %>% 
+  slice_min(clust_info_dist,n = 10) %>% 
+  #bind_rows(amplicon_dists %>% mutate(type = "amplicon")) %>% 
+  ggplot(aes(!!dist_metric, reorder(gene,!!dist_metric), fill = type)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(x = 0.01, label = str_wrap(Annotation,width = 125)),hjust = 0, size = 2) +
+  theme_bw() +
+  labs(title = "Core genes trees that best recapitulate concatenated gene tree",
+       y = "Gene")
+ggsave("results/panaroo_best_full_length_genes.pdf",width = 4, height =2, scale =2)
+```
+
+
+### Monophyletic groups resolved by full length genes? 
+```{r}
+group_table <- colormap2 %>% 
+  dplyr::select(tip.label, group)
+
+group_monophy <- function(path){
+  
+  gene = path %>% basename() %>% str_remove("\\.muscle\\.filtered\\.afa\\.treefile")
+  
+  gene_tree <- read.tree(path) %>% midpoint.root()
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, group_table$tip.label)
+  
+  filt_table <- group_table %>% 
+    filter(tip.label %in% shared_tips) %>% 
+    filter(!duplicated(tip.label)) %>% 
+    mutate(group = str_replace_all(group, "_", "-")) %>% 
+    as.data.frame()
+  
+  gene_monophy <- AssessMonophyly(keep.tip(gene_tree,shared_tips),filt_table)
+  
+  monophy_summary <- GetSummaryMonophyly(gene_monophy)$group %>% 
+    rownames_to_column("type") %>% 
+    mutate(gene = gene) %>% 
+    as.data.frame()
+  
+  return(monophy_summary)
+}
+
+group_monophy_safe <- possibly(group_monophy, otherwise = "Error")
+
+group_monophy_full_gene <- map_df(core_gene_trees$path, group_monophy_safe) %>%
+  write_rds("results/panoo_FULLgene_monophy.rds")
+
+monophyletic_fullGenes <- group_monophy_full_gene %>% 
+  filter(type == "Monophyletic") %>% 
+  type_convert() #%>% 
+  #left_join(panaroo_primer_trees) %>% left_join(amplicon_dists_mean %>% select(gene,mean_dist)) %>% 
+  #mutate(tree_and_monophy = scale(Tips) + scale(-mean_dist)) %>% 
+  #mutate(gene_wo_primer = str_remove(gene, "__.*")) %>% 
+  #arrange(desc(Tips))
+```
+
+
+#### Plot core gene trees
+```{r}
+gene_to_plot <- "group_9413"
+
+test <- core_gene_trees %>% 
+  filter(gene == gene_to_plot) %>% 
+  pull(path) %>% 
+  read.tree()
+
+test$tip.label <- test$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+
+ggtree(test, layout = "circular") %<+% colormap2 + 
+  geom_rootedge() +
+  geom_tippoint(aes(color = hex_col, size = WLECC)) +
+  geom_tiplab(aes(label = short_name)) +
+  scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+  labs(color = "MAE group",
+       title = str_glue("{gene_to_plot}"),
+       subtitle = "GTR+I+G calculated with IQtree") +
+    expand_limits(y = 2)
+
+```
+
+
+```{}
+# Print examples to BLAST
+panoo_gene_dists %>% 
+  filter(gene == "group_7650") %>% 
+  pull("alignment_path") %>% 
+  Biostrings::readDNAMultipleAlignment() %>% as.character() %>% head(n=1L)
+
+dist_metric = sym("RF")
+
+```
+
+
+
+### Compare to gene presence absence distances
+
+```{r}
+compare_to_gene_pa <- function(path){
+  gene <- path %>% basename() %>% str_remove("\\.muscle.*")
+  gene_tree <- read.tree(path)
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, gene_pa_tree$tip.label)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  gene_pa_tree_subset <- keep.tip(gene_pa_tree, shared_tips)
+  
+  out <- data.frame(gene = gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+               path = path)
+
+  return(out)
+}
+
+
+gene_dists_to_gene_pa_tree <- map_df(core_gene_trees$path, compare_to_gene_pa) %>% 
+  left_join(core_gene_trees) %>% 
+  arrange(clust_info_dist) %>% 
+  write_rds("results/panoo_gene_dists_to_genePAtree.rds")
+
+(core_gene_and_pres_abs_dists <- panoo_gene_dists %>% 
+  mutate(type = "concatenated core gene tree") %>% 
+  slice_min(clust_info_dist,n = 20) %>% 
+  left_join(gene_dists_to_gene_pa_tree %>% mutate(type = "gene pres / abs") %>% select(type, clust_info_dist_PA = "clust_info_dist", gene), by = "gene") %>% 
+  pivot_longer(c(clust_info_dist, clust_info_dist_PA), names_to = "dist", values_to = "value") %>% 
+  ggplot(aes(value, reorder(gene,value), fill = dist)) +
+  geom_bar(stat = "identity",position = "dodge") +
+  theme_bw() +
+  labs(title = "Core genes trees that best recapitulate concatenated gene tree",
+       x = "clust_info_dist",
+       y = NULL)
+)
+
+```
+
+
+
+
+# Make primers for panaroo genes (Illumina)
+```{r}
+library(DECIPHER)
+library(tidyverse)
+library(furrr)
+
+plan(multisession, workers = 72)
+
+fas <- system("ls data/panaroo/aligned_gene_sequences/*muscle.filtered.afa", intern = TRUE)
+
+make_primers <- function(fasta){
+
+gene = basename(fasta) %>% str_remove(".fasta")
+  
+dbConn <- dbConnect(SQLite(), ":memory:")
+N <- Seqs2DB(fasta, "FASTA", dbConn, "")
+
+desc <- dbGetQuery(dbConn, "select description from Seqs")$description
+Add2DB(data.frame(identifier=desc, stringsAsFactors=FALSE), dbConn)
+
+
+# Designing primers for sequencing experiments:
+TYPE <- "sequence"
+MIN_SIZE <- 275 # base pairs
+MAX_SIZE <- 450
+RESOLUTION <- 5 # k-mer signature
+LEVELS <- 5 # max number of each k-mer
+ENZYMES <- NULL # required for sequencing
+
+primers <- DesignSignatures(dbConn,tblName = "Seqs",
+    type=TYPE,
+    minProductSize=MIN_SIZE,
+    maxProductSize=MAX_SIZE,
+    resolution=RESOLUTION,
+    levels=LEVELS,
+    enzymes=ENZYMES) %>% 
+  mutate(gene = gene)
+
+return(primers)
+}
+
+all_panaroo_gene_primers <- future_map_dfr(fas, make_primers, .progress = TRUE) %>% 
+  write_tsv("data/all_panaroo_primer_candidates_muscle_filtered.tsv") %>% 
+  write_rds("data/all_panaroo_primer_candidates_muscle_filtered.rds")
+```
+
+```{r}
+all_panaroo_gene_primers <- read_rds("data/all_panaroo_primer_candidates_muscle_filtered.rds")
+```
+
+
+#### Write out amplicons from core gene primers
+```{r}
+best_panaroo_primers <- all_panaroo_gene_primers %>%
+  mutate(gene = str_remove(gene, ".muscle.filtered.afa")) %>% 
+  ungroup() %>% 
+  left_join(panoo_gene_dists %>% select(gene, clust_info_dist, RF, phylo_info_dist)) %>% 
+  filter(products >= 174 & products <= 182) %>% 
+  mutate(n_ambig_f = str_count(forward_primer, "[^ATCG]"),
+         n_ambig_r = str_count(reverse_primer, "[^ATCG]"),
+         n_ambig = n_ambig_f + n_ambig_r,
+         scaled_n_ambig = scale(n_ambig),
+         n_similar_sigs = str_count(similar_signatures, ", "),
+         scaled_n_similar_sigs = scale(n_similar_sigs),
+         n_similar_sig_groups = str_count(similar_signatures, "\\)"),
+         scaled_num_products = scale(products),
+         scaled_n_similar_sig_groups = scale(n_similar_sig_groups),
+         scaled_score = scale(score),
+         scaled_coverage = scale(coverage),
+         mean_tree_dist = (clust_info_dist + phylo_info_dist + RF) / 3,
+         scaled_tree_sim = scale(1 - mean_tree_dist),
+         combined_score = scaled_coverage + scaled_tree_sim - 0.1*scaled_n_ambig + 0.25*scaled_score + 0.25*scaled_num_products - 0.25*scaled_n_similar_sigs) %>% 
+  group_by(gene) %>% 
+  slice_max(combined_score, n = 2) %>% 
+  arrange(desc(combined_score)) %>% 
+  ungroup() %>% 
+  mutate(primer_pair = row_number(),
+         primer_pair_name = str_glue("{gene}__{primer_pair}")) %>% 
+  relocate(primer_pair_name)
+
+# Pick the best candidate primers
+panaroo_primers_and_amplicons <- best_panaroo_primers %>% 
+  #filter(primer_pair == primer_num) %>% 
+  group_by(primer_pair) %>% 
+  rowwise() %>% 
+  mutate(primers = list(Biostrings::DNAStringSet(c(forward_primer, reverse_primer))),
+         seqs_aligned = list(Biostrings::readDNAStringSet(str_glue("data/panaroo/aligned_gene_sequences/{gene}.aln.fas"))),
+         seqs = list(DECIPHER::RemoveGaps(seqs_aligned)),
+         pcr_products = list(DECIPHER::AmplifyDNA(primers = primers, myDNAStringSet = seqs, maxProductSize = 500,annealingTemp = 65,P = 4e-7)),
+         pcr_prod_df = list(data.frame(name = names(pcr_products), seq = as.character(pcr_products)) %>% 
+                              mutate(efficiency = str_remove(name , "%.*"),
+                                     genome = str_remove(name, ".*\\) "),
+                                     type = str_remove(name, ".*\\(") %>% str_remove("\\).*")
+                                     )
+                            )
+         ) %>% write_rds("data/panaroo_primers_and_amplicons.rds")
+
+panaroo_primers_and_amplicons <- read_rds("data/panaroo_primers_and_amplicons.rds")
+primer_seqs <- panaroo_primers_and_amplicons %>% 
+  select(primer_pair_name, forward_primer, reverse_primer, score, coverage, products, clust_info_dist, n_ambig, combined_score)
+
+# Extract and export PCR products for alignment & tree building using muscle & IQtree
+panaroo_pcr_products <- panaroo_primers_and_amplicons %>% 
+  unnest(pcr_prod_df) %>% 
+  group_by(genome,gene) %>% 
+  slice_max(efficiency, n = 1,with_ties = FALSE) %>%
+  group_by(gene) %>% 
+  mutate(seq = set_names(seq, genome),
+         string_set = list(Biostrings::DNAStringSet(seq,use.names = TRUE)))
+
+# Write out PCR products to fastas
+panaroo_pcr_products %>% 
+  rowwise() %>% 
+  mutate(string_set %>% 
+           Biostrings::writeXStringSet(filepath = str_glue("data/panaroo/core_gene_primer_products/{gene}__{primer_pair}.fasta"))) #%>% write_rds("data/panaroo_pcr_products.rds")
+
+panaroo_pcr_product_summary <- panaroo_pcr_products %>% 
+  group_by(gene, products, n_ambig, scaled_n_ambig, primer_pair_name, clust_info_dist, RF, phylo_info_dist, score, coverage, combined_score,  ) %>% 
+  mutate(scaled_n_ambig = as.numeric(scaled_n_ambig), # Deal with some columns still being list columns
+         combined_score = as.numeric(combined_score)) %>% 
+  summarise(mean_efficiency = mean(as.numeric(efficiency))) %>% 
+  type_convert() %>% 
+  write_tsv("results/primer_summary_pre_alignemnt_of_products.tsv")
+
+panaroo_pcr_product_summary <- read_tsv("results/primer_summary_pre_alignemnt_of_products.tsv")
+
+```
+
+
+```{r}
+amplicon_fastas <- system("ls data/panaroo/core_gene_primer_products/*.fasta", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(amplicon = basename(path) %>% str_remove(".fasta"))
+
+path = amplicon_fastas$path[1]
+amplicon_name = amplicon_fastas$amplicon[1]
+
+get_amplicon_lengths <- function(path, amplicon_name){
+  
+  seqs <- Biostrings::readDNAStringSet(path) %>% 
+    as.character() %>% 
+    data.frame(seq = .) %>% 
+    rownames_to_column("genome") %>% select(-genome) %>% 
+    mutate(max_len = max(nchar(seq)),
+           min_len = min(nchar(seq)),
+           mean_len = mean(nchar(seq)),
+           median_len = median(nchar(seq)),
+           len_sd = sd(nchar(seq)),
+           n_prods = n()) %>% 
+    select(-seq) %>% 
+    distinct() %>% 
+    mutate(primer = amplicon_name)
+}
+
+
+amplicon_lengths <- map2_df(amplicon_fastas$path, amplicon_fastas$amplicon, get_amplicon_lengths)
+  
+```
+
+
+
+### Compare amplicon trees to HQ tree
+```{r}
+panaroo_primer_trees <- system("ls data/panaroo/core_gene_primer_products/*.treefile", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  mutate(gene = basename(path) %>% str_remove(".afa.treefile"))
+
+panaroo_primer_tree_list <- panaroo_primer_trees$path
+names(panaroo_primer_tree_list) <- panaroo_primer_trees$gene
+
+#path = "data/marker_genes_extracted_from_jacob_genomes/pgi.tre"
+
+compare_to_hq <- function(path){
+  gene <- path %>% basename() %>% str_remove("\\.afa\\..*")
+  gene_tree <- read.tree(path)
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, hq_tree$tip.label)
+  
+  n_shared_genomes <- length(shared_tips)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+  
+  out <- data.frame(gene = gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+               path = path,
+               n_shared_genomes = n_shared_genomes)
+  
+  return(out)
+}
+
+
+panaroo_amplicon_dists <- map_df(panaroo_primer_trees$path, compare_to_hq) %>% 
+  left_join(panaroo_primer_trees) %>% 
+  filter(n_shared_genomes >= 160) %>% 
+  mutate(mean_tree_dist = (RF + clust_info_dist + phylo_info_dist) / 3) %>% 
+  arrange(mean_tree_dist) %>% 
+  mutate(rank = row_number()) %>% 
+  left_join(panaroo_pcr_product_summary %>% ungroup() %>% select(gene = "primer_pair_name", mean_efficiency)) %>% 
+  write_rds("results/panaroo_amplicon_dists.rds")
+
+panaroo_amplicon_dists <- read_rds("results/panaroo_amplicon_dists.rds")
+
+dist_metric = sym("clust_info_dist")
+
+panaroo_amplicon_dists %>% 
+  mutate(type = "full_gene") %>% 
+  #bind_rows(amplicon_dists %>% mutate(type = "amplicon")) %>% 
+  ggplot(aes(!!dist_metric, reorder(gene,!!dist_metric), fill = type)) +
+  geom_bar(stat = "identity")
+
+
+best_RF <- panaroo_amplicon_dists %>% slice_min(RF, n =5) %>%
+  arrange(RF) %>% mutate(rank_for_metric = row_number(),
+                         selection_metric = "RF")
+
+best_clust_info <- panaroo_amplicon_dists %>% slice_min(clust_info_dist, n =5) %>% arrange(clust_info_dist) %>%
+  mutate(rank_for_metric = row_number(), 
+         selection_metric = "clust_info_dist")
+
+best_tree_dist <- bind_rows(best_RF, best_clust_info) %>% distinct()
+```
+
+### Compare to gene pres/abs "tree"
+```{r}
+compare_to_gene_pa <- function(path){
+
+  gene <- path %>% basename() %>% str_remove("\\.afa\\.*")
+  
+  gene_tree <- read.tree(path)
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  #branch_names <- gene_tree$tip.label %>% 
+    #data.frame(long = .) %>% 
+    #mutate(long = str_replace_all(long, "-","_")) %>% 
+    #left_join(jacob_mapping) %>% 
+    #mutate(short = if_else(is.na(short), long, short)) %>% 
+    #left_join(seqID_to_strainID %>% dplyr::rename(short = "jacob_name")) %>% 
+    #mutate(short = if_else(!is.na(strainID), strainID, short))
+    
+  #gene_tree$tip.label <- branch_names$short
+  
+  shared_tips <- intersect(gene_tree$tip.label, gene_pa_tree$tip.label)
+  n_shared_genomes <- length(shared_tips)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  gene_pa_tree_subset <- keep.tip(gene_pa_tree, shared_tips)
+  
+  out <- data.frame(gene=gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,gene_pa_tree_subset,normalize = TRUE),
+               path = path,
+               n_shared_genomes = n_shared_genomes)
+
+  return(out)
+}
+
+
+panaroo_amplicon_dists_to_gene_pa_tree <- map_df(panaroo_primer_trees$path, compare_to_gene_pa) %>% 
+  left_join(panaroo_primer_trees) %>% 
+  arrange(RF) %>% 
+  write_rds("results/panoo_geneAMPLICON_dists_to_genePAtree.rds")
+
+panaroo_amplicon_dists_to_gene_pa_tree <- read_rds("results/panoo_geneAMPLICON_dists_to_genePAtree.rds")
+```
+
+## How well do the mae groups cluster in trees from each amplicon?
+
+```{r}
+plan(multisession, workers = 8)
+
+group_table <- colormap2 %>% 
+  dplyr::select(tip.label, group)
+
+path <- panaroo_primer_trees$path[84]
+
+group_monophy <- function(path){
+  
+  gene = path %>% str_remove(".*/") %>% str_remove(".afa.treefile")
+  
+  gene_tree <- read.tree(path) %>% midpoint.root()
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, group_table$tip.label)
+  
+  filt_table <- group_table %>% 
+    filter(tip.label %in% shared_tips) %>% 
+    filter(!duplicated(tip.label)) %>% 
+    mutate(group = str_replace_all(group, "_", "-")) %>% 
+    as.data.frame()
+  
+  gene_monophy <- AssessMonophyly(keep.tip(gene_tree,shared_tips),filt_table)
+  
+  monophy_summary <- GetSummaryMonophyly(gene_monophy)$group %>% 
+    rownames_to_column("type") %>% 
+    mutate(gene = gene) %>% 
+    as.data.frame()
+  
+  return(monophy_summary)
+}
+
+group_monophy_safe <- possibly(group_monophy, otherwise = "Error")
+
+group_monophy <- map_df(panaroo_primer_trees$path, group_monophy_safe) %>%
+  write_rds("results/panoo_gene_monophy.rds")
+
+group_monophy <- read_rds("results/panoo_gene_monophy.rds")
+
+monophyletic <- group_monophy %>% 
+  filter(type == "Monophyletic") %>% 
+  type_convert() %>% 
+  left_join(panaroo_primer_trees) %>% left_join(panaroo_amplicon_dists %>% select(gene,mean_dist = "mean_tree_dist", mean_efficiency)) %>% 
+  mutate(tree_and_monophy = scale(Tips) + scale(-mean_dist)) %>% 
+  mutate(gene_wo_primer = str_remove(gene, "__.*")) %>% 
+  arrange(desc(Tips))
+
+
+balance_of_tree_and_monophy <- monophyletic %>% 
+  select(gene, Tips) %>% 
+  left_join(panaroo_amplicon_dists) %>% 
+  mutate(scaled_tips = scale(Tips),
+         scaled_dist = scale(1-clust_info_dist),
+         combined_scale = scaled_dist + scaled_tips,
+         actual_gene_name = gene %>% str_remove("__.*")) %>% 
+arrange(desc(combined_scale))
+
+best_amplicon_genes <- balance_of_tree_and_monophy %>% 
+  group_by(actual_gene_name) %>% 
+  slice_max(order_by = combined_scale, n=1) %>% 
+  ungroup() %>% 
+  slice_max(order_by = combined_scale, n=10) %>% 
+  arrange(desc(combined_scale)) %>% 
+  mutate(across(c(scaled_tips,combined_scale,scaled_dist), ~as.numeric(.x))) %>% #fix some list columns to export tsv
+  write_tsv("results/best_amplicons.tsv")
+
+best_amplicon_genes <- read_tsv("results/best_amplicons.tsv")
+
+best_balance <- balance_of_tree_and_monophy %>% 
+  slice_max(combined_scale,n=5, with_ties = FALSE) %>% 
+   mutate(selection_metric = "best balance of tree dist and monophy",
+         rank_for_metric = row_number())
+
+most_monophy <- monophyletic %>% 
+  group_by(gene_wo_primer) %>% 
+  slice_max(Tips, n=1,with_ties = FALSE) %>% 
+  ungroup() %>% 
+  slice_max(Tips,n=5) %>% 
+  mutate(selection_metric = "monophy",
+         rank_for_metric = row_number())
+
+```
+### Plot amplicon trees
+```{r}
+
+best_primers <- bind_rows(best_tree_dist, most_monophy,best_balance)
+
+plot_amp_tree <- function(primer_name){
+  amp_tree <- panaroo_primer_trees %>% 
+    filter(gene == primer_name) %>% 
+    pull(path) %>% 
+    read.tree
+  
+  if(primer_name %in% best_primers$gene ){
+    selec_meth = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(selection_metric)
+    
+    meth_rank = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(rank_for_metric)
+  } else{
+    meth_rank <- ""
+    selec_meth <- ""
+    }
+  
+  amp_tree$tip.label <- amp_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  ggtree(amp_tree,layout = "circular") %<+% colormap2 + 
+    geom_rootedge() +
+    geom_tippoint(aes(color = hex_col, size = WLECC)) +
+    geom_tiplab(aes(label = short_name)) +
+    scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    labs(color = "MAE group",
+         title = str_glue("{primer_name}"),
+         subtitle = str_glue("selection metric: {selec_meth} #{meth_rank}")) +
+      expand_limits(y = 2)
+  
+  ggsave(str_glue("results/best_amplicon_trees/{primer_name}.pdf"),width = 2, height = 2, scale = 10)
+}
+
+
+lapply(best_primers$gene, plot_amp_tree)
+
+plot_amp_tree("pyrH__761")
+
+```
+
+
+### Plot primer melt curves
+```{r}
+best_primer_seqs <- primer_seqs %>% 
+  filter(primer_pair_name %in% (monophyletic %>% slice_max(tree_and_monophy,n = 5) %>% pull("gene")))
+
+temp_range <- 55:75
+ps <- c("RGAAGCTTTTGGCAGTCCGAC", "GGACGYTGSAGTTTATATAACCAGAA") # forward and reverse
+
+f <- function(temp) {
+  CalculateEfficiencyPCR(ps, reverseComplement(DNAStringSet(ps)),
+  temp, P=4e-7, ions=.225)
+}
+
+efficiency <- matrix(unlist(lapply(temp_range, f)), ncol=2, byrow=TRUE)
+plot(temp_range, efficiency[,1], ylim=c(0,1), ylab="Hybridization Efficiency",
+xlab=expression(paste("Temperature (", degree, "C)", sep="")),
+type="l", lwd=2, col="Blue", main="Denaturation Plot")
+lines(temp_range, efficiency[,2], col="Red", lwd=2)
+abline(h=0.5, lty=2, lwd=2, col="Orange")
+abline(v=57.5, lty=2, lwd=2, col="Green")
+legend("topright", legend=c("Forward Primer", "Reverse Primer", "50% Efficiency",
+"Annealing Temperature"), col=c("Blue", "Red", "Orange", "Green"),
+lwd=c(2, 2, 2, 2), lty=c(1, 1, 2, 2))
+
+
+
+```
+
+
+
+# Check missing amplicons
+Make sure that missing amplicons don't seem to be from a gene loss event, i.e. check that they seem to be randomly distributed across the tree or in lower quality genomes.
+
+```{r}
+
+plot_missing_genomes <- function(primer_name){
+  amp_tree <- panaroo_primer_trees %>% 
+    filter(gene == primer_name) %>% 
+    pull(path) %>% 
+    read.tree
+  
+  amp_tree$tip.label <- amp_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  missing_genomes <- setdiff(iqtree$tip.label, amp_tree$tip.label)
+  
+  missing_genomes_df <- data.frame(tip.label = iqtree$tip.label) %>% 
+    mutate(present = if_else(tip.label %in% missing_genomes, FALSE, TRUE)) %>% 
+    left_join(colormap2)
+  
+  if(primer_name %in% best_primers$gene ){
+    selec_meth = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(selection_metric)
+    
+    meth_rank = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(rank_for_metric)
+  } else{
+    meth_rank <- ""
+    selec_meth <- ""
+    }
+  
+  ggtree(iqtree,layout = "circular") %<+% missing_genomes_df + 
+    geom_rootedge() +
+    geom_tippoint(aes(color = present)) +
+    geom_tiplab(aes(label = short_name)) +
+    #scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    labs(title = str_glue("{primer_name}"),
+         subtitle = str_glue("selection metric: {selec_meth} #{meth_rank}"))
+  
+  ggsave(str_glue("results/best_amplicon_trees/missingGenomes--{primer_name}.pdf"),width = 2, height = 2, scale = 10)
+}
+
+#plot_missing_genomes("recA__1511")
+
+lapply(best_primers$gene, plot_missing_genomes)
+
+```
+Look at mae 3 & mae 2 groups for the group_14174 gene tree (very tight clusters)
+```{r}
+
+primer_name = "group_14174__1575"
+
+amp_tree <- panaroo_primer_trees %>% 
+    filter(gene == primer_name) %>% 
+    pull(path) %>% 
+    read.tree
+  
+  if(primer_name %in% best_primers$gene ){
+    selec_meth = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(selection_metric)
+    
+    meth_rank = best_primers %>% 
+      filter(gene == primer_name) %>% 
+      pull(rank_for_metric)
+  } else{
+    meth_rank <- ""
+    selec_meth <- ""
+    }
+  
+  amp_tree$tip.label <- amp_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  mae2_3_genomes <- colormap2 %>% 
+    filter(tip.label %in% amp_tree$tip.label) %>% 
+    filter(str_detect(group, "Mae2") | str_detect(group, "Mae3"))
+  
+  amp_tree <- keep.tip(amp_tree, mae2_3_genomes$tip.label)
+  
+  ggtree(amp_tree,layout = "circular") %<+% colormap2 + 
+    geom_rootedge() +
+    geom_tippoint(aes(color = hex_col, size = WLECC)) +
+    geom_tiplab(aes(label = short_name)) +
+    scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    labs(color = "MAE group",
+         title = str_glue("{primer_name}"),
+         subtitle = str_glue("selection metric: {selec_meth} #{meth_rank}")) +
+      expand_limits(y = 2)
+  
+  #ggsave(str_glue("results/best_amplicon_trees/{primer_name}.pdf"),width = 2, height = 2, scale = 10)
+
+```
+
+```{r}
+to_order <- best_panaroo_primers %>% 
+  filter(primer_pair_name %in% c("group_14174__1522","lgt__516"))
+```
+
+
+
+# Microcystin genes on tree
+```{r}
+
+mcye_pres <-  pa_binary %>%
+  data.frame() %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% c("group_3577")) %>%
+  column_to_rownames("gene") %>%
+  t() %>%
+  data.frame() %>%
+  mutate(mcyE = if_any(everything(), ~ . ==TRUE)) %>%
+  dplyr::select(mcyE) %>%
+  rownames_to_column("tip.label") %>%
+  mutate(tip.label = str_replace(tip.label,"\\.","-"))
+
+mcye_gene_cluster_ids <- gene_pres_abs %>% 
+  filter(Gene == "group_3577") %>% 
+  pivot_longer(-c(Gene, `Non-unique Gene name`, Annotation), names_to = "genome", values_to = "annotation_id") %>% 
+  separate_longer_delim(annotation_id, ";") %>% 
+  filter(!is.na(annotation_id)) %>% 
+  left_join(gene_info)
+
+Biostrings::DNAStringSet(mcye_gene_cluster_ids$dna_sequence %>% `names<-`(mcye_gene_cluster_ids$genome)) %>%  Biostrings::writeXStringSet("data/panaroo/mcyE_genes.fasta")
+
+
+mcye_for_plot <- colormap2 %>% 
+  left_join(mcye_pres)
+
+
+
+(primer_prod_tree <- ggtree(iqtree,layout = "circular") %<+% mcye_for_plot + 
+  geom_rootedge() +
+  geom_tippoint(aes(color = mcyE, size = WLECC)) +
+  geom_tiplab(aes(label = short_name)) +
+  #scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    scale_color_viridis_d() +
+  labs(color = "Has mcyE gene", title = "IQtree GTR") +
+    expand_limits(y = 2)
+) 
+ggsave("results/iqtree_mcyE.pdf",width = 2, height = 2, scale = 10)
+
+amp_tree$tip.label <- amp_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+
+# Plot amplicon tree with microcystin overlaid
+(primer_prod_tree <- ggtree(amp_tree,layout = "circular") %<+% mcye_for_plot + 
+  geom_rootedge() +
+  geom_tippoint(aes(color = mcyE, size = WLECC)) +
+  geom_tiplab(aes(label = short_name)) +
+  #scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    scale_color_viridis_d() +
+  #labs(color = "MAE group", title = "IQtree") +
+    expand_limits(y = 2)
+)
+```
+
+Plot mcy on tree, also eval if it is monophyletic
+
+
+## Pull genes for other work
+
+### Historically used markers
+```{r}
+all_historic_markers <- c("ITSc","ftsZ", "glnA", "tpiA", "cpcB", "ntcA", "IGS", "gltX", "pgi", "recA")
+
+# some of the panaroo annotations don't completely line up with gene names, but good gene clusters were still identified
+panaroo_ids <- c(
+  "group_12176" # pgi
+)
+
+historic_markers <- c(all_historic_markers, panaroo_ids)
+
+historic_markers_gene_info <- gene_info %>% 
+  filter(str_detect(gene_name, paste0(historic_markers, collapse = "|")),
+         !gene_name %in% c("glnA3"))
+
+historic_markers_pres_abs <- gene_pres_abs_roary %>% 
+  filter(across(everything(), ~str_detect(.x, paste0(historic_markers_gene_info$annotation_id, collapse = "|"))))
+
+historic_markers_long <- gene_pres_abs_roary %>% 
+  pivot_longer(-c(1:14), names_to = "genome", values_to = "annotation_id") %>% 
+  filter(annotation_id %in% historic_markers_gene_info$annotation_id,
+         Gene != "group_6922") %>% #remove spurious cpcB group
+  left_join(gene_info %>% select(genome = "gff_file", annotation_id, dna_sequence)) %>% 
+  mutate(Gene = case_when(Gene == "group_12176" ~ "pgi",
+                   TRUE ~ Gene),
+         `Non-unique Gene name` = str_remove_all(`Non-unique Gene name`, ";"),
+         Gene = if_else(str_detect(Gene, "^group_"), `Non-unique Gene name`, Gene))
+
+markers_summary <- historic_markers_long %>% 
+  group_by(Gene) %>% 
+  summarise(n_genomes = n())
+
+
+panoo_hist_names <- historic_markers_long$Gene %>% unique()
+
+export_genes <- function(gene){
+  for_export_df <- historic_markers_long %>% 
+    filter(Gene == gene,
+           !is.na(dna_sequence))
+  
+  Biostrings::DNAStringSet(for_export_df$dna_sequence) %>% 
+    `names<-`(for_export_df$genome) %>% 
+    Biostrings::writeXStringSet(str_glue("data/panaroo/exported_marker_genes/historic/{gene}_curated.fasta"))
+}
+
+purrr::map(panoo_hist_names,export_genes)
+
+```
+
+### Genes from CAI et al 2023 (Science Advances)
+```{r}
+cai_2023_genes <- c("acrB" = "group_2486", # Previously used group_14038 but none of the reported primers matched, but all primers match group_2486
+                            "amtB" = "amt", 
+                            "cpoB" = "bamD", 
+                            "dppA" = "group_12618", 
+                            "glnA" = "glnA", 
+                            "helY" = "dob10", 
+                            "murC" = "group_8150", 
+                            "recJ" = "group_12865", 
+                            "sbcC" = "sbcC", 
+                            "trpE" = "ubiD", # Previously used trpE, but none of the primers matched, but all primers match ubiD 
+                            "yccS" = "yccC"
+                            )
+
+cai_2023_genes_df <- data.frame(Gene = cai_2023_genes) %>% 
+  rownames_to_column("cai_gene_name")
+
+cai_gene_info <- gene_info %>% 
+  filter(str_detect(gene_name, paste0(cai_2023_genes, collapse = "|")),
+         !gene_name %in% c("glnA3")) 
+
+(unique_cai_genes <- cai_gene_info$gene_name %>% unique())
+
+cai_gene_pres_abs <- gene_pres_abs_roary %>% 
+  filter(Gene %in% cai_2023_genes)
+
+cai_gene_long <- cai_gene_pres_abs %>% 
+  pivot_longer(-c(1:14), names_to = "genome", values_to = "annotation_id") %>% 
+  separate_longer_delim(annotation_id,delim = ";") %>% 
+  group_by(genome, Gene) %>% 
+  left_join(gene_info %>% select(genome = "gff_file", annotation_id, dna_sequence)) %>% 
+  slice_max(nchar(dna_sequence),n = 1,with_ties = FALSE) %>% 
+  filter(!is.na(dna_sequence)) %>% 
+  left_join(cai_2023_genes_df)
+
+cai_markers_summary <- cai_gene_long %>% 
+  group_by(Gene) %>% 
+  summarise(n_genomes = n())
+
+panoo_cai_names <- cai_gene_long$cai_gene_name %>% unique()
+
+export_cai_genes <- function(cai_gene){
+  for_export_df <- cai_gene_long %>% 
+    filter(cai_gene_name == cai_gene,
+           !is.na(dna_sequence))
+  
+  Biostrings::DNAStringSet(for_export_df$dna_sequence) %>% 
+    `names<-`(for_export_df$genome) %>% 
+    Biostrings::writeXStringSet(str_glue("data/panaroo/exported_marker_genes/cai_2023/{cai_gene}.fasta"))
+}
+
+purrr::map(panoo_cai_names,export_cai_genes)
+
+```
+
+#### Extract primer products
+```{r}
+
+cai_primers_sanger <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1YGP0NQ1zl4KrYtdcFGnlTctM7Z_PxYw2-NQ-b20lQnQ/edit#gid=0") %>% 
+  filter(seq_type == "sanger") %>% 
+  group_by(primer_pair) %>% 
+  rowwise() %>% 
+  mutate(primers = list(Biostrings::DNAStringSet(c(forward_primer, reverse_primer))),
+         seqs_aligned = list(Biostrings::readDNAStringSet(str_glue("data/panaroo/exported_marker_genes/cai_2023/{gene}.afa"))),
+         seqs = list(DECIPHER::RemoveGaps(seqs_aligned)),
+         pcr_products = list(DECIPHER::AmplifyDNA(primers = primers, myDNAStringSet = seqs, maxProductSize = 1800,annealingTemp = 65,P = 4e-7)),
+         pcr_prod_df = list(data.frame(name = names(pcr_products), seq = as.character(pcr_products)) %>% 
+                              mutate(efficiency = str_remove(name , "%.*"),
+                                     genome = str_remove(name, ".*\\) "),
+                                     type = str_remove(name, ".*\\(") %>% str_remove("\\).*")
+                                     )
+                            )
+         ) %>% write_rds("data/cai_sanger_primers_and_amplicons.rds")
+
+
+cai_primers_illumina <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1YGP0NQ1zl4KrYtdcFGnlTctM7Z_PxYw2-NQ-b20lQnQ/edit#gid=0") %>% 
+  filter(seq_type == "illumina") %>% 
+  group_by(primer_pair) %>% 
+  rowwise() %>% 
+  mutate(primers = list(Biostrings::DNAStringSet(c(forward_primer, reverse_primer))),
+         seqs_aligned = list(Biostrings::readDNAStringSet(str_glue("data/panaroo/exported_marker_genes/cai_2023/{gene}.afa"))),
+         seqs = list(DECIPHER::RemoveGaps(seqs_aligned)),
+         pcr_products = list(DECIPHER::AmplifyDNA(primers = primers, myDNAStringSet = seqs, maxProductSize = 600,annealingTemp = 65,P = 4e-7)),
+         pcr_prod_df = list(data.frame(name = names(pcr_products), seq = as.character(pcr_products)) %>% 
+                              mutate(efficiency = str_remove(name , "%.*"),
+                                     genome = str_remove(name, ".*\\) "),
+                                     type = str_remove(name, ".*\\(") %>% str_remove("\\).*")
+                                     )
+                            )
+         ) %>% write_rds("data/cai_illumina_primers_and_amplicons.rds")
+
+cai_primers <- bind_rows(cai_primers_illumina, cai_primers_sanger)
+
+cai_pcr_products <- cai_primers %>% 
+  unnest(pcr_prod_df) %>% 
+  group_by(genome,gene,primer_pair, seq_type) %>% 
+  slice_max(efficiency, n = 1,with_ties = FALSE) %>%
+  group_by(gene, seq_type, primer_pair) %>% 
+  mutate(seq = set_names(seq, genome),
+         string_set = list(Biostrings::DNAStringSet(seq,use.names = TRUE)),
+         n_products = length(string_set))
+
+cai_pcr_products %>% 
+  rowwise() %>% 
+  mutate(string_set %>% 
+           Biostrings::writeXStringSet(filepath = str_glue("data/panaroo/exported_marker_genes/cai_2023_amplicons/{primer_pair}.fasta"))) #%>% write_rds("data/panaroo_pcr_products.rds")
+```
+
+
+
+### Best full length genes from pangenome analysis
+```{r}
+best_full_length_genes <- panoo_gene_dists %>% 
+  slice_max(order_by = -clust_info_dist, n =10)
+
+top_gene_trees <-  core_gene_trees %>% 
+  filter(gene %in% best_full_length_genes$gene) %>% 
+  mutate(linked_aln_path = str_glue("data/panaroo/exported_marker_genes/best_core_genes/{gene}.afa"),
+         linked_tree_path = str_glue("data/panaroo/exported_marker_genes/best_core_genes/{gene}.afa.treefile"))
+
+# Make dir
+top_gene_trees$linked_aln_path %>% dirname() %>% unique() %>% dir.create()
+
+# Link alignments & trees
+file.link(top_gene_trees$alignment_path, top_gene_trees$linked_aln_path)
+file.link(top_gene_trees$path, top_gene_trees$linked_tree_path)
+
+```
+
+
+### Best amplicons
+```{r}
+
+amplicon_trees_to_pull <- panaroo_primer_trees %>% 
+  filter(gene %in% best_amplicon_genes$gene) %>% 
+  mutate(alignment_path = path %>% str_remove(".treefile"),
+         linked_aln_path = str_glue("data/panaroo/exported_marker_genes/best_amplicons/{gene}.afa"),
+         linked_tree_path = str_glue("data/panaroo/exported_marker_genes/best_amplicons/{gene}.afa.treefile"))
+
+# Make dir
+amplicon_trees_to_pull$linked_aln_path %>% dirname() %>% unique() %>% dir.create()
+
+# Link alignments & trees
+file.link(amplicon_trees_to_pull$alignment_path, amplicon_trees_to_pull$linked_aln_path)
+file.link(amplicon_trees_to_pull$path, amplicon_trees_to_pull$linked_tree_path)
+
+```
+
+
+### Calculate percent identity & tree dist
+```{r}
+
+hist_gene_alignments <- system("ls data/panaroo/exported_marker_genes/historic/*_curated.afa", intern = TRUE)
+full_gene_alignments <- system("ls data/panaroo/exported_marker_genes/best_core_genes/*.afa", intern = TRUE)
+amplicon_alignments <- system("ls data/panaroo/exported_marker_genes/best_amplicons/*.afa", intern = TRUE)
+cai23_alignments <- system("ls data/panaroo/exported_marker_genes/cai_2023/*.afa", intern = TRUE)
+cai23_amplicon_alignments <- system("ls data/panaroo/exported_marker_genes/cai_2023_amplicons/*.afa", intern = TRUE)
+
+alignments <- c(hist_gene_alignments, full_gene_alignments, amplicon_alignments, cai23_alignments,cai23_amplicon_alignments)
+
+alignment <- "data/panaroo/exported_marker_genes/historic/16S_curated.afa"
+get_percent_ident <- function(alignment){
+  gene <- alignment %>% basename() %>% str_remove("\\.afa")
+  alignment_dir <- dirname(alignment)
+  
+  seq <-  bio3d::read.fasta(alignment) %>% 
+    bio3d::seqidentity()
+  
+  # Keep pairs in both directions for now, will be left joined with shared gene content to simplify
+  #seq[lower.tri(seq)] <- NA
+    
+  percent_ident <- seq %>% 
+    as.data.frame() %>% 
+    rownames_to_column("genome1") %>% 
+    pivot_longer(-genome1, names_to = "genome2", values_to = "percent_ident") %>% 
+    filter(genome1 != genome2,
+           !is.na(percent_ident)) %>% 
+    mutate(percent_dissim = 1- percent_ident,
+           gene = str_remove(gene,"_curated$"),
+           type = case_when(str_detect(alignment, "historic") ~ "historic",
+                            str_detect(alignment, "best_core_genes") ~ "full_length_gene",
+                            str_detect(alignment, "best_amplicons") ~ "amplicon",
+                            str_detect(alignment, "cai_2023") ~ "cai_2023",
+                            str_detect(alignment, "cai_2023_amplicons") ~ "cai_2023_amplicon")) %>% 
+    write_tsv(str_glue("{alignment_dir}/{gene}_percent_ident.tsv"))
+  
+  return(percent_ident)
+}
+
+# Calculate pairwise percent identities for each alignment
+gene_dists <- map_df(alignments, get_percent_ident)
+
+gene_dists %>% ggplot(aes(percent_ident, fill = type)) +
+  geom_density(alpha = 0.5) +
+  lims(x= c(0.9,1))
+
+get_length_stats <- function(alignment){
+  alignment %>% Biostrings::readDNAStringSet() %>% 
+    data.frame(seq = .) %>% 
+    mutate(length = seq %>% str_remove_all("-") %>%  nchar()) %>% 
+    summarise(mean_length = mean(length) %>% round(0),
+              median_length = median(length) %>% round(0),
+              min_length = min(length) %>% round(0),
+              max_length = max(length) %>% round(0),
+              alignment_path = alignment)
+}
+
+length_stats <- map_df(alignments, get_length_stats) %>% 
+  mutate(type = alignment_path %>% dirname() %>% str_remove(".*/"),
+         marker = basename(alignment_path) %>% str_remove(".afa") %>% str_remove("_curated"))
+
+# Gather tree distances for the tree types of genes
+
+compare_to_hq_combined <- function(path){
+  gene <- path %>% basename() %>% str_remove("\\.afa\\..*")
+  gene_tree <- read.tree(path)
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  
+  # Get length information
+  length_info <- path %>% str_remove("\\.treefile$") %>% Biostrings::readDNAStringSet() %>% 
+    data.frame(seq = .) %>% 
+    mutate(length = seq %>% str_remove_all("-") %>%  nchar()) %>% 
+    summarise(mean_length = mean(length) %>% round(0),
+              median_length = median(length) %>% round(0),
+              min_length = min(length) %>% round(0),
+              max_length = max(length) %>% round(0),
+              path = path)
+  
+  
+  shared_tips <- intersect(gene_tree$tip.label, hq_tree$tip.label)
+  
+  n_shared_genomes <- length(shared_tips)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  hq_tree_subset <- keep.tip(hq_tree, shared_tips)
+  
+  out <- data.frame(gene = gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,hq_tree_subset,normalize = TRUE),
+               path = path,
+               n_shared_genomes = n_shared_genomes) %>% 
+               mutate(type = case_when(str_detect(path, "historic") ~ "Traditional marker",
+                            str_detect(path, "best_core_genes") ~ "Single copy core gene",
+                            str_detect(path, "best_amplicons") ~ "Amplicon from core genes",
+                            str_detect(path, "/cai_2023/") ~ "Genes identified in Cai et al. 2023",
+                            str_detect(path, "/cai_2023_amplicons/.*sanger") ~ "Amplicons from Cai et al. 2023 (Sanger)",
+                            str_detect(path, "/cai_2023_amplicons/.*illumina") ~ "Amplicons from Cai et al. 2023 (Illumina)")) %>% 
+    left_join(length_info)
+  
+  return(out)
+}
+
+gene_name_replacements <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1S2T0o_De8ftwQk9aSHHj_Cog6yD7rHVuXCJnxNfGUes/edit?usp=sharing")
+
+replace_name <- function(cur_name){
+  if (cur_name %in% gene_name_replacements$original) {
+    new_name <- gene_name_replacements %>% 
+      filter(original == cur_name) %>% 
+      pull("new_name")
+    
+  } else {
+    new_name <- cur_name
+  }
+  return(new_name)
+}
+
+tree_files <- paste0(alignments, ".treefile")
+
+hist_dists <- map_df(tree_files, compare_to_hq_combined) %>% 
+  rowwise() %>% 
+    mutate(gene = str_remove(gene, "_curated"),
+           gene = if_else(gene %in% gene_name_replacements$original, replace_name(gene), gene),
+           gene = case_when(str_detect(type, "Cai") & str_detect(gene, "trpE") ~ str_replace(gene, "trpE", '"trpE" (ubiD)'),
+                            .default = gene)) %>% 
+  group_by(gene) %>% 
+  mutate(clust_info_dist = min(clust_info_dist),
+         type = factor(type, levels = c("Single copy core gene","Genes identified in Cai et al. 2023" ,"Traditional marker","Amplicon from core genes", "Amplicons from Cai et al. 2023 (Sanger)", "Amplicons from Cai et al. 2023 (Illumina)"), ordered = TRUE),
+         percent_of_genomes = round(n_shared_genomes / 181 * 100))
+
+colors5 <- c("#194B77", "#C16D08", "#826489", "lightblue3", "#FFAF50")
+colors3 <- c("#194B77", "#826489", "lightblue3")
+dark_labels <- c("Single copy core gene", "Traditional marker", "Genes identified in Cai et al. 2023")
+
+(dists_to_HQ_ggplot_w_cai <- hist_dists %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)") %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors5) +
+  geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+  geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to concatenated core gene tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_HQtree_w_cai.pdf",width = 4, height =2.5, scale =2.5)
+
+
+(dists_to_HQ_ggplot_w_cai_nodppA <- hist_dists %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)",
+         !str_detect(gene, "dppA")) %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors5) +
+  geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+  geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to concatenated core gene tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_HQtree_w_cai_nodppA.pdf",width = 4, height =2.5, scale =2.5)
+
+(dists_to_HQ_ggplot <- hist_dists %>% 
+  filter(!str_detect(type, "Cai et al. 2023")) %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors3) +
+  geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+    geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  theme_bw() +
+  coord_cartesian(clip = "off") +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to concatenated core gene tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_HQtree.pdf",width = 4, height =2.5, scale =1.75)
+
+```
+
+
+#### Dist to gene pres/abs tree
+```{r}
+
+gene_PA_tree <- read_rds("data/panaroo/gene_PA_tree.rds")
+
+compare_to_genePA_tree <- function(path){
+  gene <- path %>% basename() %>% str_remove("\\.afa\\..*")
+  gene_tree <- read.tree(path)
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  
+  # Get length information
+  length_info <- path %>% str_remove("\\.treefile$") %>% Biostrings::readDNAStringSet() %>% 
+    data.frame(seq = .) %>% 
+    mutate(length = seq %>% str_remove_all("-") %>%  nchar()) %>% 
+    summarise(mean_length = mean(length) %>% round(0),
+              median_length = median(length) %>% round(0),
+              min_length = min(length) %>% round(0),
+              max_length = max(length) %>% round(0),
+              path = path)
+  
+  
+  shared_tips <- intersect(gene_tree$tip.label, gene_PA_tree$tip.label)
+  
+  n_shared_genomes <- length(shared_tips)
+  
+  gene_tree_subset <- keep.tip(gene_tree, shared_tips)
+  gene_PA_tree_subset <- keep.tip(gene_PA_tree, shared_tips)
+  
+  out <- data.frame(gene = gene,
+                    RF = TreeDist::RobinsonFoulds(gene_tree_subset,gene_PA_tree_subset,normalize = TRUE),
+                    clust_info_dist = TreeDist::ClusteringInfoDistance(gene_tree_subset,gene_PA_tree_subset,normalize = TRUE),
+                    phylo_info_dist = TreeDist::PhylogeneticInfoDistance(gene_tree_subset,gene_PA_tree_subset,normalize = TRUE),
+               path = path,
+               n_shared_genomes = n_shared_genomes) %>% 
+               mutate(type = case_when(str_detect(path, "historic") ~ "Traditional marker",
+                            str_detect(path, "best_core_genes") ~ "Single copy core gene",
+                            str_detect(path, "best_amplicons") ~ "Amplicon from core genes",
+                            str_detect(path, "/cai_2023/") ~ "Genes identified in Cai et al. 2023",
+                            str_detect(path, "/cai_2023_amplicons/.*sanger") ~ "Amplicons from Cai et al. 2023 (Sanger)",
+                            str_detect(path, "/cai_2023_amplicons/.*illumina") ~ "Amplicons from Cai et al. 2023 (Illumina)")) %>% 
+    left_join(length_info)
+  
+  return(out)
+}
+
+gene_name_replacements <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1S2T0o_De8ftwQk9aSHHj_Cog6yD7rHVuXCJnxNfGUes/edit?usp=sharing")
+
+replace_name <- function(cur_name){
+  if (cur_name %in% gene_name_replacements$original) {
+    new_name <- gene_name_replacements %>% 
+      filter(original == cur_name) %>% 
+      pull("new_name")
+    
+  } else {
+    new_name <- cur_name
+  }
+  return(new_name)
+}
+
+tree_files <- paste0(alignments, ".treefile")
+
+genePA_dists <- map_df(tree_files, compare_to_genePA_tree) %>% 
+  rowwise() %>% 
+    mutate(gene = str_remove(gene, "_curated"),
+           gene = if_else(gene %in% gene_name_replacements$original, replace_name(gene), gene),
+           gene = case_when(str_detect(type, "Cai") & str_detect(gene, "trpE") ~ str_replace(gene, "trpE", '"trpE" (ubiD)'),
+                            .default = gene)) %>% 
+  group_by(gene) %>% 
+  mutate(clust_info_dist = min(clust_info_dist),
+         type = factor(type, levels = c("Single copy core gene","Genes identified in Cai et al. 2023" ,"Traditional marker","Amplicon from core genes", "Amplicons from Cai et al. 2023 (Sanger)", "Amplicons from Cai et al. 2023 (Illumina)"), ordered = TRUE),
+         percent_of_genomes = round(n_shared_genomes / 181 * 100))
+
+colors5 <- c("#194B77", "#C16D08", "#826489", "lightblue3", "#FFAF50")
+colors3 <- c("#194B77", "#826489", "lightblue3")
+dark_labels <- c("Single copy core gene", "Traditional marker", "Genes identified in Cai et al. 2023")
+
+(dists_to_genePA_ggplot_w_cai <- genePA_dists %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)") %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors5) +
+  #geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  #geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+  geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to gene presence/absence tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_genePA_w_cai.pdf",width = 4, height =2.5, scale =2.5)
+
+(dists_to_genePA_ggplot_w_cai_nodppA <- genePA_dists %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)",
+         !str_detect(gene, "dppA")) %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors5) +
+  #geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  #geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+  geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to gene presence/absence tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_genePA_w_cai_nodppA.pdf",width = 4, height =2.5, scale =2.5)
+
+
+(dists_to_genePA_ggplot <- genePA_dists %>% 
+  filter(!str_detect(type, "Cai et al. 2023")) %>% 
+  ggplot(aes(clust_info_dist, reorder(gene,-clust_info_dist), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = colors3) +
+  #geom_text(data = ~filter(.x, type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "white", size = 2, hjust = 0) +
+  #geom_text(data = ~filter(.x, !type %in% dark_labels), aes(0, label = str_glue("{median_length}bp; {percent_of_genomes}% of genomes")),nudge_x = 0.01, color = "black", size = 2, hjust = 0) +
+  geom_text(aes(clust_info_dist + 0.005, label = round(clust_info_dist, 2)), color = "black", size = 2, hjust = 0) +
+  theme_bw() +
+  coord_cartesian(clip = "off") +
+  theme(panel.border = element_blank()) +
+  labs(x = "Distance to gene presence/absence tree\n(clustering information distance)",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_distance_to_genePA.pdf",width = 4, height =2.5, scale =1.75)
+
+```
+
+
+
+## Check monophyly combined
+```{r}
+plan(multisession, workers = 8)
+
+group_table <- colormap2 %>% 
+  dplyr::select(tip.label, group)
+
+group_monophy <- function(path){
+  
+  gene = path %>% str_remove(".*/") %>% str_remove(".afa.treefile")
+  
+  gene_tree <- read.tree(path) %>% midpoint.root()
+  gene_tree$tip.label <- gene_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+  
+  shared_tips <- intersect(gene_tree$tip.label, group_table$tip.label)
+  
+  filt_table <- group_table %>% 
+    filter(tip.label %in% shared_tips) %>% 
+    filter(!duplicated(tip.label)) %>% 
+    mutate(group = str_replace_all(group, "_", "-")) %>% 
+    as.data.frame()
+  
+  gene_monophy <- AssessMonophyly(keep.tip(gene_tree,shared_tips),filt_table)
+  
+  monophy_summary <- GetSummaryMonophyly(gene_monophy)$group %>% 
+    rownames_to_column("type") %>% 
+    mutate(gene = gene,
+           path = path,
+           marker_type = case_when(str_detect(path, "historic") ~ "Traditional marker",
+                            str_detect(path, "best_core_genes") ~ "Single copy core gene",
+                            str_detect(path, "best_amplicons") ~ "Amplicon from core genes",
+                            str_detect(path, "/cai_2023/") ~ "Genes identified in Cai et al. 2023",
+                            str_detect(path, "/cai_2023_amplicons/.*sanger") ~ "Amplicons from Cai et al. 2023 (Sanger)",
+                            str_detect(path, "/cai_2023_amplicons/.*illumina") ~ "Amplicons from Cai et al. 2023 (Illumina)"))
+  
+  return(monophy_summary)
+}
+
+group_monophy_safe <- possibly(group_monophy, otherwise = "Error")
+
+combined_monophy <- map_df(tree_files, group_monophy_safe) %>%
+  write_rds("results/final_comp_monophy.rds")
+
+combined_monophy <- read_rds("results/final_comp_monophy.rds")
+
+combined_monophyletic <- combined_monophy %>% 
+  filter(type %in% c("Monophyletic", "Monotypic")) %>% 
+  type_convert() %>% 
+  #left_join(panaroo_primer_trees) %>% left_join(panaroo_amplicon_dists %>% select(gene,mean_dist = "mean_tree_dist", mean_efficiency)) %>% 
+  #mutate(tree_and_monophy = scale(Tips) + scale(-mean_dist)) %>% 
+  #mutate(gene_wo_primer = str_remove(gene, "__.*")) %>% 
+  group_by(gene, path, marker_type) %>% 
+  summarise(Tips = sum(Tips,na.rm = TRUE)) %>% 
+  arrange(desc(Tips)) %>% 
+  rowwise() %>% 
+  mutate(gene = str_remove(gene, "_curated"), 
+         gene = if_else(gene %in% gene_name_replacements$original, replace_name(gene), gene),
+         type = factor(marker_type, levels = c("Single copy core gene","Genes identified in Cai et al. 2023" ,"Traditional marker","Amplicon from core genes", "Amplicons from Cai et al. 2023 (Sanger)", "Amplicons from Cai et al. 2023 (Illumina)"), ordered = TRUE),
+         gene = case_when(str_detect(type, "Cai") & str_detect(gene, "trpE") ~ str_replace(gene, "trpE", '"trpE" (ubiD)'),
+                            .default = gene))
+
+
+(monophy_tips_ggplot_w_cai <- combined_monophyletic %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)") %>% 
+  ggplot(aes(Tips, reorder(gene,Tips), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(Tips + 0.005, label = round(Tips, 2)), color = "black", size = 2, hjust = 0) +
+  theme_bw() +
+  scale_fill_manual(values = colors5) +
+  theme(panel.border = element_blank()) +
+  labs(x = "Number of genomes in\nmonophyletic clusters",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_monophy_w_cai.pdf",width = 4, height =2.5, scale =1.75)
+
+(monophy_tips_ggplot_w_cai_nodppA <- combined_monophyletic %>% 
+  filter(type != "Amplicons from Cai et al. 2023 (Sanger)",
+                  !str_detect(gene, "dppA")) %>% 
+  ggplot(aes(Tips, reorder(gene,Tips), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(Tips + 0.005, label = round(Tips, 2)), color = "black", size = 2, hjust = 0) +
+  theme_bw() +
+  scale_fill_manual(values = colors5) +
+  theme(panel.border = element_blank()) +
+  labs(x = "Number of genomes in\nmonophyletic clusters",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_monophy_w_cai_nodppA.pdf",width = 4, height =2.5, scale =1.75)
+
+(monophy_tips_ggplot <- combined_monophyletic %>% 
+  filter(!str_detect(type, "Cai et al. 2023")) %>% 
+  ggplot(aes(Tips, reorder(gene,Tips), fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(Tips + 0.005, label = round(Tips, 2)), color = "black", size = 2, hjust = 0) +
+  theme_bw() +
+  scale_fill_manual(values = colors3) +
+  theme(panel.border = element_blank()) +
+  labs(x = "Number of genomes in\nmonophyletic clusters",
+       y= NULL, 
+       fill = "Marker type:"))
+ggsave("results/marker_monophy.pdf",width = 4, height =2.5, scale =1.75)
+
+```
+
+### Make combined summary plots
+```{r}
+# With Cai 2023
+(combined_summary_plot_w_cai <- dists_to_HQ_ggplot_w_cai + monophy_tips_ggplot_w_cai + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a",tag_suffix = ")"))
+
+
+ggsave(plot = combined_summary_plot_w_cai, filename = "results/combined_summary_plot_w_cai.pdf",width = 6, height =4, scale = 2)
+ggsave(plot = combined_summary_plot_w_cai, filename = "results/combined_summary_plot_w_cai.png",width = 6, height =4, scale = 2)
+ggsave(plot = combined_summary_plot_w_cai, filename = "results/combined_summary_plot_w_cai.eps",width = 6, height =4, scale = 2)
+
+
+# Without Cai 2023
+(combined_summary_plot <- dists_to_HQ_ggplot + monophy_tips_ggplot + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a",tag_suffix = ")"))
+
+
+ggsave(plot = combined_summary_plot, filename = "results/combined_summary_plot.pdf",width = 6, height =4, scale = 2)
+ggsave(plot = combined_summary_plot, filename = "results/combined_summary_plot.png",width = 6, height =4, scale = 2)
+ggsave(plot = combined_summary_plot, filename = "results/combined_summary_plot.eps",width = 6, height =4, scale = 2)
+
+# With Cai 2023 & dist to gene pres/abs tree
+(combined_summary_plot_w_cai_and_genePA <- dists_to_HQ_ggplot_w_cai + monophy_tips_ggplot_w_cai + dists_to_genePA_ggplot_w_cai + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a",tag_suffix = ")"))
+
+
+ggsave(plot = combined_summary_plot_w_cai_and_genePA, filename = "results/combined_summary_plot_w_cai_and_genePA.pdf",width = 6.5, height =4, scale = 2.5)
+ggsave(plot = combined_summary_plot_w_cai_and_genePA, filename = "results/combined_summary_plot_w_cai_and_genePA.png",width = 6.5, height =4, scale = 2.5)
+ggsave(plot = combined_summary_plot_w_cai_and_genePA, filename = "results/combined_summary_plot_w_cai_and_genePA.eps",width = 6.5, height =4, scale = 2.5)
+
+# With Cai 2023 & dist to gene pres/abs tree, no dppA
+(combined_summary_plot_w_cai_and_genePA_nodppA <- dists_to_HQ_ggplot_w_cai_nodppA + monophy_tips_ggplot_w_cai_nodppA + dists_to_genePA_ggplot_w_cai_nodppA + plot_layout(guides = "collect") + plot_annotation(tag_levels = "a",tag_suffix = ")"))
+
+
+ggsave(plot = combined_summary_plot_w_cai_and_genePA_nodppA, filename = "results/combined_summary_plot_w_cai_and_genePA_nodppA.pdf",width = 6.5, height =4, scale = 2.5)
+ggsave(plot = combined_summary_plot_w_cai_and_genePA_nodppA, filename = "results/combined_summary_plot_w_cai_and_genePA_nodppA.png",width = 6.5, height =4, scale = 2.5)
+ggsave(plot = combined_summary_plot_w_cai_and_genePA_nodppA, filename = "results/combined_summary_plot_w_cai_and_genePA_nodppA.eps",width = 6.5, height =4, scale = 2.5)
+
+```
+
+
+
+### Tanglegrams of select markers
+
+#### 16S
+```{r}
+
+hq_tree_no_outgroup <- drop.tip(hq_tree,"PCC_6803")
+
+comparison_tree <- read.tree("data/panaroo/exported_marker_genes/historic/16S_curated.afa.treefile") %>% drop.tip(c("PCC_6803","ATCC29413"))
+
+# Tanglegram of IQtree and Jacob tree
+shared_tips <- intersect(comparison_tree$tip.label, hq_tree$tip.label) %>% .[! . == "PCC_6803"]
+
+hq_subset <- keep.tip(hq_tree, shared_tips)
+comparison_tree_subset <- keep.tip(comparison_tree, shared_tips)
+
+pdf(str_glue("results/tanglegrams/taglegram_HQtree_vs_16S.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(comparison_tree_subset))), ReadDendrogram(textConnection(write.tree(hq_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+
+trees_to_compare <- cophylo(hq_tree_no_outgroup, comparison_tree,rotate = TRUE)
+
+#plot(trees_to_compare)
+
+palette <- randomcoloR::distinctColorPalette(length(hq_tree$tip.label))
+
+pdf(file = "results/cophylo/HQtree_vs_16S.pdf", width = 8, height = 12, pointsize = 4)
+
+par(lend=3)
+plot(trees_to_compare,link.col=palette,link.lwd=4,link.type="curved", link.lty="solid",fsize=c(0.8,0.8))
+
+dev.off()
+```
+
+
+
+#### ITS
+```{r}
+
+hq_tree_no_outgroup <- drop.tip(hq_tree,"PCC_6803")
+
+comparison_tree <- read.tree("data/panaroo/exported_marker_genes/historic/itsC_curated.afa.treefile") %>% drop.tip(c("PCC_6803","ATCC29413"))
+
+# Tanglegram of IQtree and Jacob tree
+shared_tips <- intersect(comparison_tree$tip.label, hq_tree$tip.label) %>% .[! . == "PCC_6803"]
+
+hq_subset <- keep.tip(hq_tree, shared_tips)
+comparison_tree_subset <- keep.tip(comparison_tree, shared_tips)
+
+pdf(str_glue("results/tanglegrams/taglegram_HQtree_vs_ITSc.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(comparison_tree_subset))), ReadDendrogram(textConnection(write.tree(hq_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+
+trees_to_compare <- cophylo(hq_tree_no_outgroup, comparison_tree,rotate = TRUE)
+
+#plot(trees_to_compare)
+
+palette <- randomcoloR::distinctColorPalette(length(hq_tree$tip.label))
+
+pdf(file = "results/cophylo/HQtree_vs_ITSc.pdf", width = 8, height = 12, pointsize = 4)
+
+par(lend=3)
+plot(trees_to_compare,link.col=palette,link.lwd=4,link.type="curved", link.lty="solid",fsize=c(0.8,0.8))
+
+dev.off()
+```
+
+
+
+
+#### group_9636
+```{r}
+
+comparison_tree <- read.tree("data/panaroo/exported_marker_genes/best_core_genes/group_9636.afa.treefile") %>% drop.tip(c("PCC_6803","ATCC29413"))
+comparison_tree$tip.label <- str_remove(comparison_tree$tip.label, "_[0-9]*_[0-9]*_[0-9]*$")
+
+
+# Tanglegram of IQtree and Jacob tree
+shared_tips <- intersect(comparison_tree$tip.label, hq_tree$tip.label) %>% .[! . == "PCC_6803"]
+
+hq_subset <- keep.tip(hq_tree, shared_tips)
+comparison_tree_subset <- keep.tip(comparison_tree, shared_tips)
+
+pdf(str_glue("results/tanglegrams/taglegram_HQtree_vs_group_9636.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(comparison_tree_subset))), ReadDendrogram(textConnection(write.tree(hq_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+
+trees_to_compare <- cophylo(hq_tree_no_outgroup, comparison_tree,rotate = TRUE)
+
+#plot(trees_to_compare)
+
+palette <- randomcoloR::distinctColorPalette(length(hq_tree$tip.label))
+
+pdf(file = "results/cophylo/HQtree_vs_group_9636.pdf", width = 8, height = 12, pointsize = 4)
+
+par(lend=3)
+plot(trees_to_compare,link.col=palette,link.lwd=4,link.type="curved", link.lty="solid",fsize=c(0.8,0.8))
+
+dev.off()
+```
+
+
+
+#### lgt__516
+```{r}
+
+comparison_tree <- read.tree("data/panaroo/exported_marker_genes/best_amplicons/lgt__516.afa.treefile") %>% drop.tip(c("PCC_6803","ATCC29413"))
+comparison_tree$tip.label <- str_remove(comparison_tree$tip.label, "_[0-9]*_[0-9]*_[0-9]*$")
+
+# Tanglegram of IQtree and Jacob tree
+shared_tips <- intersect(comparison_tree$tip.label, hq_tree$tip.label) %>% .[! . == "PCC_6803"]
+
+hq_subset <- keep.tip(hq_tree, shared_tips)
+comparison_tree_subset <- keep.tip(comparison_tree, shared_tips)
+
+pdf(str_glue("results/tanglegrams/taglegram_HQtree_vs_lgt__516.pdf")) 
+dndlist <- dendextend::dendlist(ReadDendrogram(textConnection(write.tree(comparison_tree_subset))), ReadDendrogram(textConnection(write.tree(hq_subset))))
+dendextend::tanglegram(dndlist,  margin_inner = 1.8, lab.cex = 0.3, lwd = 
+0.5, edge.lwd = 0.5, type = "r", sort = TRUE, match_order_by_labels = TRUE)
+dev.off()
+
+trees_to_compare <- cophylo(hq_tree_no_outgroup, comparison_tree,rotate = TRUE)
+
+#plot(trees_to_compare)
+
+palette <- randomcoloR::distinctColorPalette(length(hq_tree$tip.label))
+
+pdf(file = "results/cophylo/HQtree_vs_lgt__516.pdf", width = 8, height = 12, pointsize = 4)
+
+par(lend=3)
+plot(trees_to_compare,link.col=palette,link.lwd=4,link.type="curved", link.lty="solid",fsize=c(0.8,0.8))
+
+dev.off()
+```
+
+
+### Combined cophy plot
+```{r}
+ggplotify::as.ggplot()
+
+
+#wrap_plots(ITSc_cophy, group_9636_cophy, lgt_cophy)
+
+ITSc_cophy + group_9636_cophy + lgt_cophy + plot_annotation(tag_levels = "a",tag_suffix = ")")
+
+ggsave("results/cophylo/combined.pdf",width = 11, height = 8.5, scale =2, dpi = 300)
+```
+
+
+
+
+Checking that labels in some older refs match those from panaroo
+```{r}
+seq_panaroo <- Biostrings::readDNAStringSet("data/panaroo/exported_marker_genes/best_core_genes/group_10526.afa") %>% 
+  data.frame(seq = .,
+             name = names(.) %>% str_remove(";.*"))
+
+
+seq_16S <- Biostrings::readDNAStringSet("data/marker_genes_extracted_from_jacob_genomes/16S.afa") %>% 
+  data.frame(seq = .,
+             name = names(.)) %>% 
+  mutate(gene_matches_one_from_panaroo = name %in% seq_panaroo$name)
+
+
+```
+
+
+
+
+# Shared gene content
+
+```{r}
+pres_abs_long <- pa_binary %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene") %>% 
+  pivot_longer(-gene, names_to = "genome", values_to = "pres_abs") %>% 
+  filter(pres_abs == TRUE)
+  
+genomes_and_gene_count <- pres_abs_long %>% 
+  group_by(genome) %>% 
+  summarise(n_genes = n())
+
+
+g1 = "Microcystis_MC19"
+g2 = "LE17-20C"
+
+shared_gene_count <- function(g1, g2){
+  test <- pres_abs_long %>% 
+    filter(genome == !!g1 | genome == !!g2) %>%
+    group_by(gene) %>% 
+    mutate(n_present = n()) %>% 
+    filter(n_present == 2) %>% 
+    pull(gene) %>% unique() %>% length()
+}
+
+test <- shared_gene_count("LE17-20C","Microcystis_MC19")
+
+genome_combinations <- RcppAlgos::comboGrid(genomes_and_gene_count$genome,genomes_and_gene_count$genome,repetition = FALSE) %>% 
+  as.data.frame() %>% 
+  dplyr::rename(genome1 = "Var1", genome2 = "Var2") %>% 
+  filter(genome1 != genome2) %>% 
+  rowwise() %>% 
+  mutate(shared_genes = shared_gene_count(genome1, genome2)) %>% 
+  filter(!genome1 %in% c("PCC_6803", "ATCC29413"),
+         !genome2 %in% c("PCC_6803", "ATCC29413")) %>% 
+  left_join(genomes_and_gene_count %>% dplyr::rename(genome1 = "genome", genome1_count = "n_genes")) %>% 
+  left_join(genomes_and_gene_count %>% dplyr::rename(genome2 = "genome", genome2_count = "n_genes")) %>% 
+  mutate(normalized_gene_count = (2*shared_genes) / (genome1_count + genome2_count)) %>% 
+  write_rds("data/shared_gene_counts.rds") %>% 
+  write_tsv("data/panaroo/shared_gene_info_laura/shared_gene_counts.tsv")
+  
+
+cleanup_panaroo_names <- function(x){
+  outstr <- x %>% str_remove("[_,\\.][0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*") %>% str_remove(";.*")
+  return(outstr)
+}
+
+gene_dists_wide <- gene_dists %>% 
+  select(genome1, genome2, percent_ident, gene) %>% 
+  mutate(across(c(genome1, genome2), ~cleanup_panaroo_names(.x))) %>%  
+  pivot_wider(names_from = gene, values_from = percent_ident) %>% 
+  filter(genome1 != genome2)
+
+
+shared_genes_and_gene_dists <- genome_combinations %>% 
+  left_join(gene_dists_wide) %>% 
+  filter(!genome1 %in% c("PCC_6803", "ATCC29413"),
+         !genome2 %in% c("PCC_6803", "ATCC29413")) %>% 
+  write_tsv("data/panaroo/exported_marker_genes/pairwise_genome_sharedGenes_and_geneIdentity.tsv")
+
+
+unique_products <- gene_dists %>% 
+  filter(percent_ident != 1) %>% 
+  pivot_longer(c(genome1, genome2), names_to = "genome_type", values_to = "genome") %>% 
+  select(genome, gene) %>%
+  mutate(genome = str_remove(genome, ";.*")) %>% 
+  group_by(gene,.drop = TRUE) %>% 
+  distinct() %>% 
+  summarise(n_unique = n())
+```
+
+
+#### Ridgeline plot of percent identity distribution for each gene
+```{r}
+
+shared_genes_and_gene_dists <- read_tsv("data/panaroo/exported_marker_genes/pairwise_genome_sharedGenes_and_geneIdentity.tsv")
+
+shared_genes_and_gene_dists_long <- shared_genes_and_gene_dists %>% 
+  dplyr::select(genome1, genome2,`16S`:ppnK__1135) %>% 
+  pivot_longer(-c(genome1, genome2), names_to = "gene", values_to = "identity") %>% 
+  filter(!is.na(identity),
+         identity > 0) %>% 
+  group_by(gene) %>% 
+  mutate(mean_identity = mean(identity)) %>% 
+  rowwise() %>% 
+  mutate(gene = if_else(gene %in% gene_name_replacements$original, replace_name(gene), gene))
+
+colors3 <- c("#194B77", "#826489", "lightblue3")
+
+shared_genes_and_gene_dists_long %>% 
+  left_join(hist_dists %>% dplyr::select(gene, type) %>% filter(!str_detect(type,"Cai"))) %>% 
+  ggplot(aes(identity, reorder(gene,mean_identity), fill = type)) +
+  ggridges::geom_density_ridges(rel_min_height = 0.005) +
+  theme_bw() +
+  scale_fill_manual(values = colors3) + 
+  coord_cartesian(xlim = c(0.9,1)) +
+  geom_point(aes(x = mean_identity)) +
+  labs(y = NULL, x = "% identity")
+
+ggsave("results/percent_ID_ridgeline.png", width = 5, height = 5, scale = 1.5)
+
+```
+
+
+
+
+
+# Old code snippets
+
+### Check for heterogeneity in read mappings
+```{}
 
 alignments <- list.files("data/marker_genes/identified_variants","_called_variants.afa",full.names = TRUE)
 
@@ -239,7 +2689,7 @@ alignments_div %>%
 
 
 
-```{r}
+```{}
 
 
 param <- Rsamtools::ScanBamParam(what = "seq")
@@ -280,7 +2730,7 @@ test %>%
 ```
 
 
-```{r}
+```{}
 
 no_index <- function(x){
   !str_detect(x, "bai")
@@ -501,74 +2951,6 @@ snps_plot / checkM_strains + plot_layout(heights = c(0.8, 0.2))
 ggsave("results/strain_heterogeneity.png", width = 10, height = 4, scale =2, dpi= 600)
 
 ```
-
-
-
-
-
-bamfile <- system.file("extdata", "ex1.bam",
-package="Rsamtools")
-       param <- ScanBamParam(what="seq")
-       gal <- readGAlignmentsFromBam(bamfile, param=param)
-       qseq <- mcols(gal)$seq  # the query sequences
-
-(2) Use sequenceLayer() to "lay" the query sequences on the reference
-     space. This will remove the parts from the query sequences that
-     correspond to insertions and soft clipping, and it will fill them
-     with - where deletions and/or skipped regions occurred:
-
-       qseq_on_ref <- sequenceLayer(qseq, cigar(gal),
-                                    from="query", to="reference")
-
-(3) Compute 1 consensus matrix per chromosome:
-
-       qseq_on_ref_by_chrom <- splitAsList(qseq_on_ref, seqnames(gal))
-       qseq_pos_by_chrom <- splitAsList(start(gal), seqnames(gal))
-
-       cm_by_chrom <- lapply(names(qseq_pos_by_chrom),
-           function(seqname)
-               consensusMatrix(qseq_on_ref_by_chrom[[seqname]],
-                               as.prob=TRUE,
-                               shift=qseq_pos_by_chrom[[seqname]]-1,
-                               width=seqlengths(gal)[[seqname]]))
-       names(cm_by_chrom) <- names(qseq_pos_by_chrom)
-
-
-
-
-
-Make primers
-```{r}
-library(DECIPHER)
-
-fas <- "data/marker_genes/identified_variants/pgi_called_variants.fasta"
-
-dbConn <- dbConnect(SQLite(), ":memory:")
-N <- Seqs2DB(fas, "FASTA", dbConn, "")
-
-desc <- dbGetQuery(dbConn, "select description from Seqs")$description
-Add2DB(data.frame(identifier=desc, stringsAsFactors=FALSE), dbConn)
-
-
-# Designing primers for sequencing experiments:
-TYPE <- "sequence"
-MIN_SIZE <- 275 # base pairs
-MAX_SIZE <- 450
-RESOLUTION <- 5 # k-mer signature
-LEVELS <- 5 # max number of each k-mer
-ENZYMES <- NULL # required for sequencing
-
-primers <- DesignSignatures(dbConn,tblName = "Seqs",
-    type=TYPE,
-    minProductSize=MIN_SIZE,
-    maxProductSize=MAX_SIZE,
-    resolution=RESOLUTION,
-    levels=LEVELS,
-    enzymes=ENZYMES)
-
-```
-
-
 
 
 

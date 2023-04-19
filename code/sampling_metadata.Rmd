@@ -3,7 +3,7 @@ title: "HAB environmental data"
 output: html_notebook
 ---
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_knit$set(root.dir = here::here("~/bioinformatics/microcystis_genomes_2022/"))
 library(tidyverse)
 ```
 
@@ -26,55 +26,110 @@ Data collected on sampling trips
 map_NCEI_to_GLERLdatashare <- readxl::read_excel("data/env_data/column_map_NCEI_to_GLERL_weekly_datashare.xlsx")
 
 
+# This has been replaced with the finalized data made available through NCEI
 # Import 2020 GLERL weekly datashare and cleanup
-env_2020 <- read_csv("data/env_data/2020_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
-  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
-  type_convert()
+# env_2020 <- read_csv("data/env_data/2020_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
+#   mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+#   type_convert()
 
 # Change 2021 GLERL weekly datashare column names to match NCEI format
-names(env_2020) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2020), map_NCEI_to_GLERLdatashare$GLERL)] 
-
-env_2020 <- env_2020 %>% 
-  select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
-
-
-# Import 2021 GLERL weekly datashare and cleanup
-env_2021 <- read_csv("data/env_data/2021_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
-  mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
-  type_convert()
-
-# Change 2021 GLERL weekly datashare column names to match NCEI format
-names(env_2021) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2021), map_NCEI_to_GLERLdatashare$GLERL)] 
-
-env_2021 <- env_2021 %>% 
-  select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
+# # names(env_2020) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2020), map_NCEI_to_GLERLdatashare$GLERL)] 
+# # 
+# # env_2020 <- env_2020 %>% 
+# #   select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
+# # 
+# # 
+# # # Import 2021 GLERL weekly datashare and cleanup
+# # env_2021 <- read_csv("data/env_data/2021_WLE_Weekly_Datashare_CSV.csv", na = c("nd","bdl","n/a","na",".","ns")) %>% 
+# #   mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+# #   type_convert()
+# 
+# # Change 2021 GLERL weekly datashare column names to match NCEI format
+# names(env_2021) <- map_NCEI_to_GLERLdatashare$NCEI[match(names(env_2021), map_NCEI_to_GLERLdatashare$GLERL)] 
+# 
+# env_2021 <- env_2021 %>% 
+#   select(one_of(map_NCEI_to_GLERLdatashare$NCEI))
 
 
 
 # Import NCEI archives from 2012 to 2018
 env_2012_to_2018 <- read_csv("data/env_data/lake_erie_habs_field_sampling_results_2012_2018_v2.csv",na = c("nd","bdl","n/a","na",".")) %>% 
   mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  pivot_longer(-c(Date,Site, `Sample Depth (category)`), names_to = "NCEI", values_to = "value") %>% 
+  dplyr::rename(date = "Date", station_name = "Site", sample_depth_category = "Sample Depth (category)") %>% 
+  left_join(map_NCEI_to_GLERLdatashare) %>% 
   type_convert()
 
 env_2019 <- read_csv("data/env_data/lake_erie_habs_field_sampling_results_2019.csv", na = c("nd","bdl","n/a","na",".")) %>% 
   mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  pivot_longer(-c(Date,Site, `Sample Depth (category)`), names_to = "NCEI", values_to = "value") %>% 
+  dplyr::rename(date = "Date", station_name = "Site", sample_depth_category = "Sample Depth (category)") %>% 
+  left_join(map_NCEI_to_GLERLdatashare) %>% 
   type_convert()
 
 env_2020_to_2021 <- read_csv("data/env_data/noaa-glerl-erie-habs-field-sampling-results-2020-2021.csv",na = c("nd","bdl","n/a","na",".")) %>% 
   mutate(across(everything(), ~str_remove_all(.x,"<"))) %>% 
+  pivot_longer(-c(date, station_name, sample_depth_category), names_to = "NCEI_20_21", values_to = "value") %>% 
+  left_join(map_NCEI_to_GLERLdatashare) %>% 
   type_convert()
 ```
 
 ## Merge data
 
 ```{r}
-env_data <- env_2012_to_2018 %>% 
-  full_join(env_2019) %>% 
-  full_join(env_2020_to_2021) %>% 
-  #full_join(env_2021) %>% 
-  #full_join(env_2020) %>% 
-  mutate(Date = lubridate::mdy(Date)) %>% 
+
+# Using old NCEI column names
+env_data_oldNCEI_columns <- bind_rows(env_2012_to_2018, env_2019, env_2020_to_2021) %>% 
+  select(Date = "date", Site = "station_name", `Sample Depth (category)` = "sample_depth_category", NCEI, value) %>% 
+  filter(!is.na(NCEI)) %>% 
+  pivot_wider(names_from = "NCEI", values_from = "value") %>% 
+  mutate(temp_date = lubridate::mdy(Date)) %>% 
+  arrange(temp_date, Site, `Sample Depth (category)`) %>% 
+  select(-temp_date) %>% 
   write_tsv("data/env_data/merged_env_data.tsv")
+
+# Using old NCEI column names
+env_data_newNCEI_columns <- bind_rows(env_2012_to_2018, env_2019, env_2020_to_2021) %>% 
+  select(date, station_name, sample_depth_category, NCEI_20_21, value) %>% 
+  filter(!is.na(NCEI_20_21)) %>% 
+  pivot_wider(names_from = "NCEI_20_21", values_from = "value") %>% 
+  mutate(date = lubridate::mdy(date)) %>% 
+  arrange(date, station_name, sample_depth_category) %>% 
+  write_tsv("data/env_data/merged_env_data_newNCEI.tsv")
+
+# Using GLAMR column names
+env_data_GLAMR_columns <- bind_rows(env_2012_to_2018, env_2019, env_2020_to_2021) %>% 
+  select(date, NOAA_site = "station_name", sample_depth_category, GLAMR, value) %>% 
+  filter(!is.na(GLAMR)) %>% 
+  pivot_wider(names_from = "GLAMR", values_from = "value") %>% 
+  mutate(date = lubridate::mdy(date)) %>% 
+  arrange(date, NOAA_site, sample_depth_category) %>% 
+  mutate(collection_date = if_else(!is.na(time), paste0(date,"T", time), as.character(date))) %>% 
+  relocate(collection_date) %>% 
+  write_tsv("data/env_data/merged_env_data_GLAMR_w_surface_and_bottom.tsv")
+
+# Using GLAMR column names for only surface measurements
+env_data_GLAMR_columns_surface_only <- bind_rows(env_2012_to_2018, env_2019, env_2020_to_2021) %>% 
+  select(date, NOAA_site =  "station_name", sample_depth_category, GLAMR, value) %>% 
+  filter(!is.na(GLAMR)) %>% 
+  pivot_wider(names_from = "GLAMR", values_from = "value") %>% 
+  mutate(date = lubridate::mdy(date)) %>% 
+  arrange(date, NOAA_site, sample_depth_category) %>% 
+  mutate(collection_date = if_else(!is.na(time), paste0(date,"T", time), as.character(date)),
+         depth = if_else(!is.na(depth_at_sampling_location) & lubridate::year(date) != 2020, paste0(as.character(as.numeric(depth_at_sampling_location) - 1), "-","0.5") ,depth)) %>% 
+  relocate(collection_date) %>% 
+  filter(sample_depth_category == "Surface") %>% 
+  select(-sample_depth_category) %>% 
+  write_tsv("data/env_data/merged_env_data_GLAMR.tsv")
+
+
+# env_data <- env_2012_to_2018 %>% 
+#   full_join(env_2019) %>% 
+#   full_join(env_2020_to_2021) %>% 
+#   #full_join(env_2021) %>% 
+#   #full_join(env_2020) %>% 
+#   mutate(Date = lubridate::mdy(Date)) %>% 
+#   write_tsv("data/env_data/merged_env_data.tsv")
 ```
 
 

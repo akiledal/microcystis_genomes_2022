@@ -7,16 +7,15 @@ output: html_document
 
 
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_knit$set(root.dir = here::here("~/projects/microcystis_genomes_2022/"))
 
 library(tidyverse)
 library(Rsamtools)
 ```
 
 
+## Functional genes for WLECC manuscript
 ```{r}
-
-
 #test <- "data/marker_genes/ND-100/16S_mapped.bam"
 
 bam_stats <- function(bam_path){
@@ -62,6 +61,8 @@ bam_stats <- function(bam_path){
 ```
 
 ```{r}
+bam_path <- bam_files[1]
+
 bam_stats_w_pileup <- function(bam_path){
 
   bam <- Rsamtools::BamFile(file = bam_path,
@@ -74,7 +75,7 @@ bam_stats_w_pileup <- function(bam_path){
   # bam_count <- scanBamHeader(bam)$targets %>% 
   #   data.frame(length = ., seq = labels(.))
   
-  mod_catalase_pileup <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+  out <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) #%>% 
     group_by(seqnames) %>% 
     mutate(seq_length = max(pos),
            total_mapped_bases = sum(count)) %>% 
@@ -97,11 +98,47 @@ bam_stats_w_pileup <- function(bam_path){
     left_join(reads_pile) %>% 
     mutate(bam_path = bam_path)
 }
+
+bam_stats_w_nuc_info <- function(bam_path){
+
+  bam <- Rsamtools::BamFile(file = bam_path,
+                            index = paste0(bam_path,".bai"))
+  
+  # number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  out <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+    arrange(seqnames, pos, desc(count)) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count),
+             nuc_rank = row_number(),
+             depth = sum(count),
+             rel_abund = count/depth,
+             prop_non_primary_base = sum(non_primary_base_count) / depth,
+             ratio_to_primary = count / max(count)) %>% 
+    group_by(seqnames) %>% 
+      mutate(prop_non_primary_seq = sum(non_primary_base_count) / total_mapped_bases,
+             percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary_seq * 100,
+             bam_path = bam_path) %>% 
+    left_join(reads_pile)
+}
+
 ```
 
 
 
-## Per-gene summary
+### Per-gene summary
 Find bam files and then get stats
 ```{r}
 id_map <- read_tsv("data/strain_to_seq_sample_map.tsv")
@@ -123,6 +160,14 @@ sample_genotype_summary <- plot_data %>%
   mutate(n_genes = sum(percent_covered_bases > 50)) %>% 
   arrange(desc(n_genes), desc(mean_depth)) %>% 
   write_rds("data/read_mapping_to_genes_summary.rds")
+
+sample_genotype_summary <- read_rds("data/read_mapping_to_genes_summary.rds") %>% 
+  mutate(seqnames = case_when(seqnames == "ccmM"~"cccmM",
+                          seqnames == "alkp-like" ~ "MAE_16640",
+                          seqnames == "sip"~ "MAE_47020",
+                          seqnames == "pstB_1"~ "pstB2",
+                          TRUE ~ as.character(seqnames)),
+         seqnames = str_remove(seqnames, "_[0-9]$")) 
 
 sample_order <- sample_genotype_summary %>% pull(pubID) %>% unique()
 mcy_order <- paste0("mcy", LETTERS[seq( from = 1, to = 10 )])
@@ -202,7 +247,7 @@ ggsave("results/methionine_pathway_mapping.pdf", width = 3, height = 2, scale = 
 ```
 
 
-## with per-base info
+### with per-base info
 ```{r}
 
 all_bam_stats_w_seqs <- map_df(bam_files, bam_stats_w_pileup)
@@ -252,6 +297,172 @@ mcy_order <- paste0("mcy", LETTERS[seq( from = 1, to = 10 )])
 #   scale_x_continuous(guide = guide_axis(angle = -35))
 
 #ggsave("results/mcy_read_coverage.png",width = 12, height = 8, scale =1.5, dpi=300)
+```
+
+## Taxonomic markers to assess strain diveristy
+
+```{r}
+
+id_map <- read_tsv("data/strain_to_seq_sample_map.tsv")
+
+bam_files <- system("ls data/strain_mapping/*_mapped.bam", intern = TRUE)
+
+all_bam_stats_w_seqs <- map_df(bam_files, bam_stats_w_nuc_info)
+
+plot_data <- all_bam_stats_w_seqs %>% 
+  mutate(sample = bam_path %>% basename() %>% str_remove("_mapped.bam")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  left_join(id_map) %>% 
+  filter(!is.na(pubID)) %>% 
+  mutate(seqnames = case_when(seqnames == "group_507" ~ "group_5007",
+                              seqnames == "group_9635" ~ "group_9636",
+                              TRUE ~ seqnames))
+
+
+plot_data %>% 
+  ggplot(aes(pos, depth, color = prop_non_primary_seq)) +
+  geom_path() +
+  scale_color_viridis_c(trans = "log10") +
+  facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+
+plot_data %>% 
+  ggplot(aes(prop_non_primary_base * 100, pubID)) +
+  geom_violin() +
+  scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+  #scale_color_viridis_c(trans = "log10") +
+  #facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+plot_data %>% 
+  filter(pubID == "LE19-12.2",
+         nuc_rank >1) %>% 
+  ggplot(aes(count/depth , pubID)) +
+  geom_violin() +
+  #scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,count,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(x = "position", y = "depth", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,ratio_to_primary,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Depth ratio to primary allele", x = "Position (bp)", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,rel_abund,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Relative abundance", x = "Position (bp)", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1,
+         pubID =="LE19-12.2", 
+         seqnames == "lgt_516") %>% 
+  ggplot(aes(pos,count,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(x = "% non-primary bases")
+
+# LE-19.12.2
+
+all_19_22_seqs <- plot_data %>% 
+  filter(count > 1,
+         pubID =="LE19-12.2", 
+         seqnames == "lgt_516")
+
+primary_19_22_lgt <- all_19_22_seqs %>% 
+  filter(nuc_rank == 1) %>% 
+  arrange(pos) %>% 
+  pull(nucleotide) %>% 
+  paste0(collapse = "")
+
+secondary_19_22_lgt <- all_19_22_seqs %>% 
+  group_by(pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank)) %>% 
+  arrange(pos) %>% 
+  pull(nucleotide) %>% 
+  paste0(collapse = "")
+
+
+# Contam of particular interest, must be supported by at least 2 reads
+
+strains_of_interest <- c("LE17-20", "LE19-55.1", "LE19-8.1", "LE19-12.2")
+
+primary_seqs <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         count > 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs <- plot_data %>% 
+  filter(count > 1) %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary <- bind_rows(primary_seqs, secondary_seqs) %>% 
+  distinct()
+
+
+seqs_for_export <- Biostrings::DNAStringSet(primary_and_secondary$sequence) %>% 
+    `names<-`(primary_and_secondary$header) %>% 
+    Biostrings::writeXStringSet(str_glue("data/strain_contam_marker_genes_primary_and_secondary_alleles.fasta"))
+
+## Any singular SNPs
+
+primary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary_ALL <- bind_rows(primary_seqs_ALL, secondary_seqs_ALL) %>% 
+  distinct()
+
+
+seqs_for_export <- Biostrings::DNAStringSet(primary_and_secondary_ALL$sequence) %>% 
+    `names<-`(primary_and_secondary_ALL$header) %>% 
+    Biostrings::writeXStringSet(str_glue("data/strain_contam_marker_genes_primary_and_secondary_alleles_ALL_Secondary.fasta"))
+
+
 ```
 
 
@@ -320,13 +531,333 @@ full_simp_plot_data_W_read_mapping <- full_simp_plot_data %>%
 
 ```
 
+### mLE1981 -- LLNL's version of strain LE19-8.1
+```{r}
+
+bam <- "data/strain_mapping/mLE1981_mapped.bam"
+
+# number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  all_bam_stats_w_seqs <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+    arrange(seqnames, pos, desc(count)) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count),
+             nuc_rank = row_number(),
+             depth = sum(count),
+             rel_abund = count/depth,
+             prop_non_primary_base = sum(non_primary_base_count) / depth,
+             ratio_to_primary = count / max(count)) %>% 
+    group_by(seqnames) %>% 
+      mutate(prop_non_primary_seq = sum(non_primary_base_count) / total_mapped_bases,
+             percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary_seq * 100,
+             bam_path = bam_path) %>% 
+    left_join(reads_pile)
+  
+  
+
+plot_data <- all_bam_stats_w_seqs %>% 
+  mutate(sample = bam_path %>% basename() %>% str_remove("_mapped.bam")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  #left_join(id_map) %>% 
+  #filter(!is.na(pubID)) %>% 
+  mutate(seqnames = case_when(seqnames == "group_507" ~ "group_5007",
+                              seqnames == "group_9635" ~ "group_9636",
+                              TRUE ~ seqnames),
+         pubID = sequencingID)
+
+
+plot_data %>% 
+  ggplot(aes(pos, depth, color = prop_non_primary_seq)) +
+  geom_path() +
+  scale_color_viridis_c(trans = "log10") +
+  facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+
+plot_data %>% 
+  ggplot(aes(prop_non_primary_base * 100, pubID)) +
+  geom_violin() +
+  scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+  #scale_color_viridis_c(trans = "log10") +
+  #facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+plot_data %>% 
+  filter(pubID == "LE19-12.2",
+         nuc_rank >1) %>% 
+  ggplot(aes(count/depth , pubID)) +
+  geom_violin() +
+  #scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,count,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(x = "position", y = "depth", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,ratio_to_primary,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Depth ratio to primary allele", x = "Position (bp)", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,rel_abund,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Relative abundance", x = "Position (bp)", color = "Allele frequency rank")
+
+
+# Contam of particular interest, must be supported by at least 2 reads
+
+strains_of_interest <- c("mLE1981")
+
+primary_seqs <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         count > 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs <- plot_data %>% 
+  filter(count > 1) %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary <- bind_rows(primary_seqs, secondary_seqs) %>% 
+  distinct()
+
+
+seqs_for_export <- Biostrings::DNAStringSet(primary_and_secondary$sequence) %>% 
+    `names<-`(primary_and_secondary$header) %>% 
+    Biostrings::writeXStringSet(str_glue("data/mLE1981_contam_marker_genes_primary_and_secondary_alleles.fasta"))
+
+## Any singular SNPs
+
+primary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary_ALL <- bind_rows(primary_seqs_ALL, secondary_seqs_ALL) %>% 
+  distinct()
+```
+
+
+### LE3 -- checking LLNL's version of strain LE3
+```{r}
+
+bam <- "data/strain_mapping/LE3_mapped.bam"
+bam_path <- "data/strain_mapping/LE3_mapped.bam"
+
+# number of mapped_reads
+  reads_pile <- idxstatsBam(bam)
+  
+  # Can be used to get seq lengths quickly
+  # bam_count <- scanBamHeader(bam)$targets %>% 
+  #   data.frame(length = ., seq = labels(.))
+  
+  all_bam_stats_w_seqs <- Rsamtools::pileup(bam,pileupParam = PileupParam(distinguish_strands = FALSE)) %>% 
+    group_by(seqnames) %>% 
+    mutate(seq_length = max(pos),
+           total_mapped_bases = sum(count)) %>% 
+    group_by(seqnames, pos, seq_length) %>% 
+    arrange(seqnames, pos, desc(count)) %>% 
+      mutate(non_primary_base_count = sum(count) - max(count),
+             nuc_rank = row_number(),
+             depth = sum(count),
+             rel_abund = count/depth,
+             prop_non_primary_base = sum(non_primary_base_count) / depth,
+             ratio_to_primary = count / max(count)) %>% 
+    group_by(seqnames) %>% 
+      mutate(prop_non_primary_seq = sum(non_primary_base_count) / total_mapped_bases,
+             percent_covered_bases = sum(depth > 0) / seq_length * 100,
+             mean_depth = mean(depth),
+             depth_var = var(depth),
+             depth_sd = sd(depth),
+             percent_id_to_consensus = 100 - prop_non_primary_seq * 100,
+             bam_path = bam_path) %>% 
+    left_join(reads_pile)
+  
+  
+
+plot_data <- all_bam_stats_w_seqs %>% 
+  mutate(sample = bam_path %>% basename() %>% str_remove("_mapped.bam")) %>% 
+  dplyr::rename(sequencingID = "sample") %>% 
+  #left_join(id_map) %>% 
+  #filter(!is.na(pubID)) %>% 
+  mutate(seqnames = case_when(seqnames == "group_507" ~ "group_5007",
+                              seqnames == "group_9635" ~ "group_9636",
+                              TRUE ~ seqnames),
+         pubID = sequencingID)
+
+
+plot_data %>% 
+  ggplot(aes(pos, depth, color = prop_non_primary_seq)) +
+  geom_path() +
+  scale_color_viridis_c(trans = "log10") +
+  facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+
+plot_data %>% 
+  ggplot(aes(prop_non_primary_base * 100, pubID)) +
+  geom_violin() +
+  scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+  #scale_color_viridis_c(trans = "log10") +
+  #facet_grid(pubID~seqnames,scales = "free", space = "free_x")
+
+plot_data %>% 
+  filter(pubID == "LE19-12.2",
+         nuc_rank >1) %>% 
+  ggplot(aes(count/depth , pubID)) +
+  geom_violin() +
+  #scale_x_log10(labels = scales::label_comma()) +
+  labs(x = "% non-primary bases")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,count,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(x = "position", y = "depth", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,ratio_to_primary,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Depth ratio to primary allele", x = "Position (bp)", color = "Allele frequency rank")
+
+plot_data %>% 
+  filter(nuc_rank > 1,
+         count > 1) %>% 
+  ggplot(aes(pos,rel_abund,color = factor(nuc_rank))) +
+  #geom_path() +
+  geom_point() +
+  facet_grid(seqnames ~ pubID, space = "free_x") +
+  labs(y = "Relative abundance", x = "Position (bp)", color = "Allele frequency rank")
+
+
+# Contam of particular interest, must be supported by at least 2 reads
+
+strains_of_interest <- c("LE3")
+
+primary_seqs <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         count > 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs <- plot_data %>% 
+  filter(count > 1) %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary <- bind_rows(primary_seqs, secondary_seqs) %>% 
+  distinct()
+
+
+seqs_for_export <- Biostrings::DNAStringSet(primary_and_secondary$sequence) %>% 
+    `names<-`(primary_and_secondary$header) %>% 
+    Biostrings::writeXStringSet(str_glue("data/LE3_contam_marker_genes_primary_and_secondary_alleles.fasta"))
+
+## Any singular SNPs
+
+primary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames) %>% 
+  filter(nuc_rank == 1,
+         pubID %in% strains_of_interest) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_primarySequence "))
+  
+secondary_seqs_ALL <- plot_data %>% 
+  group_by(pubID, seqnames, pos) %>% 
+  filter(nuc_rank < 3, # only use the secondary nucleotide if present
+         nuc_rank == max(nuc_rank),
+         pubID %in% strains_of_interest) %>% 
+  group_by(pubID, seqnames) %>% 
+  arrange(seqnames,pubID, pos) %>% 
+  summarise(sequence = paste0(nucleotide,collapse = "")) %>% 
+  mutate(header = str_glue("{pubID}_{seqnames}_secondarySequence "))
+
+primary_and_secondary_ALL <- bind_rows(primary_seqs_ALL, secondary_seqs_ALL) %>% 
+  distinct()
+```
+
+
+
+```{r}
+pcc7806_pileup <- data.table::fread("data/strain_mapping/mLE1981_PCC7806_mapped.pileup")
+
+pcc7806_pileup %>% 
+  ggplot(aes(V2, V4)) +
+  geom_path()
+
+```
 
 
 
 
 
 ## Some old code from a similar effort
-```{r}
+```{}
 no_index <- function(x){
   !str_detect(x, "bai")
 }

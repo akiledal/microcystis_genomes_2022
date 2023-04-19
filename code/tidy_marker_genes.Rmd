@@ -32,7 +32,7 @@ regions_16S <- microcystis_marker_genes_pre_16S_regions %>%
   select(-seq,-gene) %>% 
   pivot_longer(c(V4_16S,V2_16S),names_to="gene",values_to="seq")
 
-microcystis_marker_genes <- bind_rows(microcystis_marker_genes,regions_16S)
+microcystis_marker_genes <- bind_rows(microcystis_marker_genes_pre_16S_regions,regions_16S)
 
 genes <- microcystis_marker_genes %>% 
   select(gene) %>% 

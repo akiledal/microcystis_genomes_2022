@@ -12,6 +12,8 @@ library(scales)
 ```
 
 
+# Using the reference genomes from Laura
+
 Import and combine all blast results
 ```{r}
 
@@ -97,3 +99,88 @@ filtered_blasts %>%
 
 
 ```
+
+
+# Using the reference genomes from Jacob
+
+Import and combine all blast results
+```{r}
+
+genomes <- system("ls data/reference/jacob_reference_genomes/*.fa",intern = TRUE)
+
+genome = genomes[1]
+get_contig_names <- function(genome){
+  fasta <- Biostrings::readDNAStringSet(genome,use.names = TRUE) %>% 
+    data.frame(header = names(.), 
+               seq = .) %>% 
+    mutate(genome_name  = str_remove(genome,".fna") %>% str_remove(".*jacob_reference_genomes/")) %>% 
+    select(genome_name, header)
+}
+
+contigs <- map_df(genomes, get_contig_names)
+
+blasts <- system("ls data/BLAST/markers_from_jacob_genomes/*.blastn", intern = TRUE) %>% 
+  data.frame(file = .) %>%  # convert to data frame
+  mutate(blast = str_remove(file,".blastn") %>% str_remove_all(".*/"))
+
+blast6_cols <- c("Query", "Subject", "Percent_ID", "Aln_Len", "Mismatch", "Gap", "Query_Start", "Query_Stop", "Subject_Start", "Subject_Stop", "E-Value", "Bit_Score", "percent_of_query_aligned", "subject_title","aligned_qeuery_seq", "aligned_subject_seq")
+
+# Function for importing .pb results, specifies column types to import and adds file name to data frame
+read_blast_results <- function(file){
+  read_tsv(file, skip = 0,col_types = rep("c",16) %>% paste0(collapse = ""), col_names = blast6_cols) %>% 
+    mutate(file = file,
+           blast = str_remove(file,".blastn") %>% str_remove_all(".*/"),
+           gene = blast %>% str_remove("__.*"),
+           genome = blast %>% str_remove(".*__"))
+}
+
+# Take list of files, import and merge them all
+all_blasts <- map_df(blasts$file, ~read_blast_results(.)) %>% 
+  type_convert()
+
+filtered_blasts <- all_blasts %>% 
+  filter(percent_of_query_aligned > 75,
+         Percent_ID > 90) %>% 
+  group_by(genome,gene) %>% 
+  slice_max(n = 1, order_by = Bit_Score,with_ties = FALSE) %>% 
+  mutate(present = TRUE)
+
+for (gene_name in unique(filtered_blasts$gene)) {
+  filtered_blasts %>% 
+    filter(gene == gene_name) %>% 
+    ungroup() %>% 
+    select(genome, aligned_subject_seq) %>% 
+    mutate(aligned_subject_seq = str_remove_all(aligned_subject_seq, "-") %>% str_remove_all("\n")) %>% 
+    deframe() %>% Biostrings::DNAStringSet() %>% 
+    Biostrings::writeXStringSet(glue::glue("data/marker_genes_extracted_from_jacob_genomes/{gene_name}.fasta"))
+}
+  
+
+gene_seqs <- filtered_blasts %>% 
+  select(genome,gene,aligned_subject_seq)
+
+n_genes <- filtered_blasts %>% 
+  ungroup() %>% group_by(genome) %>% 
+  summarise(n_genes = n()) 
+  
+n_genomes <- filtered_blasts %>% 
+  ungroup() %>% group_by(gene) %>% 
+    summarize(n_genomes = n())
+
+
+filtered_blasts %>% 
+  ggplot(aes(Aln_Len, fill = gene)) +
+  geom_density() +
+  scale_x_log10()
+
+
+filtered_blasts %>%
+  ggplot(aes(blast, genome, fill = present)) + 
+  geom_tile()
+
+# 
+# filtered_blasts %>%
+#   ggplot(aes(n_genomes, n_genes, fill = present)) + 
+#   geom_point()
+```
+
