@@ -1,0 +1,296 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+library(tidyverse)
+library(patchwork)
+
+set.seed(2022)
+```
+
+Read in toxin pres/abs files
+```{r}
+paths <- system("ls data/toxin_pres_abs/*.csv", intern = TRUE)
+
+path <- paths[1]
+
+read_toxin_pres_abs <- function(path){
+ toxin <- path %>% basename() %>% str_remove("\\.csv")
+  pa_df <- read_csv(path, show_col_types = FALSE) %>% 
+    mutate(toxin = toxin) %>% 
+    pivot_longer(-c(species, toxin),names_to = "toxin_gene", values_to = "pres_abs") %>% 
+    dplyr::rename(genome = "species")
+}
+
+toxin_pres_abs <- map_df(paths, read_toxin_pres_abs) %>% 
+  filter(!toxin %in% c("jam", "oci", "pag"))
+```
+
+Can find the historic markers here:
+/for_laura/otu_analysis_curated
+
+Don't stratify by individual toxin genes, either pure if all genes absent or a gene present in all genomes.
+
+Read in clustering files
+
+```{r}
+otu_files <- system("ls data/otus/*/*.otu", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+ bind_cols(., unglue::unglue_data(.$path, "data/otus/{type}/{gene}.phylip.an.0.{dissim}.otu")) %>% 
+  mutate(dissim = as.numeric(dissim),
+         sim = 100 - dissim)
+
+read_otus <- function(path){
+
+col_names <- c("otu", "genome")
+
+test <- read_tsv(path,col_names = col_names, show_col_types = FALSE) %>% 
+  separate_longer_delim(genome, delim = ",") %>% 
+  mutate(genome = str_remove(genome, ";.*"),
+         path = path) %>% 
+  left_join(otu_files) %>% 
+  mutate(gene = str_remove(gene, "_curated"))
+}
+
+otus <- map_df(otu_files$path, read_otus)
+```
+
+
+Combine OTUs & toxin pres/abs data
+```{r}
+
+n_genomes_for_markers <- otus %>% 
+  select(gene, genome) %>% distinct() %>% 
+  group_by(gene) %>% 
+  summarise(n_genomes_containing = n())
+
+n_toxin_genes <- toxin_pres_abs %>% 
+  select(toxin, toxin_gene) %>% 
+  distinct() %>% 
+  group_by(toxin) %>% 
+  summarise(n_toxin_genes = n())
+
+otu_toxins <- toxin_pres_abs %>% 
+  left_join(otus)
+
+otu_purity <- otu_toxins %>% 
+  group_by(otu, toxin, gene, sim) %>% 
+  mutate(mean_pres = mean(pres_abs),
+         genomes_in_otu = n()) %>% 
+  left_join(n_genomes_for_markers) %>% 
+  left_join(n_toxin_genes)
+
+genomes_in_pure_otus <- otu_purity %>% 
+  group_by(toxin, gene, sim) %>% 
+  filter(mean_pres == 0 | mean_pres == 1) %>% 
+  summarise(percent_genome_in_pure_otu = ((n() / n_genomes_containing) / n_toxin_genes) * 100) %>% 
+  distinct()
+
+genomes_in_pure_otus %>% 
+  group_by(gene, sim) %>% 
+  summarise(avg_percent_in_pure_otus = mean(percent_genome_in_pure_otu)) %>% 
+  ggplot(aes(sim, avg_percent_in_pure_otus, color = gene)) + 
+  geom_point()
+
+```
+
+previously was considering each toxin gene independently, to match how this was done previously, first summarize pres/abs at toxin level (any gene hit = toxin present)
+
+```{r}
+toxin_otu_purity <- otu_toxins %>% 
+  group_by(otu, toxin, sim, genome, gene, type) %>% 
+  summarise(pres_abs = as.numeric(sum(pres_abs) > 0)) %>% 
+  group_by(otu, toxin, sim, gene) %>% 
+  mutate(mean_pres = mean(pres_abs),
+         genomes_in_otu = n()) %>% 
+  left_join(n_genomes_for_markers) 
+
+toxin_genomes_in_pure_otus <- toxin_otu_purity %>% 
+  group_by(toxin, gene, sim, type) %>% 
+  filter(mean_pres == 0 | mean_pres == 1) %>% 
+  summarise(percent_genome_in_pure_otu = ((n() / n_genomes_containing)) * 100) %>% 
+  distinct()
+
+toxin_genomes_in_pure_otus %>% 
+  group_by(gene, sim) %>% 
+  summarise(avg_percent_in_pure_otus = mean(percent_genome_in_pure_otu)) %>% 
+  ggplot(aes(sim, avg_percent_in_pure_otus, color = gene, group = gene)) + 
+  geom_point() + 
+  geom_path()
+
+plt_data_percent_in_pure <- toxin_genomes_in_pure_otus %>% 
+  group_by(gene, sim, type) %>% 
+  summarise(avg_percent_in_pure_otus = mean(percent_genome_in_pure_otu)) %>% 
+  mutate(type = case_when(type == "best_amplicons" ~ "Amplicon from core genes",
+                          type == "best_core_genes" ~ "Single copy core gene",
+                          type == "historic" ~ "Traditional marker",
+                          .default = type))
+  
+plot_order <- plt_data_percent_in_pure %>% 
+  filter(sim == 99) %>% 
+  dplyr::select(gene, plt_order = "avg_percent_in_pure_otus") %>% 
+  arrange(plt_order)
+
+colors3 <- c("lightblue3", "#194B77", "#826489")
+
+plt_data_percent_in_pure %>% 
+  left_join(plot_order) %>% 
+  ggplot(aes(avg_percent_in_pure_otus, factor(gene,levels = plot_order$gene, ordered = TRUE), color = type, shape = factor(sim), label = round(avg_percent_in_pure_otus,1))) + 
+  geom_point() + 
+  geom_text(data = . %>% filter(sim == "99"),size = 2.5,nudge_x = 7) +
+  scale_color_manual(values = colors3) +
+  theme_bw() +
+  labs(y = NULL, 
+       x = "Average % of Total Toxin Sequences in Pure OTUs", 
+       shape = "OTU % identity",
+       color = "Marker type")
+
+ggsave("results/total_percent_toxin_seqs_in_pure_OTUs.png", width = 4, height =3, scale = 1.5)
+ggsave("results/total_percent_toxin_seqs_in_pure_OTUs.pdf", width = 4, height =3, scale = 1.5)
+ggsave("results/total_percent_toxin_seqs_in_pure_OTUs.eps", width = 4, height =3, scale = 1.5)
+
+```
+
+
+```{r}
+
+change_toxin_names <- function(short_name) {
+ case_when(short_name == "aer" ~ "Aeruginosin",
+           short_name == "apn" ~ "Anabaenopeptin",
+           short_name == "jam" ~ "Jamaicamides",
+           short_name == "mcn" ~ "Cyanopeptolin",
+           short_name == "mcy" ~ "Microcystin",
+           short_name == "mdn" ~ "Microviridin",
+           short_name == "oci" ~ "Cyanopeptin",
+           short_name == "pag" ~ "Prenylagaramide",
+           short_name == "pir" ~ "Piricylamide"
+           ) 
+}
+
+
+plt_data_percent_in_pure <- toxin_genomes_in_pure_otus %>% 
+  group_by(gene, sim, toxin, type) %>% 
+  summarise(avg_percent_in_pure_otus = mean(percent_genome_in_pure_otu)) %>% 
+  mutate(type = case_when(type == "best_amplicons" ~ "Amplicon from core genes",
+                          type == "best_core_genes" ~ "Single copy core gene",
+                          type == "historic" ~ "Traditional marker",
+                          .default = type),
+         toxin = change_toxin_names(toxin))
+  
+plot_order <- plt_data_percent_in_pure %>% 
+  ungroup() %>% 
+  filter(sim == 99) %>% 
+  dplyr::select(gene, plt_order = "avg_percent_in_pure_otus") %>% 
+  group_by(gene) %>% 
+  slice_max(plt_order, n = 1) %>% 
+  arrange(plt_order) %>% ungroup() %>% distinct()
+
+plot_order <- plt_data_percent_in_pure %>% 
+  ungroup() %>% 
+  filter(sim == 99) %>% 
+  dplyr::select(gene, plt_order = "avg_percent_in_pure_otus") %>% 
+  group_by(gene) %>% 
+  summarise(plt_order = mean(plt_order)) %>% 
+  arrange(plt_order) %>% ungroup() %>% distinct()
+
+
+facet_order <- plt_data_percent_in_pure %>% 
+  ungroup() %>% 
+  filter(sim == 99) %>% 
+  dplyr::select(gene, avg_percent_in_pure_otus, toxin) %>% 
+  group_by(toxin) %>% 
+  summarise(mean_pure= mean(avg_percent_in_pure_otus)) %>% 
+  arrange(desc(mean_pure)) %>% 
+  pull("toxin")
+  
+
+colors3 <- c("lightblue3", "#194B77", "#826489")
+
+plt_data_percent_in_pure %>% 
+  left_join(plot_order) %>% 
+  ggplot(aes(avg_percent_in_pure_otus, factor(gene,levels = plot_order$gene, ordered = TRUE), color = type, shape = factor(sim), label = round(avg_percent_in_pure_otus,1))) + 
+  geom_point() + 
+  theme_bw() +
+  facet_wrap(~factor(toxin,levels = facet_order, ordered = TRUE), nrow = 2) +
+  scale_color_manual(values = colors3) +
+  theme_bw() +
+  labs(y = NULL, 
+       x = "Average % of Total Toxin Sequences in Pure OTUs", 
+       shape = "OTU % identity",
+       color = "Marker type")
+
+ggsave("results/per_toxin_percent_in_pure_OTUs.png", width = 3.5, height =3.5, scale = 2.5)
+ggsave("results/per_toxin_percent_in_pure_OTUs.pdf", width = 3.5, height =3.5, scale = 2.5)
+ggsave("results/per_toxin_percent_in_pure_OTUs.eps", width = 3.5, height =3.5, scale = 2.5)
+```
+
+
+
+
+
+
+```{r}
+file.name1 <-"mdn matrix"
+mdn<- read.csv(paste0(file.name1,".csv"), header=T)
+options(max.print = 10000)
+apn%>%
+  filter(species %in% c("Microcystis_aeruginosa_PCC_7806SL","Microcystis_aeruginosa_Ma_AC_P_19900807_S300",
+  "Microcystis_aeruginosa_DIANCHI905"))
+
+```
+
+```{r}
+###OTU shared presence per toxin graph (dont use)###
+library(ggplot2)
+file.name1 <-"OTU graph data"
+dat<- read.csv(paste0(file.name1,".csv"), header=T)
+ggplot(data= dat, aes(OTU.id, shared.presence, group = Gene, color = Gene, shape = Gene))+
+  #geom_line()+
+  geom_point()+
+  scale_shape_manual(values = seq(0,8))+
+  labs(shape = "Marker Gene", color= "Marker Gene", x = "OTU % ID", y = "Shared Toxin Gene Presence (%)" )+
+    facet_wrap( ~ toxin, nrow = 5)
+
+###OTU purity per toxin###
+library(ggplot2)
+file.name1 <-"OTU graph data purity"
+dat<- read.csv(paste0(file.name1,".csv"), header=T)
+ggplot(data= dat, aes(x=factor(OTU.id), shared.presence, group = Gene, color = Gene, shape = Gene))+
+  #geom_line()+
+  geom_point()+
+  scale_x_discrete(labels=c("95"="95","97"="97","99"="99"))+
+  scale_shape_manual(values = seq(0,8))+
+  labs(shape = "Marker Gene", color= "Marker Gene", x = "OTU % ID", y = "% Sequences in Pure OTUs")+
+  facet_wrap( ~ toxin, scales = "free_x", nrow = 5)
+
+###OTU purity per gene for all toxins summary###
+file.name2 <-"OTU summary"
+dat2<- read.csv(paste0(file.name2,".csv"), header=T)
+ggplot(data= dat2, aes(x=factor(OTU.id), shared.presence, color = Gene, shape = Gene))+
+  geom_point()+
+  scale_x_discrete(labels=c("95"="95","97"="97","99"="99"))+
+  scale_shape_manual(values = seq(0,8))+
+  labs(shape = "Marker Gene", color= "Marker Gene", x = "OTU % ID", y = "Average % of Total Toxin Sequences in Pure OTUs")
+
+###toxin gene ref table###
+library(kableExtra)
+file.name1 <-"Toxin ref sequences"
+dat<- read.csv(paste0(file.name1,".csv"), header=T)
+dat %>%
+  kbl(caption = "Table 2: Toxin sequences used in Blast query of Microcystis genomes from Supplemental Table 1 to generate presence absence matrix of toxin genes.") %>%
+  kable_classic_2(full_width = F, html_font = "Times New Roman")%>%
+  kable_styling(font_size = 12)
+
+###microcystis genome ref table###
+file.name3 <-"microcystis genome ref"
+dat3<- read.csv(paste0(file.name3,".csv"), header=T)
+kbl(dat3,longtable = T, booktabs = T, caption = "Table 1: Published Microcystis Genomes") %>%
+  kable_classic_2(full_width = F, html_font = "Times New Roman")%>%
+  kable_styling(font_size = 12, latex_options = c("repeat_header"))%>%
+  save_kable(file = "D:/Ph.D/Dissertation/Prelim Project- Microcystis Strain Variation Markers/Figure 4 OTU/mcy_table.pdf")
+
+```
+
