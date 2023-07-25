@@ -98,7 +98,8 @@ color_map <- jacob_mapping %>%
                            tip.label == "Microcystis_aeruginosa_LE3" ~ "FALSE",
                            tip.label == "Microcystis_aeruginosa_LE13-04" ~ "FALSE",
                            TRUE ~ as.character(WLECC))) %>% 
-  write_tsv("data/reference/color_map.tsv")
+  write_tsv("data/reference/color_map.tsv") %>% 
+  write_rds("data/reference/color_map.rds")
   #select(tip.label, group)
 
 
@@ -227,61 +228,6 @@ return(out)
 prelim_gene_dists <- map_df(gene_trees$path, compare_to_hq) %>% 
   left_join(gene_trees)
 
-```
-
-Deprecated, think this was from testing some preliminary analysis
-```{}
-#ape::comparePhylo(gene_tree_subset, hq_tree_subset, plot = TRUE)
-
-variant_trees <- lapply(variant_tree_files,read.tree)
-
-tree_names <- character()
-
-for (i in 1:length(variant_trees)){
-  tip_labels <- data.frame(old.label = variant_trees[[i]]$tip.label) %>% 
-     mutate(gene = str_remove(old.label, "_.*"),
-            sequencingID = str_remove(old.label,"_consensus") %>% str_remove(".*_")) %>% 
-     left_join(seqID_to_strainID)
-  
-  tree_names <- c(tree_names, tip_labels$gene[1])
-  
-  print(tip_labels$gene[1])
-   
-  variant_trees[[i]]$tip.label <- tip_labels$straindID_underscores
-  
-  variant_trees[[i]]<- keep.tip(variant_trees[[i]],our_strains)
-}
-
-names(variant_trees) <- tree_names
-
-
-TreeDist::RobinsonFoulds(hq_tree_ours_only %>% keep.tip(variant_trees[["16S"]]$tip.label),variant_trees[["16S"]])
-
-ape::comparePhylo(hq_tree_ours_only %>% keep.tip(variant_trees[["16S"]]$tip.label),variant_trees[["pgi"]], plot = TRUE)
-
-
-
-t1 <- hq_tree_ours_only %>% keep.tip(variant_trees[["pgi"]]$tip.label) %>% phytools::midpoint.root() %>% ape::chronoMPL() %>% as.dendrogram()
-t2 <- variant_trees[["pgi"]] %>% phytools::midpoint.root() %>% ape::chronoMPL()   %>% as.dendrogram()
-
-assoc <- cbind(t1$tip.label, t1$tip.label)
-#cophyloplot(t1, t2, assoc, length.line = 4, space = 28, gap = 3)
-
-
-dndlist <- dendextend::dendlist(t1, t2)
-#dendextend::tanglegram(dndlist, fast = TRUE, margin_inner = 1.8, lab.cex = 0.3, lwd = 
-#0.5, edge.lwd = 0.5, type = "r",)
-
-
-compare_to_hq_tree <- function(tree){
-  TreeDist::RobinsonFoulds(hq_tree_ours_only %>% keep.tip(tree$tip.label),tree)
-}
-
-ani_dist_to_multigene_tree <- TreeDist::RobinsonFoulds(ani_tree_ours_only,hq_tree_ours_only)
-
-tree_distances <- sapply(variant_trees, compare_to_hq_tree) %>% 
-  data.frame(dist_to_hq_tree = ., gene = names(.)) %>% 
-  bind_rows(data.frame(dist_to_hq_tree = ani_dist_to_multigene_tree, gene = "ani"))
 ```
 
 
@@ -726,13 +672,17 @@ umap_plot_data <- umap_res$layout %>%
     scale_color_identity(guide = "legend", labels = ordered_color_map$group, breaks = ordered_color_map$hex_col) +
     geom_point() +
     theme_bw()+
-    labs(title = "UMAP of Microcystis shared gene content",
+    labs(
+         #title = "UMAP of Microcystis shared gene content",
          color = "Clades from Pérez-Carrascal\net al. 2019") +
     theme(legend.title.align = 0.5)
   ) #%>% 
   plotly::ggplotly()
 
 ggsave("results/UMAP_shared_gene_content.png",width = 5, height = 3, dpi = 300, scale = 1.5)
+ggsave("results/UMAP_shared_gene_content.tiff",width = 5, height = 3, dpi = 300, scale = 1.5)
+ggsave("results/UMAP_shared_gene_content.pdf",width = 5, height = 3, dpi = 300, scale = 1.5)
+ggsave("results/UMAP_shared_gene_content.eps",width = 5, height = 3, dpi = 300, scale = 1.5)
 
 ```
 #### Gene PA tree
@@ -1670,16 +1620,16 @@ mcye_for_plot <- colormap2 %>%
 
 
 
-(primer_prod_tree <- ggtree(iqtree,layout = "circular") %<+% mcye_for_plot + 
+(primer_prod_tree <- ggtree(iqtree %>% drop.tip("PCC_6803"),layout = "circular") %<+% mcye_for_plot + 
   geom_rootedge() +
-  geom_tippoint(aes(color = mcyE, size = WLECC)) +
+  geom_tippoint(aes(color = hex_col, shape = mcyE), size = 5) +
   geom_tiplab(aes(label = short_name)) +
-  #scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
-    scale_color_viridis_d() +
+  scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+  #scale_fill_viridis_d() +
   labs(color = "Has mcyE gene", title = "IQtree GTR") +
     expand_limits(y = 2)
 ) 
-ggsave("results/iqtree_mcyE.pdf",width = 2, height = 2, scale = 10)
+ggsave("results/iqtree_mcyE2.pdf",width = 2, height = 2, scale = 10)
 
 amp_tree$tip.label <- amp_tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
 
@@ -1908,7 +1858,7 @@ amplicon_alignments <- system("ls data/panaroo/exported_marker_genes/best_amplic
 cai23_alignments <- system("ls data/panaroo/exported_marker_genes/cai_2023/*.afa", intern = TRUE)
 cai23_amplicon_alignments <- system("ls data/panaroo/exported_marker_genes/cai_2023_amplicons/*.afa", intern = TRUE)
 
-alignments <- c(hist_gene_alignments, full_gene_alignments, amplicon_alignments, cai23_alignments,cai23_amplicon_alignments)
+alignments <- c(hist_gene_alignments, full_gene_alignments, amplicon_alignments, cai23_alignments,cai23_amplicon_alignments) #%>% .[!str_detect(., "dppA2")]
 
 alignment <- "data/panaroo/exported_marker_genes/historic/16S_curated.afa"
 get_percent_ident <- function(alignment){
@@ -2029,7 +1979,7 @@ hist_dists <- map_df(tree_files, compare_to_hq_combined) %>%
   group_by(gene) %>% 
   mutate(clust_info_dist = min(clust_info_dist),
          type = factor(type, levels = c("Single copy core gene","Genes identified in Cai et al. 2023" ,"Traditional marker","Amplicon from core genes", "Amplicons from Cai et al. 2023 (Sanger)", "Amplicons from Cai et al. 2023 (Illumina)"), ordered = TRUE),
-         percent_of_genomes = round(n_shared_genomes / 181 * 100))
+         percent_of_genomes = round(n_shared_genomes / 180 * 100))
 
 colors5 <- c("#194B77", "#C16D08", "#826489", "lightblue3", "#FFAF50")
 colors3 <- c("#194B77", "#826489", "lightblue3")
@@ -2159,7 +2109,7 @@ genePA_dists <- map_df(tree_files, compare_to_genePA_tree) %>%
   group_by(gene) %>% 
   mutate(clust_info_dist = min(clust_info_dist),
          type = factor(type, levels = c("Single copy core gene","Genes identified in Cai et al. 2023" ,"Traditional marker","Amplicon from core genes", "Amplicons from Cai et al. 2023 (Sanger)", "Amplicons from Cai et al. 2023 (Illumina)"), ordered = TRUE),
-         percent_of_genomes = round(n_shared_genomes / 181 * 100))
+         percent_of_genomes = round(n_shared_genomes / 180 * 100))
 
 colors5 <- c("#194B77", "#C16D08", "#826489", "lightblue3", "#FFAF50")
 colors3 <- c("#194B77", "#826489", "lightblue3")
@@ -2520,6 +2470,44 @@ ggsave("results/cophylo/combined.pdf",width = 11, height = 8.5, scale =2, dpi = 
 
 
 
+## Plot marker tree
+
+```{r}
+marker_tree_file <- "data/panaroo/exported_marker_genes/best_amplicons/lgt__516.afa.treefile"
+
+tree <- ape::read.tree(marker_tree_file) 
+
+WLECC_genomes <- colormap2 %>% 
+  filter(WLECC == TRUE,
+         !is.na(tip.label)) %>% 
+  pull("tip.label")
+
+addtnl_genomes <- c("Microcystis_aeruginosa_PCC_7806SL", "Microcystis_aeruginosa_NIES-843", "Microcystis_aeruginosa_PCC_9701")
+
+genomes_to_keep <- c(WLECC_genomes, addtnl_genomes)
+
+tree$tip.label <- tree$tip.label %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$") %>% str_remove("_[0-9]*_refound.*")
+
+tree <- keep.tip(tree,genomes_to_keep)
+
+  
+  ggtree(tree,layout = "circular") %<+% colormap2 + 
+    geom_rootedge() +
+    geom_tippoint(aes(color = hex_col)) +
+    geom_tiplab(aes(label = short_name)) +
+    scale_color_identity(guide = "legend",labels = color_map$group, breaks = color_map$hex_col) +
+    labs(color = "Group") +
+      expand_limits(y = 2)
+  
+  ggsave(str_glue("results/best_amplicon_trees/{primer_name}.pdf"),width = 2, height = 2, scale = 10)
+
+
+
+```
+
+
+
+
 
 Checking that labels in some older refs match those from panaroo
 ```{r}
@@ -2640,317 +2628,7 @@ shared_genes_and_gene_dists_long %>%
   labs(y = NULL, x = "% identity")
 
 ggsave("results/percent_ID_ridgeline.png", width = 5, height = 5, scale = 1.5)
+ggsave("results/percent_ID_ridgeline.pdf", width = 5, height = 5, scale = 1.5)
+ggsave("results/percent_ID_ridgeline.tiff", width = 5, height = 5, scale = 1.5)
 
 ```
-
-
-
-
-
-# Old code snippets
-
-### Check for heterogeneity in read mappings
-```{}
-
-alignments <- list.files("data/marker_genes/identified_variants","_called_variants.afa",full.names = TRUE)
-
-read_alignments <- function(path){
-  
-  gene_name <- str_remove(path,".*/") %>% str_remove("_called_variants.afa")
-  
-  alignment <- Biostrings::readDNAMultipleAlignment(path) %>% 
-    consensusMatrix() %>% 
-    as.data.frame()
-
-  div <- diversity(alignment,MARGIN = 2) %>% 
-    data.frame(position = names(.), diversity = .) %>% 
-    mutate(position = as.numeric(str_remove(position,"V")),
-           gene = gene_name) 
-
-  return(div)
-}
-
-
-test <- read_alignments(alignments[1])
-
-alignments_div <- map_df(alignments,read_alignments)
-
-gene_div <- alignments_div %>% 
-  group_by(gene) %>% 
-  summarise(gene_length = max(position),
-         div_sum = sum(diversity),
-         norm_div = div_sum/gene_length)
-
-alignments_div %>% 
-  ggplot(aes(position,diversity)) + 
-  geom_bar(stat = "identity") +
-  facet_grid(gene ~. ,scales = "free_x")
-```
-
-
-
-```{}
-
-
-param <- Rsamtools::ScanBamParam(what = "seq")
-
-gal  <- GenomicAlignments:::readGAlignments("data/marker_genes/ND-100/16S_mapped_to_consensus.bam", param=param)
-qseq <- mcols(gal)$seq
-
-qseq_on_ref <- GenomicAlignments::sequenceLayer(qseq, GenomicAlignments::cigar(gal),
-                                    from="query", to="reference")
-
-
-
-qseq_on_ref_by_chrom <- splitAsList(qseq_on_ref, seqnames(gal))
-qseq_pos_by_chrom <- splitAsList(start(gal), seqnames(gal))
-
-cm_by_chrom <- lapply(names(qseq_pos_by_chrom),
-   function(seqname)
-       consensusMatrix(qseq_on_ref_by_chrom[[seqname]],
-                       as.prob=TRUE,
-                       shift=qseq_pos_by_chrom[[seqname]]-1,
-                       width=seqlengths(gal)[[seqname]]))
-names(cm_by_chrom) <- names(qseq_pos_by_chrom)
-
-test <- data.frame(cm_by_chrom) %>% 
-  rownames_to_column("base") %>% 
-  pivot_longer(-base, names_to = "position", values_to = "count") %>% 
-  mutate(position = as.character(str_remove(position, ".*\\."))) 
-
-
-test %>% 
-  ggplot(aes(position, count, color = base)) + 
-  geom_point()
-
-test %>% 
-  ggplot(aes(count)) +
-  geom_histogram() + scale_y_log10()
-
-```
-
-
-```{}
-
-no_index <- function(x){
-  !str_detect(x, "bai")
-}
-
-
-bams_to_consensus <- list.files("data/marker_genes","_mapped_to_consensus.bam",recursive = TRUE, full.names = TRUE) %>% 
-  Filter(x = .,f = no_index )
-
-bam_path <- bams_to_consensus[1]
-
-bam_to_consensusMatrix <- function(bam_path){
-  sample <- str_remove(bam_path,".*marker_genes/") %>% str_remove("/.*")
-  gene <- str_remove(bam_path,".*/") %>% str_remove("_mapped_to_consensus.bam")
-  
-  param <- Rsamtools::ScanBamParam(what = "seq")
-  gal  <- GenomicAlignments:::readGAlignments(bam_path, param=param)
-  qseq <- mcols(gal)$seq
-  
-  qseq_on_ref <- GenomicAlignments::sequenceLayer(qseq, GenomicAlignments::cigar(gal),
-                                      from="query", to="reference")
-  
-  qseq_on_ref_by_chrom <- splitAsList(qseq_on_ref, seqnames(gal))
-  qseq_pos_by_chrom <- splitAsList(start(gal), seqnames(gal))
-  
-  cm_by_chrom <- lapply(names(qseq_pos_by_chrom),
-     function(seqname)
-         consensusMatrix(qseq_on_ref_by_chrom[[seqname]],
-                         as.prob=FALSE,
-                         shift=qseq_pos_by_chrom[[seqname]]-1,
-                         width=seqlengths(gal)[[seqname]]))
-  names(cm_by_chrom) <- names(qseq_pos_by_chrom)
-  
-  df <- data.frame(cm_by_chrom) %>% 
-    rownames_to_column("base") %>% 
-    pivot_longer(-base, names_to = "position", values_to = "count") %>% 
-    mutate(position = as.character(str_remove(position, ".*\\.")),
-           gene = gene,
-           sample = sample) 
-  
-  return(df)
-}
-
-
-
-test <- map_df(bams_to_consensus,bam_to_consensusMatrix) %>% 
-  group_by(position,gene,sample) %>% 
-  mutate(site_coverage = sum(count)) %>% 
-  #filter(sample %in% samples_to_use$samples_to_use) %>%
-  ungroup() %>% 
-  group_by(gene, position, sample) %>% 
-  arrange(desc(count)) %>% 
-  mutate(rank = row_number(),
-         percent = count / site_coverage * 100)
-
-
-diversity_matrix <- test %>% 
-  select(sample, gene, base, position, count) %>% 
-  pivot_wider(names_from = base, values_from = count)
-
-
-diversity <- test %>% 
-  group_by(sample, gene, position) %>% 
-  summarise(shannon = vegan::diversity(count))
-
-diversity_summary <- diversity %>% 
-  ungroup() %>% group_by(sample) %>% 
-  summarise(mean_shannon = mean(shannon)) %>%
-  left_join(seqID_to_strainID %>% dplyr::rename(sample = "sequencingID")) %>% 
-  write_tsv("results/strain_het_by_marker_gene_mean_shannon_diversity.tsv")
-
-test_simplified <- test %>% 
-  filter(count > 2) %>% 
-  group_by(gene,position,sample) %>% 
-  mutate(n_snp_types = n()) %>% 
-  filter(n_snp_types > 1)
-
-test %>% filter(rank == 1) %>% 
-  ggplot(aes(sample,percent, color = gene, group =sample)) +
-  #geom_density_2d()
-  geom_jitter() +
-  geom_boxplot() +
-  scale_y_log10()
-  #geom_boxplot() 
-  #geom_point() +
-  #ggridges::geom_density_ridges(panel_scaling = TRUE) +
-  #scale_x_continuous(expand = c(0, 0))
-
-
-test %>% filter(rank ==1) %>% 
-  ggplot(aes(position,percent,color = gene)) +
-  geom_point() +
-  facet_wrap(sample ~ .)
-
-(snps_plot <- test_simplified %>% filter(rank == 1, count > 2) %>% 
-  mutate(sequencingID = sample) %>% 
-  left_join(seqID_to_strainID) %>% 
-  filter(sample %in% samples_to_use$samples_to_use) %>% 
-  filter(strainID %in% strain_het$strainID) %>% 
-  filter(strainID %in% snps_bar$data$strainID) %>%
-  ggplot(aes(position,percent,color = gene)) +
-  geom_point() +
-  facet_grid(~strainID) +
-    theme(legend.position = "none")
-)
-
-
-(snps_plot <- test_simplified %>% filter(rank == 1, count > 2) %>% 
-  mutate(sequencingID = sample) %>% 
-  left_join(seqID_to_strainID) %>% 
-  filter(sample %in% samples_to_use$samples_to_use) %>% 
-  filter(strainID %in% strain_het$strainID) %>% 
-  filter(strainID %in% snps_bar$data$strainID) %>%
-  ggplot(aes(position,100 - percent,color = gene)) +
-  geom_point() +
-    labs(y = "% non-primary base") +
-  facet_grid(~strainID) 
-    #theme(legend.position = "none")
-)
-
-snp_summary <- test_simplified %>% 
-  group_by(sample) %>% 
-  filter(rank ==1,
-         percent < 100, 
-         count > 2,
-         sample %in% samples_to_use$samples_to_use) %>% 
-  mutate(n_snps = n(),
-         mean_primary_snp_percent = mean(percent),
-         SNP_summary = (100 - mean_primary_snp_percent) / 100 * n_snps) %>% 
-  select(sample, n_snps, mean_primary_snp_percent, SNP_summary) %>% 
-  mutate(sequencingID = sample) %>% 
-  left_join(seqID_to_strainID) %>% 
-  distinct() 
-    
-snp_summary %>% ggplot(aes(n_snps,SNP_summary, color = strainID, label = strainID)) +
-    geom_point() +
-    geom_label() +
-    scale_y_log10()
-
-(SNP_summary_plot <- snp_summary %>% 
-  filter(strainID %in% strain_het$strainID) %>% 
-  filter(strainID %in% snps_bar$data$strainID) %>%
-  ggplot(aes(strainID,1, fill = SNP_summary)) +
-    geom_tile() + 
-    labs(x = NULL) +
-    theme(legend.position = "none") +
-  scale_fill_viridis_c()
-)
-
-seconds_simplified <- test_simplified %>% 
-  filter(rank > 1 & count > 0) 
-
-seconds_simplified %>% 
-  filter(count > 2) %>% 
-  ggplot(aes(percent,sample, color = gene)) +
-  #geom_density_2d()
-  geom_jitter() +
-  #geom_point() +
-  #ggridges::geom_density_ridges(panel_scaling = TRUE) +
-  #scale_x_continuous(expand = c(0, 0))
-  scale_x_log10()
-  #scale_x_log10() + 
-  #scale_y_log10() 
-  #facet_wrap(sample ~ .)
-
-
-snps_w_2plus_reads <- seconds_simplified %>% 
-  ungroup() %>% 
-  filter(count > 2) %>% 
-  group_by(sample,gene) %>% 
-  summarise(num_snps = n()) %>% 
-  filter(sample %in% samples_to_use$samples_to_use) %>% 
-  mutate(sequencingID = sample) %>% 
-  left_join(seqID_to_strainID)
-
-(snps_bar <- snps_w_2plus_reads %>% 
-  filter(strainID %in% strain_het$strainID) %>% 
-  ggplot(aes(gene, num_snps, fill = gene)) +
-  #geom_jitter() +
-  geom_bar(stat = "identity", position = "dodge") +
-  facet_grid( ~strainID) +
-  labs(x = NULL, y = "Number of SNPs") +
-  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()
-    #axis.text.x = element_text(angle = -45, hjust = 0, vjust = 0)
-    )
-)
-  
-(checkM_strains <- strain_het %>% 
-    filter(strainID %in% snps_bar$data$strainID) %>% 
-  ggplot(aes(strainID, y = 1, fill = strain_contam)) +
-  geom_tile(color = "white") +
-  theme(axis.text.x = element_text(angle = -45, vjust = 0, hjust = 0)) + 
-  scale_fill_viridis_c(trans = "log") +
-  labs(x = NULL,
-       y=NULL,
-       fill = "checkM \nstrain contam."
-       #y= "checkM \nstrain contam."
-       ) +
-  theme(axis.text.y = element_blank(),
-        axis.ticks.y = element_blank(),
-        #legend.position="none"
-        )
-)
-
-(shannon_heatmap <- diversity_summary %>% 
-  mutate(sequencingID = sample) %>% 
-  left_join(seqID_to_strainID) %>% 
-  filter(strainID %in% snps_bar$data$strainID) %>% 
-  ggplot(aes(strainID, 1, fill = mean_shannon)) +
-  scale_fill_viridis_c() +
-    geom_tile()
-)
-
-library(patchwork)
-
-snps_plot  / SNP_summary_plot / shannon_heatmap / checkM_strains + plot_layout(heights = c(0.4, 0.1, 0.1 , 0.1))
-snps_plot / checkM_strains + plot_layout(heights = c(0.8, 0.2))
-ggsave("results/strain_heterogeneity.png", width = 10, height = 4, scale =2, dpi= 600)
-
-```
-
-
-
