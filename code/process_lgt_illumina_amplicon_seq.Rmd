@@ -1,0 +1,520 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here("~/projects/2023_lgt_microcystis_marker_pilot_MiSeq"))
+library(tidyverse)
+library(dada2)
+library(patchwork)
+```
+
+```{r}
+# Find fastqs & create summary information table
+all_fastqs <- system("ls ~/projects/2023_dolicho_litchman/data/raw_data/fastqs/*/*.fastq.gz", intern = TRUE) %>% 
+  data.frame(path = .) %>% 
+  bind_cols(.,unglue::unglue_data(.$path, "/geomicro/data2/kiledal/projects/2023_dolicho_litchman/data/raw_data/fastqs/{folder}/{sample}_L001_{dir}_001.fastq.gz")) %>% 
+  mutate(dir = if_else(dir == "R1", "fwd", "rev"),
+         sample_name = str_remove(sample, "_S[0-9]*$"),
+         sample_num = str_remove_all(sample, ".*_S")) %>% 
+  type_convert() %>% 
+  arrange(sample_num)
+
+# Filter for only lgt amplicons (16S data was in the same run)
+lgt_fastqs <- all_fastqs %>% 
+  filter(sample_num > 95) %>% 
+  mutate(link_path = str_glue("data/raw_data/fastqs/{basename(path)}"))
+
+# Link files from other project dir to lgt project dir
+fs::link_create(lgt_fastqs$path, lgt_fastqs$link_path,symbolic = FALSE)
+
+# Make wide table with column for path to fwd & reverse reads per-sample
+lgt_fastqs_wide <- lgt_fastqs %>% 
+  select(-path) %>% 
+  pivot_wider(names_from = dir, values_from = link_path) %>% 
+  mutate(fwd_filt = str_glue("data/qcd_reads/{sample_name}_fwd.fastq.gz"),
+         rev_filt = str_glue("data/qcd_reads/{sample_name}_rev.fastq.gz"))
+  
+```
+
+Inspect quality plots... looks good.
+```{r}
+plotQualityProfile(lgt_fastqs_wide$fwd[1:2])
+
+plotQualityProfile(lgt_fastqs_wide$rev[1:2])
+```
+
+Filter and trim reads
+```{r}
+filtFs <- lgt_fastqs_wide$fwd_filt %>% `names<-`(lgt_fastqs_wide$sample_name)
+filtRs <- lgt_fastqs_wide$rev_filt %>% `names<-`(lgt_fastqs_wide$sample_name)
+
+out <- filterAndTrim(lgt_fastqs_wide$fwd, filtFs, lgt_fastqs_wide$rev, filtRs, truncLen=c(240,190),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+```
+
+Learn the error rates for fwd & reverse reads separately
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+plotErrors(errF, nominalQ=TRUE)
+```
+
+Run the DADA2 denoising algorithm
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+Merge read pairs
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+```
+
+Create ASV table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+How long are the ASVs after merging?
+```{r}
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+Remove chimeric sequences
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE) %>% 
+  write_rds("data/ASVs/seqtab.nochim.rds")
+
+dim(seqtab.nochim)
+```
+
+How many sequences lost due to chimera filtering?
+```{r}
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+Create ASV count table
+```{r}
+lgt_516_asv_counts <- seqtab.nochim %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ASV") %>% 
+  mutate(asv_hash = openssl::md5(ASV)) %>% # use ASV hash as the identifier, like QIIME2
+  relocate(asv_hash,ASV)
+
+# Count of ASVs across samples
+lgt_asv_count_summary <- lgt_516_asv_counts %>% 
+  rowwise() %>% 
+  mutate(total_abund = sum(c_across(all_of(lgt_fastqs_wide$sample_name)))) %>% 
+  arrange(desc(total_abund))
+```
+
+Export ASV sequences as fasta
+```{r}
+asv_fasta <- Biostrings::DNAStringSet(lgt_516_asv_counts$ASV) %>% `names<-`(lgt_516_asv_counts$asv_hash) %>% 
+  Biostrings::writeXStringSet("data/ASVs/asvs.fasta")
+```
+
+## Plot just the ASVs
+
+Make ASV tree by aligning with mafft & building tree w/ IQtree (need to be installed separately)
+```{bash}
+cd ~/projects/2023_lgt_microcystis_marker_pilot_MiSeq/
+
+mafft --auto --adjustdirectionaccurately --maxiterate 10 --thread 4  data/ASVs/asvs.fasta > data/ASVs/asvs.afa
+
+iqtree -s data/ASVs/asvs.afa -ntmax 8 -T 8 -m GTR+I+G -redo
+```
+
+Read in the resulting tree
+```{r}
+library(ggtree)
+
+tree <- read.tree("data/ASVs/asvs.afa.treefile") %>% phytools::midpoint.root()
+
+#tree <- tree %>% ape::keep.tip(cyano_plot$asv_hash)
+
+ggtree(tree) %<+% lgt_asv_count_summary +
+  geom_tippoint(aes(size = total_abund))
+```
+
+
+## Plot with reference data included
+
+Build tree with the ASVs & reference sequences extracted from genomes
+```{bash}
+cd ~/projects/2023_lgt_microcystis_marker_pilot_MiSeq/
+
+cat data/ASVs/asvs.fasta > data/ASVs/asvs_W_references.fasta
+cat ~/projects/microcystis_genomes_2022/data/panaroo/exported_marker_genes/best_amplicons/lgt__516.fasta >> data/ASVs/asvs_W_references.fasta
+
+mafft --auto --adjustdirectionaccurately --maxiterate 10 --thread 4  data/ASVs/asvs_W_references.fasta > data/ASVs/asvs_W_references.afa
+
+iqtree -s data/ASVs/asvs_W_references.afa -ntmax 8 -T 8 -m GTR+I+G -redo
+```
+
+## Cluster sequences w/ mmseqs
+100 % identity
+```{bash}
+conda activate mmseqs
+
+mmseqs easy-cluster \
+            data/ASVs/asvs_W_references.fasta \
+            data/ASVs/asv_clust \
+            /tmp/ \
+            --cov-mode 1 \
+            --min-seq-id 1 \
+            -c 0.8 \
+            --threads 4
+```
+
+99% identity
+```{bash}
+conda activate mmseqs
+
+mmseqs easy-cluster \
+            data/ASVs/asvs_W_references.fasta \
+            data/ASVs/asv_clust99 \
+            /tmp/ \
+            --cov-mode 1 \
+            --min-seq-id 0.99 \
+            -c 0.8 \
+            --threads 4
+```
+
+```{r}
+library(ggtree)
+
+reference_fasta <- Biostrings::readDNAStringSet("~/projects/microcystis_genomes_2022/data/panaroo/exported_marker_genes/best_amplicons/lgt__516.fasta")
+
+clusters <- read_tsv("data/ASVs/asv_clust_cluster.tsv", col_names = c("cluster","ASV"))
+
+reference_fasta_df <- reference_fasta %>% 
+  data.frame(ASV = ., name = names(.)) %>% 
+  mutate(wlecc = str_detect(name, "^LE"))
+
+wle_seqs <- reference_fasta_df %>% 
+  filter(str_detect(name, "^LE"))
+
+wlecc_tips <- wle_seqs$name
+
+other_ref_seqs <- reference_fasta_df %>% 
+  filter(!str_detect(name, "^LE"))
+
+other_ref_tips <- other_ref_seqs$name
+
+membership_fct_order <- c("ASV only", "ASV & WLECC", "ASV & reference genome", "ASV, WLECC, and reference genome", "WLECC only", "WLECC & reference genome", "Reference genome only", "NA")
+
+cluster_membership <- clusters %>% 
+  mutate(wlecc = if_else(ASV %in% wlecc_tips, TRUE, FALSE),
+         other_ref = if_else(ASV %in% other_ref_tips, TRUE, FALSE),
+         new_amplicon = if_else(ASV %in% lgt_516_asv_counts$asv_hash, TRUE, FALSE)) %>% 
+  pivot_longer(c(wlecc,other_ref, new_amplicon),names_to = "type",values_to =  "t_or_f") %>% 
+  filter(t_or_f == TRUE) %>% 
+  select(cluster, type,t_or_f) %>% 
+  distinct() %>% 
+  pivot_wider(names_from = type, values_from = t_or_f,values_fill = FALSE) %>% 
+  mutate(cluster_type = case_when(wlecc == TRUE & new_amplicon == FALSE & other_ref == FALSE ~ "WLECC only",
+                                       wlecc == FALSE & new_amplicon == TRUE & other_ref == FALSE ~ "ASV only",
+                                       wlecc == FALSE & new_amplicon == FALSE & other_ref == TRUE ~ "Reference genome only",
+                                       wlecc == TRUE & new_amplicon == TRUE & other_ref == FALSE ~ "ASV & WLECC",
+                                       wlecc == TRUE & new_amplicon == TRUE & other_ref == TRUE ~ "ASV, WLECC, and reference genome",
+                                       wlecc == TRUE & new_amplicon == FALSE & other_ref == TRUE ~ "WLECC & reference genome",
+                                       wlecc == FALSE & new_amplicon == TRUE & other_ref == TRUE ~ "ASV & reference genome",
+                                       .default = "other"
+                                       ),
+          name = str_replace(cluster, ";","_"),
+         clean_name = name %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$")) 
+
+wlecc_in_clusters <- clusters %>% 
+  filter(ASV %in% wlecc_tips) %>% 
+  group_by(cluster) %>% 
+  mutate(culture_name = ASV %>% str_remove(";.*"),
+         wlecc_members = str_flatten(culture_name,collapse = "; "),
+         name = str_replace(cluster, ";","_")) %>% 
+  select(name, wlecc_members) %>% distinct()
+
+
+tree <- read.tree("data/ASVs/asvs_W_references.afa.treefile") #%>% phytools::midpoint.root()
+
+tree_tip_order <- tree %>% 
+  fortify() %>% 
+  filter(isTip == TRUE) %>% 
+  arrange(desc(y)) %>% pull(label)
+
+plot_table <- lgt_asv_count_summary %>% 
+  rename(name = "asv_hash") %>% 
+  mutate(name = as.character(name)) %>% 
+  bind_rows(wle_seqs) %>% 
+  bind_rows(other_ref_seqs) %>% 
+  mutate(wlecc = if_else(ASV %in% lgt_asv_count_summary$ASV, "ASVs from MiSeq", as.character(wlecc)),
+         wlecc = case_when(wlecc == "TRUE" ~ "WLECC",
+                           wlecc == "FALSE" ~ "From ref. genome",
+                           .default = wlecc),
+         total_abund = if_else(is.na(total_abund), 0, total_abund),
+         name = str_replace(name, ";","_"),
+         clean_name = name %>% str_remove("_[0-9]*_[0-9]*_[0-9]*$"),
+         across(any_of(lgt_fastqs_wide$sample_name),~0)) %>% 
+  left_join(cluster_membership %>% select(name, cluster_type)) %>% 
+  left_join(wlecc_in_clusters)
+
+for_filt <- plot_table %>% 
+  filter(total_abund > 1 | wlecc %in% c("WLECC", "From ref. genome"))
+
+#filt_tree <- ape::keep.tip(tree, for_filt$name)
+filt_tree <- ape::keep.tip(tree, clusters %>% select(cluster) %>% distinct() %>% pull("cluster") %>% str_replace(";","_")) 
+
+(clustered_tree <- ggtree(filt_tree,aes(color = factor(cluster_type, membership_fct_order, ordered = TRUE))) %<+% (plot_table %>% filter(name %in% filt_tree$tip.label)) +
+  geom_tippoint() + 
+  geom_tiplab(align = TRUE, aes(label = "")) + 
+    geom_tiplab(data = ~filter(.x, !is.na(wlecc_members)), aes(label = wlecc_members),offset = .002) +
+  #geom_tiplab(offset = .002,align = TRUE) +
+  labs(color = "Tip type", 
+       size = "ASV count") +
+  scale_color_manual(values = c("#cc2d2d","#f58a42","#f5ce42", "purple","#5ca85b", "grey30","black","grey90")) +
+  theme(legend.position="top",
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+    coord_cartesian(xlim = c(0,0.15)) 
+    #geom_hline(yintercept = 81)
+)
+
+ggsave("results/tree.pdf", width = 5, height = 5, scale = 2.2)
+ggsave("results/tree.png", width = 5, height = 5, scale = 2.2)
+  
+```
+
+
+```{r}
+clade_colors <- read_rds("~/projects/microcystis_genomes_2022/data/colors.rds")
+
+mae_order <- c("Mae1", "Mae2_(HL/LG)", "Mae2_(LL/LG)", "Mae3_1", "Mae3_2", "Mae3_3", "Mae4", "Mae5", "Mae6", "Mae7", "Mae8", "Mae9", "Mae10", "Mfl_ae1", "Mfl_ae2", "Mfl_ae3", "Mfl_ae4", "Mfl_ae5", "Mn", "Mpa", "Mvi", "Mwe", "Other")
+genome_colors <- read_rds("~/projects/microcystis_genomes_2022/data/joined_map.rds") %>% 
+  mutate(group = factor(group, mae_order, ordered = TRUE)) %>% 
+  arrange(group) %>% 
+  mutate(hex_col = factor(hex_col, levels = unique(.$hex_col), ordered = TRUE)) %>% 
+  arrange(hex_col)
+
+plot_table_w_colors <- plot_table %>% 
+  mutate(genome = str_replace(clean_name, "-", "_")) %>% 
+  left_join(genome_colors) %>% 
+  select(-hex_col) %>% 
+  left_join(cluster_colors)
+
+(clustered_tree_W_clade_colors <- ggtree(filt_tree,aes(color = hex_col)) %<+% (plot_table_w_colors %>% filter(name %in% filt_tree$tip.label)) +
+  geom_tippoint() + 
+  geom_tiplab(align = TRUE, aes(label = "")) + 
+  geom_tiplab(data = ~filter(.x, !is.na(wlecc_members)), aes(label = wlecc_members),offset = .002) + 
+  labs(color = "Tip type", 
+       size = "ASV count") +
+  scale_color_identity(guide = "legend",labels = genome_colors$group, breaks = genome_colors$hex_col) +
+  theme(legend.position="top",
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+    coord_cartesian(xlim = c(0,0.15)) 
+)
+
+clustered_tree_W_clade_colors$data <- clustered_tree_W_clade_colors$data %>% mutate(hex_col = if_else(is.na(hex_col), "#000000", hex_col))
+
+clustered_tree_W_clade_colors
+
+ggsave("results/tree_w_clade_colors.pdf", width = 5, height = 5, scale = 2.2)
+ggsave("results/tree_w_clade_colors.png", width = 5, height = 5, scale = 2.2)
+
+rev_tree_w_clade_colors <- clustered_tree_W_clade_colors
+
+rev_tree_w_clade_colors$data$x <- max(clustered_tree_W_clade_colors$data$x) - clustered_tree_W_clade_colors$data$x + max(clustered_tree_W_clade_colors$data$x) + 1 
+
+rev_tree_w_clade_colors
+ggsave("results/reversed_tree_w_clade_colors.pdf", width = 5, height = 5, scale = 2.2)
+
+```
+
+
+
+```{r}
+
+shannon_div <- seqtab.nochim %>% 
+  vegan::diversity() %>% 
+  data.frame(shannon = .) %>% 
+  rownames_to_column("sample")
+
+pre_long_counts <- seqtab.nochim %>% 
+  data.frame() %>% 
+  rownames_to_column("sample") %>% 
+  pivot_longer(-sample, names_to = "ASV", values_to = "count") %>% 
+  filter(count > 0) %>% 
+  group_by(sample) %>% 
+  left_join(shannon_div) %>% 
+  mutate(rel_abund = count / sum(count)) %>% 
+  left_join(lgt_asv_count_summary %>% select(ASV, asv_hash))
+
+faithPD_div <- pre_long_counts %>% 
+  select(asv_hash, sample, rel_abund) %>% 
+  pivot_wider(names_from = sample, values_from = rel_abund) %>% 
+  column_to_rownames("asv_hash") %>% 
+  t() %>% 
+  picante::pd(tree = tree,include.root = FALSE) %>%  
+  data.frame(faithPD = .) %>% 
+  rownames_to_column("sample")
+  
+long_counts <- pre_long_counts %>% 
+  left_join(faithPD_div) %>% 
+  mutate(sample_num = sample %>% str_extract("S(.*?)-.*",1),
+         extension_time = str_remove(sample, ".*-"),
+         sample_selection_reason = case_when(sample_num == 1 ~ "1. High Microcystis diversity",
+                                           sample_num == 2  ~ "2. Low Microcystis diversity",
+                                           sample_num == 3 ~ "3. High relative abundance of Microcystis (and mae3 groups)",
+                                           sample_num == 4 ~ "4. Low relative abundance of Microcystis",
+                                           sample_num == 5 ~ "5. High abundance of mae2 groups",
+                                           sample_num == 6 ~ "6. High abundance of mfl groups",
+                                           sample_num == 7 ~ "7. Culture with expected strain diversity (LE19-12.2)",
+                                           sample_num == 8 ~ "8. Culture expected to not have strain diversity (LE18-22)",
+                                           .default = as.character(sample_num)
+                                           ),
+         sample_selection_reason = str_wrap(sample_selection_reason, width = 40)) %>% 
+  pivot_longer(c(faithPD.PD, shannon),names_to = "metric", values_to = "diversity") %>% 
+  mutate(metric = case_when(metric =="faithPD.PD" ~ "Faith's Phylogenetic Diveristy",
+                            metric == "shannon" ~ "Shannon diversity"),
+         asv_hash = as.character(asv_hash)) %>% 
+  left_join(clusters %>% filter(ASV %in% pre_long_counts$asv_hash) %>% rename(asv_hash = "ASV") %>% mutate(cluster = str_replace(cluster, ";","_"),))
+
+sample_selection_reasons <- long_counts %>%
+  ungroup() %>% 
+  filter(!is.na(sample_num)) %>% 
+  select(sample_num, sample_selection_reason) %>% 
+  distinct() %>% 
+  arrange(desc(sample_num))
+
+
+long_counts %>% 
+  filter(!is.na(sample_num)) %>% 
+  ggplot(aes(diversity,factor(sample_selection_reason,sample_selection_reasons$sample_selection_reason,ordered = TRUE), color = extension_time)) + 
+  geom_point() +
+  theme_bw() +
+  facet_grid(~metric,scales = "free_x") +
+  labs(color = "Extension time", y = NULL, x = NULL)
+
+ggsave("results/alpha_diversity.pdf", width = 5, height = 3, scale = 1.5)
+ggsave("results/alpha_diversity.png", width = 5, height = 3, scale = 1.5)
+
+
+
+
+(asv_ggtree <- asv_tree %>% 
+  ggtree() +
+    geom_tiplab(align = TRUE,size = 1) +
+    coord_cartesian(xlim = c(0,0.12))
+)
+
+clustered_tree
+
+(asv_abund_heatmap <- long_counts %>% 
+  filter(extension_time == "90sec") %>% 
+  #mutate(asv_hash = as.character(asv_hash)) %>% 
+  left_join(clustered_tree$data %>% select(cluster = label, tree_y = y)) %>% 
+  ggplot(aes(sample_selection_reason, tree_y, fill = rel_abund * 100)) + 
+  geom_tile() +
+  scale_x_discrete(guide = guide_axis(angle = -35)) +
+  scale_fill_viridis_c() +
+  theme_bw() +
+    #theme_tree2() +
+  labs(y = NULL, fill = "% abundance", x =NULL) +
+  scale_y_discrete(position = "right") +
+    theme(axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    #scale_y_continuous(expand=c(0, 0.3)) +
+    scale_y_continuous(limits = c(min(clustered_tree$data$y),max(clustered_tree$data$y)), 
+                       expand=c(0, 0.3)) 
+    #geom_hline(yintercept = 81)
+)
+
+clustered_tree + theme(legend.position = "right") + asv_abund_heatmap + plot_layout(guides = "collect",widths = c(0.7,0.3))
+ggsave("results/tree_and_heatmap.pdf", width = 5, height =3, dpi = 300, scale = 4)
+ggsave("results/tree_and_heatmap.png", width = 5, height =3, dpi = 300, scale = 4)
+
+clustered_tree_W_clade_colors + theme(legend.position = "right") + asv_abund_heatmap + plot_layout(guides = "collect",widths = c(0.7,0.3))
+ggsave("results/tree_and_heatmap_w_clade_colors.pdf", width = 5, height =3, dpi = 300, scale = 4)
+ggsave("results/tree_and_heatmap_w_clade_colors.png", width = 5, height =3, dpi = 300, scale = 4)
+
+```
+
+
+# Figure for paper
+
+```{r}
+
+(asv_abund_heatmap_for_marker_gene_manuscript <- long_counts %>% 
+  filter(extension_time == "90sec",
+         sample_num %in% c(1:6,8)) %>% 
+   mutate(sample_label = case_when(sample_num == 1 ~ "Sept. 19, 2016 (WE4)",
+                                           sample_num == 2  ~ "Aug. 3, 2021 (WE2)",
+                                           sample_num == 3 ~ "Aug. 3, 2021 (WE16-WSW)",
+                                           sample_num == 4 ~ "June 8, 2021 (WE2)",
+                                           sample_num == 5 ~ "Sept. 7, 2021 (WE12)",
+                                           sample_num == 6 ~ "Aug. 10, 2015 (WE12)",
+                                           sample_num == 7 ~ "7. Culture with expected strain diversity (LE19-12.2)",
+                                           sample_num == 8 ~ "Culture LE18-22",
+                                           .default = as.character(sample_num)
+                                           ),
+          sample_plot_order = case_when(sample_num == 1 ~ 2,
+                                           sample_num == 2  ~ 4,
+                                           sample_num == 3 ~ 5,
+                                           sample_num == 4 ~ 3,
+                                           sample_num == 5 ~ 6,
+                                           sample_num == 6 ~ 1,
+                                           sample_num == 7 ~ 8,
+                                           sample_num == 8 ~ 7
+                                           ),
+         sample_label = str_wrap(sample_label, width = 40)) %>% 
+   arrange(sample_plot_order) %>% 
+  mutate(sample_label = factor(sample_label),
+         sample_label = fct_relevel(sample_label, unique(.$sample_label))) %>% 
+  #mutate(asv_hash = as.character(asv_hash)) %>% 
+  left_join(clustered_tree$data %>% select(cluster = label, tree_y = y)) %>% 
+  ggplot(aes(sample_label,tree_y, fill = rel_abund * 100)) + 
+  geom_tile() +
+  scale_x_discrete(guide = guide_axis(angle = -35)) +
+  scale_fill_viridis_c() +
+  theme_bw() +
+    #theme_tree2() +
+  labs(y = NULL, fill = "% abundance", x =NULL) +
+  scale_y_discrete(position = "right") +
+    theme(axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    #scale_y_continuous(expand=c(0, 0.3)) +
+    scale_y_continuous(limits = c(min(clustered_tree$data$y),max(clustered_tree$data$y)), 
+                       expand=c(0, 0.3)) 
+    #geom_hline(yintercept = 81)
+)
+
+
+(clade_bar <- clustered_tree_W_clade_colors$data %>% 
+   filter(isTip == TRUE) %>% 
+  ggplot(aes(1, y, color = hex_col)) +
+  geom_point(shape = 15, size = 2) +
+  scale_color_identity(guide = "legend",labels = genome_colors$group, breaks = genome_colors$hex_col) +
+  theme_tree() +
+   theme(axis.text.x = element_blank(),
+         axis.ticks.x = element_blank(),
+         axis.text.y = element_blank(),
+         axis.ticks.y = element_blank()) +
+   labs(x = NULL,
+        y = NULL,
+        color = "Clade") +
+   scale_y_continuous(limits = c(min(clustered_tree$data$y),max(clustered_tree$data$y)), 
+                       expand=c(0, 0.3)) 
+)
+
+
+clustered_tree + theme(legend.position = "right") + clade_bar + asv_abund_heatmap_for_marker_gene_manuscript + plot_layout(guides = "collect",widths = c(0.7,0.01,0.29))
+ggsave("results/tree_and_heatmap_w_cladeBar.pdf", width = 3.5, height =3, dpi = 300, scale = 4)
+ggsave("results/tree_and_heatmap_w_cladeBar.png", width = 3.5, height =3, dpi = 300, scale = 4)
+```
+
